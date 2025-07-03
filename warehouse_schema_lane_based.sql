@@ -26,6 +26,17 @@ CREATE TABLE IF NOT EXISTS conflict_boxes (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 2.1. Conflict Box Locks Table - Manage conflict box locking with heartbeat
+CREATE TABLE IF NOT EXISTS conflict_box_locks (
+    box_id VARCHAR(36) PRIMARY KEY REFERENCES conflict_boxes(box_id),
+    locked_by_robot VARCHAR(36) NOT NULL REFERENCES robots(robot_id),
+    lock_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    heartbeat_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    lock_timeout_seconds INTEGER DEFAULT 30, -- 30 seconds default timeout
+    robot_inside BOOLEAN DEFAULT FALSE, -- True if robot is physically inside the box
+    lock_priority INTEGER DEFAULT 0 -- For deadlock resolution
+);
+
 -- 3. Navigation Graph Nodes Table - Store graph nodes for path planning
 CREATE TABLE IF NOT EXISTS navigation_graph_nodes (
     node_id VARCHAR(36) PRIMARY KEY,
@@ -80,6 +91,9 @@ CREATE INDEX IF NOT EXISTS idx_blocked_cells_unblock_time ON blocked_cells(unblo
 CREATE INDEX IF NOT EXISTS idx_blocked_cells_robot ON blocked_cells(blocked_by_robot);
 CREATE INDEX IF NOT EXISTS idx_shelf_locks_robot ON shelf_locks(locked_by_robot);
 CREATE INDEX IF NOT EXISTS idx_shelf_locks_heartbeat ON shelf_locks(heartbeat_timestamp);
+CREATE INDEX IF NOT EXISTS idx_conflict_box_locks_robot ON conflict_box_locks(locked_by_robot);
+CREATE INDEX IF NOT EXISTS idx_conflict_box_locks_heartbeat ON conflict_box_locks(heartbeat_timestamp);
+CREATE INDEX IF NOT EXISTS idx_conflict_box_locks_priority ON conflict_box_locks(lock_priority);
 
 -- Triggers for updating timestamps
 CREATE TRIGGER IF NOT EXISTS update_lanes_updated_at BEFORE UPDATE ON lanes
@@ -196,6 +210,78 @@ BEGIN
     FROM blocked_cells bc
     WHERE bc.unblock_time > CURRENT_TIMESTAMP
     AND (bc.blocked_by_robot != p_robot_id OR bc.blocked_by_robot IS NULL);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to cleanup expired conflict box locks
+CREATE OR REPLACE FUNCTION cleanup_expired_conflict_box_locks()
+RETURNS INTEGER AS $$
+DECLARE
+    deleted_count INTEGER;
+BEGIN
+    DELETE FROM conflict_box_locks 
+    WHERE CURRENT_TIMESTAMP > (heartbeat_timestamp + INTERVAL '1 second' * lock_timeout_seconds);
+    GET DIAGNOSTICS deleted_count = ROW_COUNT;
+    RETURN deleted_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to try acquiring a conflict box lock
+CREATE OR REPLACE FUNCTION try_acquire_conflict_box_lock(
+    p_box_id VARCHAR(36),
+    p_robot_id VARCHAR(36),
+    p_priority INTEGER DEFAULT 0
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    lock_acquired BOOLEAN := FALSE;
+BEGIN
+    -- Try to insert a new lock
+    INSERT INTO conflict_box_locks (box_id, locked_by_robot, lock_priority)
+    VALUES (p_box_id, p_robot_id, p_priority)
+    ON CONFLICT (box_id) DO NOTHING;
+    
+    -- Check if we got the lock
+    SELECT (locked_by_robot = p_robot_id) INTO lock_acquired
+    FROM conflict_box_locks
+    WHERE box_id = p_box_id;
+    
+    RETURN COALESCE(lock_acquired, FALSE);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to release a conflict box lock
+CREATE OR REPLACE FUNCTION release_conflict_box_lock(
+    p_box_id VARCHAR(36),
+    p_robot_id VARCHAR(36)
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    lock_released BOOLEAN := FALSE;
+BEGIN
+    DELETE FROM conflict_box_locks
+    WHERE box_id = p_box_id AND locked_by_robot = p_robot_id;
+    
+    GET DIAGNOSTICS lock_released = FOUND;
+    RETURN lock_released;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to update heartbeat for conflict box lock
+CREATE OR REPLACE FUNCTION heartbeat_conflict_box_lock(
+    p_box_id VARCHAR(36),
+    p_robot_id VARCHAR(36)
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    heartbeat_updated BOOLEAN := FALSE;
+BEGIN
+    UPDATE conflict_box_locks
+    SET heartbeat_timestamp = CURRENT_TIMESTAMP
+    WHERE box_id = p_box_id AND locked_by_robot = p_robot_id;
+    
+    GET DIAGNOSTICS heartbeat_updated = FOUND;
+    RETURN heartbeat_updated;
 END;
 $$ LANGUAGE plpgsql;
 

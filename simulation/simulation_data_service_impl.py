@@ -935,6 +935,174 @@ class SimulationDataServiceImpl(ISimulationDataService):
             logger.error(f"Failed to cleanup expired blocks: {e}")
             raise SimulationDataServiceError(f"Failed to cleanup expired blocks: {e}")
     
+    # Conflict Box Lock Operations
+    def try_acquire_conflict_box_lock(self, box_id: str, robot_id: str, priority: int = 0) -> bool:
+        """
+        Try to acquire a lock on a conflict box.
+        
+        Args:
+            box_id: Conflict box to lock
+            robot_id: Robot requesting the lock
+            priority: Lock priority for deadlock resolution (higher = more priority)
+            
+        Returns:
+            bool: True if lock was acquired, False if already locked by another robot
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Use the database function we created
+                    cur.execute("SELECT try_acquire_conflict_box_lock(%s, %s, %s)", 
+                               (box_id, robot_id, priority))
+                    result = cur.fetchone()
+                    success = result[0] if result else False
+                    
+                    conn.commit()
+                    
+                    if success:
+                        logger.debug(f"Acquired conflict box lock: {box_id} by robot {robot_id} (priority {priority})")
+                    else:
+                        logger.debug(f"Failed to acquire conflict box lock: {box_id} by robot {robot_id}")
+                    
+                    return success
+                    
+        except Exception as e:
+            logger.error(f"Failed to acquire conflict box lock {box_id}: {e}")
+            raise SimulationDataServiceError(f"Failed to acquire conflict box lock: {e}")
+
+    def release_conflict_box_lock(self, box_id: str, robot_id: str) -> bool:
+        """
+        Release a conflict box lock.
+        
+        Args:
+            box_id: Conflict box to unlock
+            robot_id: Robot that owns the lock
+            
+        Returns:
+            bool: True if lock was released, False if not owned by this robot
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Use the database function we created
+                    cur.execute("SELECT release_conflict_box_lock(%s, %s)", 
+                               (box_id, robot_id))
+                    result = cur.fetchone()
+                    success = result[0] if result else False
+                    
+                    conn.commit()
+                    
+                    if success:
+                        logger.debug(f"Released conflict box lock: {box_id} by robot {robot_id}")
+                    else:
+                        logger.debug(f"Failed to release conflict box lock: {box_id} by robot {robot_id}")
+                    
+                    return success
+                    
+        except Exception as e:
+            logger.error(f"Failed to release conflict box lock {box_id}: {e}")
+            raise SimulationDataServiceError(f"Failed to release conflict box lock: {e}")
+
+    def heartbeat_conflict_box_lock(self, box_id: str, robot_id: str) -> bool:
+        """
+        Update heartbeat for a conflict box lock.
+        
+        Args:
+            box_id: Conflict box to heartbeat
+            robot_id: Robot that owns the lock
+            
+        Returns:
+            bool: True if heartbeat was updated, False if not owned by this robot
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Use the database function we created
+                    cur.execute("SELECT heartbeat_conflict_box_lock(%s, %s)", 
+                               (box_id, robot_id))
+                    result = cur.fetchone()
+                    success = result[0] if result else False
+                    
+                    conn.commit()
+                    
+                    if success:
+                        logger.debug(f"Updated heartbeat for conflict box lock: {box_id} by robot {robot_id}")
+                    else:
+                        logger.debug(f"Failed to update heartbeat for conflict box lock: {box_id} by robot {robot_id}")
+                    
+                    return success
+                    
+        except Exception as e:
+            logger.error(f"Failed to heartbeat conflict box lock {box_id}: {e}")
+            raise SimulationDataServiceError(f"Failed to heartbeat conflict box lock: {e}")
+
+    def get_conflict_box_lock_owner(self, box_id: str) -> Optional[str]:
+        """
+        Get the robot ID that currently owns a conflict box lock.
+        
+        Args:
+            box_id: Conflict box to check
+            
+        Returns:
+            Optional[str]: Robot ID that owns the lock, or None if not locked
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT locked_by_robot
+                        FROM conflict_box_locks
+                        WHERE box_id = %s
+                    """, (box_id,))
+                    
+                    result = cur.fetchone()
+                    owner = result[0] if result else None
+                    
+                    logger.debug(f"Conflict box {box_id} lock owner: {owner}")
+                    return owner
+                    
+        except Exception as e:
+            logger.error(f"Failed to get conflict box lock owner {box_id}: {e}")
+            raise SimulationDataServiceError(f"Failed to get conflict box lock owner: {e}")
+
+    def cleanup_expired_conflict_box_locks(self) -> int:
+        """
+        Remove expired conflict box lock entries.
+        
+        Returns:
+            int: Number of expired locks removed
+            
+        Raises:
+            SimulationDataServiceError: If cleanup operation fails
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Use the database function we created
+                    cur.execute("SELECT cleanup_expired_conflict_box_locks()")
+                    result = cur.fetchone()
+                    deleted_count = result[0] if result else 0
+                    
+                    conn.commit()
+                    logger.debug(f"Cleaned up {deleted_count} expired conflict box locks")
+                    return deleted_count
+                    
+        except Exception as e:
+            logger.error(f"Failed to cleanup expired conflict box locks: {e}")
+            raise SimulationDataServiceError(f"Failed to cleanup expired conflict box locks: {e}")
+    
     def close(self) -> None:
         """Close database connections and cleanup resources."""
         try:
