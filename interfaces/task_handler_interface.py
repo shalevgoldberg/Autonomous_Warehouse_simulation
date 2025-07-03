@@ -20,6 +20,11 @@ class OperationalStatus(Enum):
     STALLED = "stalled"
     ERROR = "error"
     EMERGENCY_STOP = "emergency_stop"
+    # New states for bay handling
+    APPROACHING_BAY = "approaching_bay"
+    ENTERING_BAY = "entering_bay"
+    IN_BAY = "in_bay"
+    EXITING_BAY = "exiting_bay"
 
 
 class TaskType(Enum):
@@ -27,6 +32,7 @@ class TaskType(Enum):
     PICK_AND_DELIVER = "pick_and_deliver"
     MOVE_TO_CHARGING = "move_to_charging"
     MOVE_TO_POSITION = "move_to_position"
+    IDLE_PARK = "idle_park"  # New: park in idle bay
 
 
 class TaskStatus(Enum):
@@ -62,6 +68,7 @@ class Task:
     dropoff_zone: str = "default_dropoff"  # Where to deliver items
     estimated_duration: Optional[float] = None  # Estimated time in seconds
     target_position: Optional[tuple] = None  # For MOVE_TO_POSITION tasks
+    bay_id: Optional[str] = None  # For bay-related tasks (charging, idle)
     priority: int = 0  # Legacy priority (0-10 scale)
     created_at: datetime = field(default_factory=datetime.now)
     assigned_at: Optional[datetime] = None
@@ -89,6 +96,10 @@ class Task:
         if self.task_type == TaskType.MOVE_TO_POSITION:
             if not self.target_position:
                 raise ValueError("MOVE_TO_POSITION tasks require target_position")
+        
+        if self.task_type in [TaskType.MOVE_TO_CHARGING, TaskType.IDLE_PARK]:
+            if not self.bay_id:
+                raise ValueError(f"{self.task_type.value} tasks require bay_id")
         
         # For non-order tasks, generate system order_id if empty
         if self.task_type in [TaskType.MOVE_TO_CHARGING, TaskType.MOVE_TO_POSITION]:

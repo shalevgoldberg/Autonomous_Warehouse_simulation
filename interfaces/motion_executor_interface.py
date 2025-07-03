@@ -1,12 +1,16 @@
 """
-Interface for MotionExecutor - executes motion plans via MuJoCo commands.
+Interface for MotionExecutor - executes lane-based motion via velocity commands.
+
+This interface has been updated to support the new lane-based navigation system,
+replacing cell-based path following with lane-based route following.
 """
 from abc import ABC, abstractmethod
 from typing import Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
 
-from .path_planner_interface import Path, Cell
+from .path_planner_interface import Path, Cell  # Legacy support
+from .navigation_types import Route, Point
 
 
 class MotionStatus(Enum):
@@ -16,6 +20,14 @@ class MotionStatus(Enum):
     REACHED_TARGET = "reached_target"
     BLOCKED = "blocked"
     ERROR = "error"
+    # New states for lane-based navigation
+    LANE_FOLLOW = "lane_follow"
+    ENTER_BOX = "enter_box"
+    EXIT_BOX = "exit_box"
+    APPROACH_BAY = "approach_bay"
+    ENTER_BAY = "enter_bay"
+    CHARGE_IDLE = "charge_idle"
+    EXIT_BAY = "exit_bay"
 
 
 @dataclass
@@ -33,29 +45,29 @@ class MotionExecutionError(Exception):
 
 class IMotionExecutor(ABC):
     """
-    Interface for motion execution functionality.
+    Interface for lane-based motion execution functionality.
     
     Responsibilities:
-    - Execute motion plans step-by-step
-    - Convert "move to next cell" into wheel torques (PID control)
-    - Write low-level commands to MuJoCo
-    - Handle motion safety and collision avoidance
+    - Execute lane-based routes step-by-step
+    - Convert route segments into wheel velocities (no torque control)
+    - Apply first-order smoothing to velocity commands
+    - Handle lane following, conflict boxes, and bay navigation
     
     **Thread Safety**: All methods are thread-safe.
     **Threading Model**:
-    - execute_*(), stop_execution(): CONTROL THREAD (called by TaskHandler)
+    - follow_route(), stop_execution(): CONTROL THREAD (called by TaskHandler)
     - update_control_loop(): CONTROL THREAD ONLY (100Hz within control thread)
     - get_*(), is_at_target(): ANY THREAD (thread-safe reads)
     - emergency_stop(): ANY THREAD (emergency use)
     """
     
     @abstractmethod
-    def execute_path(self, path: Path) -> None:
+    def follow_route(self, route: Route) -> None:
         """
-        Start executing a planned path.
+        Start following a lane-based route.
         
         Args:
-            path: Path to execute
+            route: Route to follow with lane segments
             
         Raises:
             MotionExecutionError: If execution cannot be started
@@ -63,15 +75,43 @@ class IMotionExecutor(ABC):
         pass
     
     @abstractmethod
-    def execute_single_move(self, target_cell: Cell) -> None:
+    def set_corner_speed(self, speed: float) -> None:
         """
-        Execute a single move to the target cell.
+        Set the corner speed limit for conflict boxes and bay gateways.
         
         Args:
-            target_cell: Target cell to move to
-            
-        Raises:
-            MotionExecutionError: If move cannot be executed
+            speed: Corner speed in m/s (typically 0.3 m/s)
+        """
+        pass
+    
+    @abstractmethod
+    def get_corner_speed(self) -> float:
+        """
+        Get current corner speed limit.
+        
+        Returns:
+            float: Current corner speed in m/s
+        """
+        pass
+    
+    # Legacy methods for backward compatibility during transition
+    @abstractmethod
+    def execute_path(self, path: Path) -> None:
+        """
+        Legacy path execution method (deprecated).
+        
+        This method is kept for backward compatibility during the transition
+        to lane-based navigation. New code should use follow_route().
+        """
+        pass
+    
+    @abstractmethod
+    def execute_single_move(self, target_cell: Cell) -> None:
+        """
+        Legacy single move method (deprecated).
+        
+        This method is kept for backward compatibility during the transition
+        to lane-based navigation.
         """
         pass
     

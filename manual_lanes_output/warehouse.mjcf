@@ -1,0 +1,62 @@
+<mujoco model='warehouse'>
+  <worldbody>
+    <geom type='plane' size='50 50 0.1' rgba='0.8 0.8 0.8 1'/>
+    <geom type='box' pos='0.25 -0.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='0.75 -0.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='1.25 -0.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='1.75 -0.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='2.25 -0.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='2.75 -0.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='3.25 -0.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='3.75 -0.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='4.25 -0.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='4.75 -0.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='0.25 -0.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='4.75 -0.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='0.25 -1.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='4.75 -1.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='0.25 -1.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='1.75 -1.75 0.5' size='0.25 0.25 1' rgba='0.3 0.3 0.3 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='2.25 -1.75 0.5' size='0.25 0.25 1' rgba='0.3 0.3 0.3 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='3.25 -1.75 0.5' size='0.25 0.25 1' rgba='0.3 0.3 0.3 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='3.75 -1.75 0.5' size='0.25 0.25 1' rgba='0.3 0.3 0.3 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='4.75 -1.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='0.25 -2.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='4.75 -2.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='0.25 -2.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='4.75 -2.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='0.25 -3.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='1.75 -3.25 0.5' size='0.25 0.25 1' rgba='0.3 0.3 0.3 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='2.25 -3.25 0.5' size='0.25 0.25 1' rgba='0.3 0.3 0.3 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='3.25 -3.25 0.5' size='0.25 0.25 1' rgba='0.3 0.3 0.3 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='3.75 -3.25 0.5' size='0.25 0.25 1' rgba='0.3 0.3 0.3 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='4.75 -3.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='0.25 -3.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='4.75 -3.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='0.25 -4.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='4.75 -4.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='0.25 -4.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='1.75 -4.75 0.5' size='0.25 0.25 1' rgba='0.3 0.3 0.3 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='2.25 -4.75 0.5' size='0.25 0.25 1' rgba='0.3 0.3 0.3 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='3.25 -4.75 0.5' size='0.25 0.25 1' rgba='0.3 0.3 0.3 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='3.75 -4.75 0.5' size='0.25 0.25 1' rgba='0.3 0.3 0.3 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='4.75 -4.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='0.25 -5.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='4.75 -5.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='0.25 -5.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='4.75 -5.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='0.25 -6.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='4.25 -6.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='4.75 -6.25 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='0.25 -6.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='0.75 -6.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='1.25 -6.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='1.75 -6.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='2.25 -6.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='2.75 -6.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='3.25 -6.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='3.75 -6.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='4.25 -6.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+    <geom type='box' pos='4.75 -6.75 0.5' size='0.25 0.25 1' rgba='0.1 0.1 0.7 1' contype='1' conaffinity='1'/>
+  </worldbody>
+</mujoco>
