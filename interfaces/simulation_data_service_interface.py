@@ -5,6 +5,9 @@ from abc import ABC, abstractmethod
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
 
+# Import lane-based navigation types
+from .navigation_types import LaneRec, BoxRec, Point, LaneDirection
+
 
 @dataclass
 class ShelfInfo:
@@ -29,6 +32,32 @@ class MapData:
     charging_zones: List[Tuple[int, int]]
 
 
+@dataclass
+class NavigationGraph:
+    """Navigation graph for lane-based path planning."""
+    nodes: Dict[str, 'GraphNode']  # node_id -> GraphNode
+    edges: Dict[str, List[str]]    # node_id -> list of connected node_ids
+    conflict_boxes: Dict[str, BoxRec]  # box_id -> BoxRec
+    
+    def get_neighbors(self, node_id: str) -> List[str]:
+        """Get neighboring node IDs for a given node."""
+        return self.edges.get(node_id, [])
+    
+    def get_node(self, node_id: str) -> Optional['GraphNode']:
+        """Get a graph node by ID."""
+        return self.nodes.get(node_id)
+
+
+@dataclass
+class GraphNode:
+    """Node in the navigation graph."""
+    node_id: str
+    position: Point
+    directions: List[LaneDirection]  # Available exit directions
+    is_conflict_box: bool = False
+    conflict_box_id: Optional[str] = None
+
+
 class SimulationDataServiceError(Exception):
     """Raised when simulation data service operations fail."""
     pass
@@ -44,12 +73,14 @@ class ISimulationDataService(ABC):
     - Manage shelf lock/unlock for safe, exclusive access
     - Store KPI events and logging data
     - Guarantee strong consistency of shared resources
+    - Manage lane-based navigation data (lanes, conflict boxes, blocked cells)
     
     **Thread Safety**: ALL methods are fully thread-safe with database-level consistency.
     **Threading Model**:
     - Map operations: ANY THREAD (read-only data)
     - Shelf operations: CONTROL THREAD (called by TaskHandler)
     - Inventory operations: CONTROL THREAD (JobsProcessor, TaskHandler)
+    - Lane operations: CONTROL THREAD (PathPlanner, TaskHandler)
     - log_event(): ANY THREAD (logging from all components)
     """
     
@@ -84,6 +115,109 @@ class ISimulationDataService(ABC):
         
         Returns:
             List[Tuple[float, float]]: List of dropoff positions
+        """
+        pass
+    
+    # Lane-Based Navigation Operations
+    @abstractmethod
+    def get_lanes(self) -> List[LaneRec]:
+        """
+        Get all lane definitions from database.
+        
+        Returns:
+            List[LaneRec]: All lane records
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        pass
+    
+    @abstractmethod
+    def get_conflict_boxes(self) -> List[BoxRec]:
+        """
+        Get all conflict box definitions.
+        
+        Returns:
+            List[BoxRec]: All conflict box records
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        pass
+    
+    @abstractmethod
+    def get_navigation_graph(self) -> NavigationGraph:
+        """
+        Get the complete navigation graph for path planning.
+        
+        Returns:
+            NavigationGraph: Complete graph with nodes, edges, and conflict boxes
+            
+        Raises:
+            SimulationDataServiceError: If graph construction fails
+        """
+        pass
+    
+    @abstractmethod
+    def report_blocked_cell(self, cell_id: str, robot_id: str, 
+                           unblock_time: float, reason: str) -> bool:
+        """
+        Report that a cell/lane is blocked by a robot.
+        
+        Args:
+            cell_id: Identifier of blocked cell/lane
+            robot_id: Robot reporting the block
+            unblock_time: Unix timestamp when cell should be unblocked
+            reason: Reason for blocking (e.g., "dynamic_obstacle", "robot_stalled")
+            
+        Returns:
+            bool: True if block was reported successfully, False otherwise
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        pass
+    
+    @abstractmethod
+    def get_blocked_cells(self) -> Dict[str, float]:
+        """
+        Get current blocked cells with unblock timestamps.
+        
+        Returns:
+            Dict[str, float]: Mapping of cell_id to unblock_time (Unix timestamp)
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        pass
+    
+    @abstractmethod
+    def clear_blocked_cell(self, cell_id: str, robot_id: str) -> bool:
+        """
+        Clear a blocked cell before its automatic unblock time.
+        
+        Args:
+            cell_id: Identifier of cell to unblock
+            robot_id: Robot requesting the unblock (must match blocker)
+            
+        Returns:
+            bool: True if cell was unblocked, False if not blocked or wrong robot
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        pass
+    
+    @abstractmethod
+    def cleanup_expired_blocks(self) -> int:
+        """
+        Remove expired blocked cell entries.
+        
+        Returns:
+            int: Number of expired blocks removed
+            
+        Raises:
+            SimulationDataServiceError: If cleanup operation fails
         """
         pass
     

@@ -9,7 +9,7 @@ from typing import List, Tuple, Optional, Dict
 from dataclasses import dataclass
 from enum import Enum
 
-from .navigation_types import Route, Point, TaskType, RoutePlanningError
+from .navigation_types import Route, Point, TaskType, PathPlanningResult, RoutePlanningError
 
 
 # Legacy support - keep for backward compatibility during transition
@@ -49,6 +49,7 @@ class IPathPlanner(ABC):
     - Compute lane-based routes from robot's current position to target
     - Use A* algorithm on lane graph (not cell grid)
     - Handle blocked lanes and bay access control
+    - Return graceful failure results instead of throwing exceptions
     
     **Thread Safety**: All methods are thread-safe.
     **Threading Model**:
@@ -58,9 +59,13 @@ class IPathPlanner(ABC):
     """
     
     @abstractmethod
-    def plan_route(self, start: Point, goal: Point, task_type: TaskType) -> Route:
+    def plan_route(self, start: Point, goal: Point, task_type: TaskType) -> PathPlanningResult:
         """
         Plan a lane-based route from start to goal position.
+        
+        This method returns a PathPlanningResult that handles both success and failure
+        cases gracefully, allowing the robot system to handle path planning failures
+        without crashing.
         
         Args:
             start: Starting position in world coordinates
@@ -68,10 +73,7 @@ class IPathPlanner(ABC):
             task_type: Type of task (affects bay access permissions)
             
         Returns:
-            Route: Computed route with lane segments and metadata
-            
-        Raises:
-            RoutePlanningError: If no route can be found
+            PathPlanningResult: Result containing either a successful route or failure information
         """
         pass
     

@@ -1,5 +1,10 @@
 # Project Context: Autonomous Warehouse Logistics Simulation in MuJoCo
 
+
+
+
+## *****Legacy version - do not follow this!!!!!******
+
 ## Database Access
 For access to the database run: `$env:WAREHOUSE_DB_PASSWORD="renaspolter";`
 
@@ -21,7 +26,6 @@ For my B.A final project, I am building a simulation for autonomous warehouse lo
 | Module | One-line Role |
 |--------|---------------|
 | StateHolder | Stores smoothed pose, speed, battery (updated every physics tick). |
-| PathPlanner | A* on static map → returns full cell route. |
 | TaskHandler | Owns current task & route buffer; triggers re-plan, manages shelf locks. |
 | TrafficRuleControl | Applies keep-right, yield, following-distance each 100 ms. |
 | MotionExecutor | Converts "move to next cell" into wheel torques (PID). |
@@ -31,6 +35,7 @@ For my B.A final project, I am building a simulation for autonomous warehouse lo
 ### Layer 2: System Services
 | Module | One-line Role |
 |--------|---------------|
+| PathPlanner | A* or dijkstra on a lane-graph → returns full cell route. |
 | RawJobRouter | Partitions external orders to the proper Job-Processor stream. |
 | JobsProcessor | Converts raw orders to robot tasks, updates inventory, pushes to Jobs-Queue. |
 | JobsQueue | Topic robots listen to; supports multiple partitions. |

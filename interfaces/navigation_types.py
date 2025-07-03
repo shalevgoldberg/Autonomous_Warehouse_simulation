@@ -95,6 +95,41 @@ class Route:
             self.conflict_boxes = []
 
 
+@dataclass
+class PathPlanningResult:
+    """
+    Result of path planning operation that handles both success and failure cases.
+    
+    This allows the system to handle path planning failures gracefully without
+    throwing exceptions that could crash the robot system.
+    """
+    success: bool
+    route: Optional[Route] = None
+    error_message: Optional[str] = None
+    failure_reason: Optional[str] = None
+    retry_after: Optional[float] = None  # Seconds to wait before retry
+    
+    @classmethod
+    def success_result(cls, route: Route) -> 'PathPlanningResult':
+        """Create a successful path planning result."""
+        return cls(success=True, route=route)
+    
+    @classmethod
+    def failure_result(cls, error_message: str, failure_reason: str, 
+                      retry_after: Optional[float] = None) -> 'PathPlanningResult':
+        """Create a failed path planning result."""
+        return cls(
+            success=False,
+            error_message=error_message,
+            failure_reason=failure_reason,
+            retry_after=retry_after
+        )
+    
+    def is_retryable(self) -> bool:
+        """Check if this failure can be retried."""
+        return not self.success and self.retry_after is not None
+
+
 class TaskType(Enum):
     """Enhanced task types for lane-based navigation."""
     PICK_AND_DELIVER = "pick_and_deliver"

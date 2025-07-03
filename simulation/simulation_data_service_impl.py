@@ -16,6 +16,7 @@ import logging
 import threading
 import time
 import uuid
+import json
 from contextlib import contextmanager
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
@@ -29,8 +30,11 @@ from interfaces.simulation_data_service_interface import (
     ISimulationDataService, 
     ShelfInfo, 
     MapData,
+    NavigationGraph,
+    GraphNode,
     SimulationDataServiceError
 )
+from interfaces.navigation_types import LaneRec, BoxRec, Point, LaneDirection
 from warehouse.map import WarehouseMap
 
 
@@ -628,6 +632,308 @@ class SimulationDataServiceImpl(ISimulationDataService):
         except Exception as e:
             # Don't raise exceptions for logging failures
             logger.error(f"Failed to log event {event_type} for robot {robot_id}: {e}")
+    
+    # Lane-Based Navigation Operations
+    def get_lanes(self) -> List[LaneRec]:
+        """
+        Get all lane definitions from database.
+        
+        Returns:
+            List[LaneRec]: All lane records
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT lane_id, direction, waypoints, is_goal_only, bay_id
+                        FROM lanes
+                        ORDER BY lane_id
+                    """)
+                    
+                    results = cur.fetchall()
+                    lanes = []
+                    
+                    for row in results:
+                        # Parse waypoints from JSON
+                        waypoints_data = row['waypoints']
+                        waypoints = [Point(x=float(wp[0]), y=float(wp[1])) for wp in waypoints_data]
+                        
+                        # Parse direction enum
+                        direction = LaneDirection(row['direction'])
+                        
+                        lane = LaneRec(
+                            lane_id=row['lane_id'],
+                            direction=direction,
+                            waypoints=waypoints,
+                            is_goal_only=row['is_goal_only'],
+                            bay_id=row['bay_id']
+                        )
+                        lanes.append(lane)
+                    
+                    logger.debug(f"Loaded {len(lanes)} lanes from database")
+                    return lanes
+                    
+        except Exception as e:
+            logger.error(f"Failed to load lanes: {e}")
+            raise SimulationDataServiceError(f"Failed to load lanes: {e}")
+    
+    def get_conflict_boxes(self) -> List[BoxRec]:
+        """
+        Get all conflict box definitions.
+        
+        Returns:
+            List[BoxRec]: All conflict box records
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT box_id, center_x, center_y, size
+                        FROM conflict_boxes
+                        ORDER BY box_id
+                    """)
+                    
+                    results = cur.fetchall()
+                    boxes = []
+                    
+                    for row in results:
+                        box = BoxRec(
+                            box_id=row['box_id'],
+                            center=Point(x=float(row['center_x']), y=float(row['center_y'])),
+                            size=float(row['size'])
+                        )
+                        boxes.append(box)
+                    
+                    logger.debug(f"Loaded {len(boxes)} conflict boxes from database")
+                    return boxes
+                    
+        except Exception as e:
+            logger.error(f"Failed to load conflict boxes: {e}")
+            raise SimulationDataServiceError(f"Failed to load conflict boxes: {e}")
+    
+    def get_navigation_graph(self) -> NavigationGraph:
+        """
+        Get the complete navigation graph for path planning.
+        
+        Returns:
+            NavigationGraph: Complete graph with nodes, edges, and conflict boxes
+            
+        Raises:
+            SimulationDataServiceError: If graph construction fails
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Load nodes
+                    cur.execute("""
+                        SELECT node_id, position_x, position_y, directions, 
+                               is_conflict_box, conflict_box_id
+                        FROM navigation_graph_nodes
+                        ORDER BY node_id
+                    """)
+                    
+                    node_results = cur.fetchall()
+                    nodes = {}
+                    
+                    for row in node_results:
+                        # Parse directions from JSON
+                        directions_data = row['directions']
+                        directions = [LaneDirection(d) for d in directions_data]
+                        
+                        node = GraphNode(
+                            node_id=row['node_id'],
+                            position=Point(x=float(row['position_x']), y=float(row['position_y'])),
+                            directions=directions,
+                            is_conflict_box=row['is_conflict_box'],
+                            conflict_box_id=row['conflict_box_id']
+                        )
+                        nodes[row['node_id']] = node
+                    
+                    # Load edges
+                    cur.execute("""
+                        SELECT from_node, to_node
+                        FROM navigation_graph_edges
+                        ORDER BY from_node, to_node
+                    """)
+                    
+                    edge_results = cur.fetchall()
+                    edges = {}
+                    
+                    for row in edge_results:
+                        from_node = row['from_node']
+                        to_node = row['to_node']
+                        
+                        if from_node not in edges:
+                            edges[from_node] = []
+                        edges[from_node].append(to_node)
+                    
+                    # Load conflict boxes
+                    conflict_boxes = {}
+                    for box in self.get_conflict_boxes():
+                        conflict_boxes[box.box_id] = box
+                    
+                    graph = NavigationGraph(
+                        nodes=nodes,
+                        edges=edges,
+                        conflict_boxes=conflict_boxes
+                    )
+                    
+                    logger.debug(f"Loaded navigation graph with {len(nodes)} nodes, "
+                               f"{sum(len(neighbors) for neighbors in edges.values())} edges, "
+                               f"{len(conflict_boxes)} conflict boxes")
+                    return graph
+                    
+        except Exception as e:
+            logger.error(f"Failed to load navigation graph: {e}")
+            raise SimulationDataServiceError(f"Failed to load navigation graph: {e}")
+    
+    def report_blocked_cell(self, cell_id: str, robot_id: str, 
+                           unblock_time: float, reason: str) -> bool:
+        """
+        Report that a cell/lane is blocked by a robot.
+        
+        Args:
+            cell_id: Identifier of blocked cell/lane
+            robot_id: Robot reporting the block
+            unblock_time: Unix timestamp when cell should be unblocked
+            reason: Reason for blocking (e.g., "dynamic_obstacle", "robot_stalled")
+            
+        Returns:
+            bool: True if block was reported successfully, False otherwise
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Convert Unix timestamp to PostgreSQL timestamp (use local time, not GMT)
+                    unblock_timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(unblock_time))
+                    
+                    # Insert or update blocked cell
+                    cur.execute("""
+                        INSERT INTO blocked_cells (cell_id, unblock_time, blocked_by_robot, block_reason)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (cell_id)
+                        DO UPDATE SET 
+                            unblock_time = EXCLUDED.unblock_time,
+                            blocked_by_robot = EXCLUDED.blocked_by_robot,
+                            block_reason = EXCLUDED.block_reason,
+                            created_at = CURRENT_TIMESTAMP
+                    """, (cell_id, unblock_timestamp, robot_id, reason))
+                    
+                    conn.commit()
+                    logger.debug(f"Reported blocked cell {cell_id} by robot {robot_id}, "
+                               f"unblock at {unblock_timestamp}, reason: {reason}")
+                    return True
+                    
+        except Exception as e:
+            logger.error(f"Failed to report blocked cell {cell_id}: {e}")
+            raise SimulationDataServiceError(f"Failed to report blocked cell: {e}")
+    
+    def get_blocked_cells(self) -> Dict[str, float]:
+        """
+        Get current blocked cells with unblock timestamps.
+        
+        Returns:
+            Dict[str, float]: Mapping of cell_id to unblock_time (Unix timestamp)
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT cell_id, unblock_time
+                        FROM blocked_cells
+                        WHERE unblock_time > CURRENT_TIMESTAMP
+                        ORDER BY cell_id
+                    """)
+                    
+                    results = cur.fetchall()
+                    blocked_cells = {}
+                    
+                    for row in results:
+                        # Convert PostgreSQL timestamp to Unix timestamp
+                        unblock_time = row['unblock_time'].timestamp()
+                        blocked_cells[row['cell_id']] = unblock_time
+                    
+                    logger.debug(f"Retrieved {len(blocked_cells)} currently blocked cells")
+                    return blocked_cells
+                    
+        except Exception as e:
+            logger.error(f"Failed to get blocked cells: {e}")
+            raise SimulationDataServiceError(f"Failed to get blocked cells: {e}")
+    
+    def clear_blocked_cell(self, cell_id: str, robot_id: str) -> bool:
+        """
+        Clear a blocked cell before its automatic unblock time.
+        
+        Args:
+            cell_id: Identifier of cell to unblock
+            robot_id: Robot requesting the unblock (must match blocker)
+            
+        Returns:
+            bool: True if cell was unblocked, False if not blocked or wrong robot
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Delete blocked cell only if it's blocked by the requesting robot
+                    cur.execute("""
+                        DELETE FROM blocked_cells
+                        WHERE cell_id = %s AND blocked_by_robot = %s
+                    """, (cell_id, robot_id))
+                    
+                    success = cur.rowcount > 0
+                    conn.commit()
+                    
+                    if success:
+                        logger.debug(f"Cleared blocked cell {cell_id} by robot {robot_id}")
+                    else:
+                        logger.debug(f"Cell {cell_id} not blocked by robot {robot_id} or not blocked at all")
+                    
+                    return success
+                    
+        except Exception as e:
+            logger.error(f"Failed to clear blocked cell {cell_id}: {e}")
+            raise SimulationDataServiceError(f"Failed to clear blocked cell: {e}")
+    
+    def cleanup_expired_blocks(self) -> int:
+        """
+        Remove expired blocked cell entries.
+        
+        Returns:
+            int: Number of expired blocks removed
+            
+        Raises:
+            SimulationDataServiceError: If cleanup operation fails
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Use the database function we created
+                    cur.execute("SELECT cleanup_expired_blocked_cells()")
+                    result = cur.fetchone()
+                    deleted_count = result[0] if result else 0
+                    
+                    conn.commit()
+                    logger.debug(f"Cleaned up {deleted_count} expired blocked cells")
+                    return deleted_count
+                    
+        except Exception as e:
+            logger.error(f"Failed to cleanup expired blocks: {e}")
+            raise SimulationDataServiceError(f"Failed to cleanup expired blocks: {e}")
     
     def close(self) -> None:
         """Close database connections and cleanup resources."""
