@@ -221,6 +221,88 @@ class ISimulationDataService(ABC):
         """
         pass
     
+    # Conflict Box Lock Operations
+    @abstractmethod
+    def try_acquire_conflict_box_lock(self, box_id: str, robot_id: str, priority: int = 0) -> bool:
+        """
+        Try to acquire a lock on a conflict box.
+        
+        Args:
+            box_id: Conflict box to lock
+            robot_id: Robot requesting the lock
+            priority: Lock priority for deadlock resolution (higher = more priority)
+            
+        Returns:
+            bool: True if lock was acquired, False if already locked by another robot
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        pass
+    
+    @abstractmethod
+    def release_conflict_box_lock(self, box_id: str, robot_id: str) -> bool:
+        """
+        Release a conflict box lock.
+        
+        Args:
+            box_id: Conflict box to unlock
+            robot_id: Robot that owns the lock
+            
+        Returns:
+            bool: True if lock was released, False if not owned by this robot
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        pass
+    
+    @abstractmethod
+    def heartbeat_conflict_box_lock(self, box_id: str, robot_id: str) -> bool:
+        """
+        Update heartbeat for a conflict box lock.
+        
+        Args:
+            box_id: Conflict box to heartbeat
+            robot_id: Robot that owns the lock
+            
+        Returns:
+            bool: True if heartbeat was updated, False if not owned by this robot
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        pass
+    
+    @abstractmethod
+    def get_conflict_box_lock_owner(self, box_id: str) -> Optional[str]:
+        """
+        Get the robot ID that currently owns a conflict box lock.
+        
+        Args:
+            box_id: Conflict box to check
+            
+        Returns:
+            Optional[str]: Robot ID that owns the lock, or None if not locked
+            
+        Raises:
+            SimulationDataServiceError: If database operation fails
+        """
+        pass
+    
+    @abstractmethod
+    def cleanup_expired_conflict_box_locks(self) -> int:
+        """
+        Remove expired conflict box lock entries.
+        
+        Returns:
+            int: Number of expired locks removed
+            
+        Raises:
+            SimulationDataServiceError: If cleanup operation fails
+        """
+        pass
+    
     # Shelf Operations
     @abstractmethod
     def lock_shelf(self, shelf_id: str, robot_id: str) -> bool:

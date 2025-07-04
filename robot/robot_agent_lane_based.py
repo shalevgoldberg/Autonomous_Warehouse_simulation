@@ -5,7 +5,7 @@ This implementation connects all robot components (TaskHandler, PathPlanner,
 LaneFollower, MotionExecutor, StateHolder) with the MuJoCo physics engine following our
 architecture principles: loose coupling, interface-driven design, and SOLID principles.
 
-Updated for lane-based navigation with conflict box management.
+Updated for lane-based navigation with conflict box management and centralized configuration.
 """
 import threading
 import time
@@ -19,6 +19,7 @@ from interfaces.state_holder_interface import IStateHolder
 from interfaces.coordinate_system_interface import ICoordinateSystem
 from interfaces.lane_follower_interface import ILaneFollower
 from interfaces.simulation_data_service_interface import ISimulationDataService
+from interfaces.configuration_interface import IConfigurationProvider
 
 from robot.impl.task_handler_impl import TaskHandlerImpl
 from robot.impl.path_planner_graph_impl import PathPlannerGraphImpl
@@ -33,37 +34,6 @@ from warehouse.map import WarehouseMap
 from simulation.mujoco_env import SimpleMuJoCoPhysics
 
 
-@dataclass
-class RobotConfiguration:
-    """Robot configuration parameters following Single Responsibility Principle."""
-    robot_id: str = "robot_1"
-    max_speed: float = 1.0
-    position_tolerance: float = 0.1
-    control_frequency: float = 10.0  # Hz
-    motion_frequency: float = 100.0  # Hz
-    start_position: Optional[Tuple[float, float]] = None  # Override warehouse default start position
-    
-    # Lane-based navigation parameters
-    lane_tolerance: float = 0.1  # Meters from center-line
-    corner_speed: float = 0.3  # Speed in conflict boxes and turns
-    bay_approach_speed: float = 0.2  # Speed when approaching bays
-    conflict_box_lock_timeout: float = 30.0  # Seconds to wait for lock
-    conflict_box_heartbeat_interval: float = 5.0  # Seconds between heartbeats
-    
-    def get_effective_start_position(self, warehouse_map: WarehouseMap) -> Tuple[float, float]:
-        """Get the effective start position, using configuration override or warehouse default."""
-        if self.start_position is not None:
-            return self.start_position
-        return warehouse_map.start_position
-    
-    def validate_start_position(self, warehouse_map: WarehouseMap) -> bool:
-        """Validate that start position is walkable in warehouse."""
-        if self.start_position is not None:
-            x, y = self.start_position
-            return warehouse_map.is_walkable(x, y)
-        return True
-
-
 class RobotAgent:
     """
     Complete robot agent integrating all components with MuJoCo physics.
@@ -74,6 +44,7 @@ class RobotAgent:
     - Thread-safe: Proper synchronization for multi-threaded operation
     - SOLID principles: Single responsibility, dependency injection
     - Lane-based navigation: Uses NavigationGraph and conflict box management
+    - Centralized configuration: Uses ConfigurationProvider for all parameters
     
     Threading Model:
     - Control Thread: 10Hz task management
@@ -84,7 +55,8 @@ class RobotAgent:
     def __init__(self, 
                  warehouse_map: WarehouseMap,
                  physics: SimpleMuJoCoPhysics,
-                 config: Optional[RobotConfiguration] = None,
+                 config_provider: IConfigurationProvider,
+                 robot_id: str = "robot_1",
                  simulation_data_service: Optional[ISimulationDataService] = None):
         """
         Initialize robot agent with dependency injection.
@@ -92,12 +64,17 @@ class RobotAgent:
         Args:
             warehouse_map: Warehouse layout and obstacles
             physics: MuJoCo physics simulation
-            config: Robot configuration parameters
+            config_provider: Configuration provider for all parameters
+            robot_id: Robot identifier
             simulation_data_service: Database service (created if not provided)
         """
-        self.config = config or RobotConfiguration()
+        self.config_provider = config_provider
+        self.robot_id = robot_id
         self.warehouse_map = warehouse_map
         self.physics = physics
+        
+        # Get robot configuration from provider
+        self.robot_config = self.config_provider.get_robot_config(robot_id)
         
         # Validate configuration
         self._validate_configuration()
@@ -109,10 +86,11 @@ class RobotAgent:
         self.coordinate_system = self._create_coordinate_system()
         
         # Initialize robot components via dependency injection
+        # Order matters: motion_executor must be created before lane_follower
         self.state_holder = self._create_state_holder()
         self.path_planner = self._create_path_planner()
-        self.lane_follower = self._create_lane_follower()
         self.motion_executor = self._create_motion_executor()
+        self.lane_follower = self._create_lane_follower()
         self.task_handler = self._create_task_handler()
         
         # Control loop management
@@ -120,29 +98,40 @@ class RobotAgent:
         self._control_thread: Optional[threading.Thread] = None
         self._motion_thread: Optional[threading.Thread] = None
         
-        print(f"[RobotAgent] Initialized {self.config.robot_id} with lane-based navigation")
+        print(f"[RobotAgent] Initialized {self.robot_id} with lane-based navigation")
         print(f"[RobotAgent] Components: PathPlanner, LaneFollower, MotionExecutor, TaskHandler")
         print(f"[RobotAgent] Database: {type(self.simulation_data_service).__name__}")
+        print(f"[RobotAgent] Configuration: {len(self.config_provider.errors)} validation errors")
     
     def _validate_configuration(self) -> None:
         """Validate robot configuration against warehouse constraints."""
-        # Validate start position if provided
-        if not self.config.validate_start_position(self.warehouse_map):
-            x, y = self.config.start_position
-            raise ValueError(f"Configured start position ({x}, {y}) is not walkable in warehouse")
+        # Check for configuration validation errors
+        config_errors = self.config_provider.errors
+        if config_errors:
+            error_msg = f"Configuration validation errors: {', '.join(config_errors)}"
+            raise ValueError(error_msg)
         
-        # Validate lane-based parameters
-        if self.config.lane_tolerance <= 0:
-            raise ValueError("Lane tolerance must be positive")
-        if self.config.corner_speed <= 0 or self.config.corner_speed > self.config.max_speed:
-            raise ValueError("Corner speed must be positive and not exceed max speed")
-        if self.config.bay_approach_speed <= 0 or self.config.bay_approach_speed > self.config.max_speed:
-            raise ValueError("Bay approach speed must be positive and not exceed max speed")
+        # Validate start position if provided (could be moved to config provider)
+        start_pos = self.config_provider.get_value("robot.start_position").value
+        if start_pos is not None:
+            x, y = start_pos
+            if not self.warehouse_map.is_walkable(x, y):
+                raise ValueError(f"Configured start position ({x}, {y}) is not walkable in warehouse")
     
     def _create_simulation_data_service(self) -> ISimulationDataService:
         """Create simulation data service for database connectivity."""
         try:
-            service = SimulationDataServiceImpl()
+            # Get database configuration from provider
+            db_config = self.config_provider.get_database_config()
+            service = SimulationDataServiceImpl(
+                warehouse_map=self.warehouse_map,
+                db_host=db_config.host,
+                db_port=db_config.port,
+                db_name=db_config.database,
+                db_user=db_config.user,
+                db_password=db_config.password,
+                pool_size=db_config.pool_size
+            )
             print(f"[RobotAgent] Database service initialized successfully")
             return service
         except Exception as e:
@@ -170,7 +159,7 @@ class RobotAgent:
     def _create_state_holder(self) -> IStateHolder:
         """Create state holder connected to physics."""
         return StateHolderImpl(
-            robot_id=self.config.robot_id,
+            robot_id=self.robot_id,
             model=self.physics.model,
             data=self.physics.data,
             physics_engine=self.physics
@@ -184,78 +173,101 @@ class RobotAgent:
     
     def _create_lane_follower(self) -> ILaneFollower:
         """Create lane follower for navigation execution."""
-        return LaneFollowerImpl(
+        lane_follower = LaneFollowerImpl(
             state_holder=self.state_holder,
             motion_executor=self.motion_executor,
             simulation_data_service=self.simulation_data_service,
-            robot_id=self.config.robot_id
+            robot_id=self.robot_id,
+            config_provider=self.config_provider
         )
+        
+        # Update lane follower configuration with robot-specific parameters
+        lane_follower.update_config_from_robot(self.robot_config)
+        
+        return lane_follower
     
     def _create_motion_executor(self) -> IMotionExecutor:
         """Create motion executor connected to physics."""
-        return MotionExecutorImpl(
+        motion_executor = MotionExecutorImpl(
             coordinate_system=self.coordinate_system,
             model=self.physics.model,
             data=self.physics.data,
-            robot_id=self.config.robot_id,
-            physics_engine=self.physics
+            robot_id=self.robot_id,
+            physics_engine=self.physics,
+            config_provider=self.config_provider
         )
+        
+        # Update motion executor configuration with robot-specific parameters
+        motion_executor.update_config_from_robot(self.robot_config)
+        
+        return motion_executor
     
     def _create_task_handler(self) -> ITaskHandler:
-        """Create task handler with all dependencies."""
-        return TaskHandlerImpl(
+        """Create task handler for task execution."""
+        task_handler = TaskHandlerImpl(
+            robot_id=self.robot_id,
             state_holder=self.state_holder,
             path_planner=self.path_planner,
             lane_follower=self.lane_follower,
             motion_executor=self.motion_executor,
             coordinate_system=self.coordinate_system,
             simulation_data_service=self.simulation_data_service,
-            robot_id=self.config.robot_id
+            config_provider=self.config_provider
         )
+        
+        # Update task handler configuration with robot-specific parameters
+        task_handler.update_config_from_robot(self.robot_config)
+        
+        return task_handler
     
     def initialize_position(self) -> None:
-        """Initialize robot at configured start position."""
-        start_pos = self.config.get_effective_start_position(self.warehouse_map)
-        self.physics.reset_robot_position(start_pos[0], start_pos[1], 0.0)
-        print(f"[RobotAgent] Robot positioned at: ({start_pos[0]:.2f}, {start_pos[1]:.2f})")
+        """Initialize robot position in physics simulation."""
+        # Get start position from configuration or warehouse default
+        start_pos = self.config_provider.get_value("robot.start_position").value
+        if start_pos is not None:
+            x, y = start_pos
+        else:
+            x, y = self.warehouse_map.start_position
+        
+        self.physics.reset_robot_position(x, y, 0.0)
+        print(f"[RobotAgent] Initialized position at ({x}, {y})")
     
-    # Public interface methods
     def start(self) -> None:
-        """Start robot agent control loops."""
+        """Start robot control and motion loops."""
         if self._running:
-            print(f"[RobotAgent] {self.config.robot_id} already running")
+            print(f"[RobotAgent] Already running")
             return
         
         self._running = True
         
-        # Start control threads
+        # Start control thread
         self._control_thread = threading.Thread(
             target=self._control_loop,
-            name=f"Control-{self.config.robot_id}",
+            name=f"RobotControl-{self.robot_id}",
             daemon=True
         )
+        self._control_thread.start()
         
+        # Start motion thread
         self._motion_thread = threading.Thread(
             target=self._motion_loop,
-            name=f"Motion-{self.config.robot_id}",
+            name=f"RobotMotion-{self.robot_id}",
             daemon=True
         )
-        
-        self._control_thread.start()
         self._motion_thread.start()
         
-        print(f"[RobotAgent] Started {self.config.robot_id} control loops")
+        print(f"[RobotAgent] Started control and motion threads")
     
     def stop(self) -> None:
-        """Stop robot agent control loops."""
+        """Stop robot control and motion loops."""
         if not self._running:
+            print(f"[RobotAgent] Not running")
             return
         
         self._running = False
         
-        # Emergency stop motion and lane following
-        self.motion_executor.emergency_stop()
-        self.lane_follower.emergency_stop()
+        # Stop motion execution
+        self.motion_executor.stop_execution()
         
         # Wait for threads to finish
         if self._control_thread:
@@ -263,141 +275,105 @@ class RobotAgent:
         if self._motion_thread:
             self._motion_thread.join(timeout=1.0)
         
-        print(f"[RobotAgent] Stopped {self.config.robot_id}")
+        print(f"[RobotAgent] Stopped control and motion threads")
     
     def assign_task(self, task: Task) -> bool:
-        """
-        Assign a task to the robot.
-        
-        Args:
-            task: Task to execute
-            
-        Returns:
-            bool: True if task accepted, False if robot busy
-        """
+        """Assign a task to the robot."""
         return self.task_handler.start_task(task)
     
     def get_status(self) -> dict:
         """Get comprehensive robot status."""
-        task_status = self.task_handler.get_task_status()
-        motion_status = self.motion_executor.get_motion_status()
-        lane_status = self.lane_follower.get_lane_following_status()
-        robot_state = self.state_holder.get_robot_state()
-        
         return {
-            'robot_id': self.config.robot_id,
-            'position': robot_state.position,
-            'battery': robot_state.battery_level,
-            'task_active': task_status.has_active_task,
-            'task_id': task_status.task_id,
-            'operational_status': task_status.operational_status.value,
-            'task_progress': task_status.progress,
-            'motion_status': motion_status.value,
-            'lane_following_status': lane_status.value,
-            'current_target': self.motion_executor.get_current_target(),
-            'conflict_boxes_held': self.lane_follower.get_held_conflict_boxes()
+            'robot_id': self.robot_id,
+            'running': self._running,
+            'position': self.state_holder.get_position(),
+            'battery_level': self.state_holder.get_battery_level(),
+            'current_task': self.task_handler.get_current_task(),
+            'task_status': self.task_handler.get_task_status(),
+            'motion_status': self.motion_executor.get_motion_status(),
+            'lane_following_status': self.lane_follower.get_lane_following_status(),
+            'configuration_errors': self.config_provider.errors
         }
     
-    # Control loop implementations
     def _control_loop(self) -> None:
-        """Control loop running at 10Hz for task management."""
-        control_period = 1.0 / self.config.control_frequency
+        """Control loop for task management."""
+        control_period = 1.0 / self.robot_config.control_frequency
         
         while self._running:
-            start_time = time.time()
-            
             try:
-                # Update state from physics
-                self.state_holder.update_from_simulation()
-                
-                # Update task execution
+                # Update task handler
                 self.task_handler.update_task_execution()
                 
-                # Update lane following
-                self.lane_follower.update_lane_following()
+                # Sleep for control period
+                time.sleep(control_period)
                 
             except Exception as e:
                 print(f"[RobotAgent] Control loop error: {e}")
-            
-            # Maintain 10Hz frequency
-            elapsed = time.time() - start_time
-            sleep_time = max(0, control_period - elapsed)
-            time.sleep(sleep_time)
+                time.sleep(control_period)
     
     def _motion_loop(self) -> None:
-        """Motion loop running at 100Hz for motion control."""
-        motion_period = 1.0 / self.config.motion_frequency
+        """Motion loop for physics integration."""
+        motion_period = 1.0 / self.robot_config.motion_frequency
         
         while self._running:
-            start_time = time.time()
-            
             try:
-                # Update motion control
+                # Update motion executor
                 self.motion_executor.update_control_loop()
+                
+                # Sleep for motion period
+                time.sleep(motion_period)
                 
             except Exception as e:
                 print(f"[RobotAgent] Motion loop error: {e}")
-            
-            # Maintain 100Hz frequency  
-            elapsed = time.time() - start_time
-            sleep_time = max(0, motion_period - elapsed)
-            time.sleep(sleep_time)
+                time.sleep(motion_period)
     
-    # Task creation helpers
     def create_pickup_task(self, shelf_id: str, item_id: str = "item_1") -> Task:
-        """Create a pick and deliver task."""
+        """Create a pickup task."""
         return Task(
-            task_id=f"pickup_{shelf_id}_{int(time.time())}",
+            task_id=f"pickup_{shelf_id}_{item_id}",
             task_type=TaskType.PICK_AND_DELIVER,
+            order_id=f"order_{shelf_id}_{item_id}",
             shelf_id=shelf_id,
-            item_id=item_id,
-            priority=1
+            item_id=item_id
         )
     
     def create_move_task(self, target_x: float, target_y: float) -> Task:
-        """Create a move to position task."""
+        """Create a move task."""
         return Task(
-            task_id=f"move_{int(time.time())}",
+            task_id=f"move_{target_x}_{target_y}",
             task_type=TaskType.MOVE_TO_POSITION,
-            target_position=(target_x, target_y, 0.0),
-            priority=1
+            target_position=(target_x, target_y, 0.0)
         )
     
     def create_charging_task(self) -> Task:
         """Create a charging task."""
         return Task(
-            task_id=f"charge_{int(time.time())}",
+            task_id="charging",
             task_type=TaskType.MOVE_TO_CHARGING,
-            priority=1
+            bay_id="charging_bay_1"
         )
     
-    # Interface access (for external systems)
+    # Interface properties for external access
     @property
     def task_handler_interface(self) -> ITaskHandler:
-        """Access to task handler interface."""
         return self.task_handler
     
     @property  
     def motion_executor_interface(self) -> IMotionExecutor:
-        """Access to motion executor interface."""
         return self.motion_executor
     
     @property
     def state_holder_interface(self) -> IStateHolder:
-        """Access to state holder interface."""
         return self.state_holder
     
     @property
     def path_planner_interface(self) -> IPathPlanner:
-        """Access to path planner interface."""
         return self.path_planner
     
     @property
     def lane_follower_interface(self) -> ILaneFollower:
-        """Access to lane follower interface."""
         return self.lane_follower
     
     @property
     def simulation_data_service_interface(self) -> ISimulationDataService:
-        """Access to simulation data service interface."""
         return self.simulation_data_service 

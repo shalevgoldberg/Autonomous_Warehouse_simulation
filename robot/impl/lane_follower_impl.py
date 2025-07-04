@@ -20,6 +20,7 @@ from interfaces.navigation_types import Route, RouteSegment, Point, BoxRec
 from interfaces.state_holder_interface import IStateHolder
 from interfaces.motion_executor_interface import IMotionExecutor, MotionStatus
 from interfaces.simulation_data_service_interface import ISimulationDataService
+from interfaces.configuration_interface import IConfigurationProvider
 
 
 @dataclass
@@ -59,7 +60,8 @@ class LaneFollowerImpl(ILaneFollower):
                  robot_id: str,
                  state_holder: IStateHolder,
                  motion_executor: IMotionExecutor,
-                 simulation_data_service: ISimulationDataService):
+                 simulation_data_service: ISimulationDataService,
+                 config_provider: Optional[IConfigurationProvider] = None):
         """
         Initialize the lane follower.
         
@@ -68,18 +70,35 @@ class LaneFollowerImpl(ILaneFollower):
             state_holder: Robot state management service
             motion_executor: Motion control service
             simulation_data_service: Database and navigation data service
+            config_provider: Configuration provider for lane following parameters
         """
         self._robot_id = robot_id
         self._state_holder = state_holder
         self._motion_executor = motion_executor
         self._simulation_data_service = simulation_data_service
+        self._config_provider = config_provider
         
         # Thread safety
         self._lock = threading.RLock()
         self._logger = logging.getLogger(f"LaneFollower.{robot_id}")
         
-        # Configuration
-        self._config = LaneFollowingConfig()
+        # Configuration - get from provider or use defaults
+        if config_provider:
+            nav_config = config_provider.get_navigation_config()
+            self._config = LaneFollowingConfig(
+                lane_tolerance=nav_config.lane_tolerance,
+                max_speed=1.0,  # Will be overridden by robot config
+                corner_speed=0.3,  # Will be overridden by robot config
+                bay_approach_speed=0.2,  # Will be overridden by robot config
+                lock_timeout=nav_config.conflict_box_lock_timeout,
+                heartbeat_interval=nav_config.conflict_box_heartbeat_interval,
+                lock_retry_attempts=3,
+                position_tolerance=0.05,
+                velocity_smoothing_factor=0.1,
+                emergency_stop_distance=0.5
+            )
+        else:
+            self._config = LaneFollowingConfig()
         
         # State management
         self._status = LaneFollowingStatus.IDLE
@@ -106,6 +125,14 @@ class LaneFollowerImpl(ILaneFollower):
         self._emergency_stopped = False
         
         self._logger.info(f"LaneFollower initialized for robot {robot_id}")
+    
+    def update_config_from_robot(self, robot_config) -> None:
+        """Update configuration with robot-specific parameters."""
+        if robot_config:
+            self._config.max_speed = robot_config.max_speed
+            self._config.corner_speed = robot_config.corner_speed
+            self._config.bay_approach_speed = robot_config.bay_approach_speed
+            self._config.position_tolerance = robot_config.position_tolerance
     
     def follow_route(self, route: Route, robot_id: str) -> None:
         """Start following a lane-based route."""

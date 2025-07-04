@@ -31,6 +31,7 @@ from interfaces.order_source_interface import IOrderSource
 from interfaces.simulation_data_service_interface import ISimulationDataService
 from interfaces.jobs_queue_interface import IJobsQueue
 from interfaces.task_handler_interface import Task, TaskType
+from interfaces.configuration_interface import IConfigurationProvider
 
 
 @dataclass
@@ -66,8 +67,9 @@ class JobsProcessorImpl(IJobsProcessor):
                  order_source: IOrderSource,
                  simulation_data_service: ISimulationDataService,
                  jobs_queue: IJobsQueue,
-                 processing_interval: float = 5.0,
-                 max_concurrent_orders: int = 10):
+                 config_provider: Optional[IConfigurationProvider] = None,
+                 processing_interval: Optional[float] = None,
+                 max_concurrent_orders: Optional[int] = None):
         """
         Initialize JobsProcessor with dependencies.
         
@@ -75,14 +77,36 @@ class JobsProcessorImpl(IJobsProcessor):
             order_source: Source of customer orders
             simulation_data_service: Warehouse inventory and shelf management
             jobs_queue: Queue for robot task distribution
+            config_provider: Configuration provider for processing parameters
             processing_interval: How often to check for new orders (seconds)
             max_concurrent_orders: Maximum orders to process simultaneously
         """
         self._order_source = order_source
         self._simulation_data_service = simulation_data_service
         self._jobs_queue = jobs_queue
-        self._processing_interval = processing_interval
-        self._max_concurrent_orders = max_concurrent_orders
+        self._config_provider = config_provider
+        
+        # Get configuration from provider or use provided/default values
+        if config_provider:
+            task_config = config_provider.get_task_config()
+            self._processing_interval = processing_interval or task_config.order_processing_interval
+            self._max_concurrent_orders = max_concurrent_orders or task_config.max_concurrent_orders
+            self._inventory_allocation_timeout = task_config.inventory_allocation_timeout
+            self._bidding_timeout = task_config.bidding_timeout
+            self._min_bid_value = task_config.min_bid_value
+            self._max_bid_value = task_config.max_bid_value
+            self._distance_cost_factor = task_config.distance_cost_factor
+            self._battery_cost_factor = task_config.battery_cost_factor
+        else:
+            # Use provided values or defaults
+            self._processing_interval = processing_interval or 5.0
+            self._max_concurrent_orders = max_concurrent_orders or 10
+            self._inventory_allocation_timeout = 30.0
+            self._bidding_timeout = 10.0
+            self._min_bid_value = 0.1
+            self._max_bid_value = 1000.0
+            self._distance_cost_factor = 10.0
+            self._battery_cost_factor = 5.0
         
         # Thread management
         self._processor_thread: Optional[threading.Thread] = None
@@ -108,7 +132,20 @@ class JobsProcessorImpl(IJobsProcessor):
         # Logging
         self._logger = logging.getLogger(f"{self.__class__.__name__}")
         self._logger.info("JobsProcessor initialized with %d max concurrent orders", 
-                         max_concurrent_orders)
+                         self._max_concurrent_orders)
+    
+    def update_config_from_provider(self) -> None:
+        """Update processing parameters from configuration provider."""
+        if self._config_provider:
+            task_config = self._config_provider.get_task_config()
+            self._processing_interval = task_config.order_processing_interval
+            self._max_concurrent_orders = task_config.max_concurrent_orders
+            self._inventory_allocation_timeout = task_config.inventory_allocation_timeout
+            self._bidding_timeout = task_config.bidding_timeout
+            self._min_bid_value = task_config.min_bid_value
+            self._max_bid_value = task_config.max_bid_value
+            self._distance_cost_factor = task_config.distance_cost_factor
+            self._battery_cost_factor = task_config.battery_cost_factor
     
     def start_processing(self) -> None:
         """Start the background order processing thread."""
@@ -303,9 +340,9 @@ class JobsProcessorImpl(IJobsProcessor):
                 # Process orders once
                 result = self.process_orders_once()
                 
-                if result.orders_processed > 0:
-                    self._logger.info(f"Processed {result.orders_processed} orders, "
-                                    f"created {result.tasks_created} tasks in "
+                if len(result.tasks_created) > 0:
+                    self._logger.info(f"Processed orders, "
+                                    f"created {len(result.tasks_created)} tasks in "
                                     f"{result.processing_time:.2f}s")
                 
                 # Wait for next processing cycle
@@ -343,19 +380,26 @@ class JobsProcessorImpl(IJobsProcessor):
         try:
             # Process each item in the order
             for order_item in order.items:
-                # Find inventory for this item
-                inventory_info = self._simulation_data_service.get_item_inventory(
+                # Find shelf location for this item
+                shelf_id = self._simulation_data_service.get_item_location(
                     order_item.item_id
                 )
                 
-                if not inventory_info or inventory_info.available_quantity < order_item.quantity:
+                if not shelf_id:
                     raise JobsProcessorError(
-                        f"Insufficient inventory for item {order_item.item_id}: "
-                        f"requested {order_item.quantity}, available {inventory_info.available_quantity if inventory_info else 0}"
+                        f"No inventory found for item {order_item.item_id}"
                     )
                 
+                # Get shelf info to check inventory
+                shelf_info = self._simulation_data_service.get_shelf_info(shelf_id)
+                if not shelf_info:
+                    raise JobsProcessorError(f"Shelf {shelf_id} not found")
+                
+                # For now, assume sufficient inventory (in real implementation, we'd check actual quantities)
+                # TODO: Add inventory quantity tracking to SimulationDataService
+                
                 # Allocate inventory and create tasks
-                tasks_for_item = self._allocate_and_create_tasks(order, order_item, inventory_info)
+                tasks_for_item = self._allocate_and_create_tasks(order, order_item, shelf_id)
                 tasks_created += len(tasks_for_item)
                 
                 # Push tasks to queue
@@ -374,7 +418,7 @@ class JobsProcessorImpl(IJobsProcessor):
             raise JobsProcessorError(f"Failed to process order {order.order_id}: {str(e)}") from e
     
     def _allocate_and_create_tasks(self, order: Order, order_item: OrderItem, 
-                                 inventory_info) -> List[Task]:
+                                 shelf_id: str) -> List[Task]:
         """
         Allocate inventory and create robot tasks for an order item.
         
@@ -387,80 +431,52 @@ class JobsProcessorImpl(IJobsProcessor):
         Args:
             order: Source order
             order_item: Item to process
-            inventory_info: Available inventory information
+            shelf_id: Shelf ID containing the item
             
         Returns:
             List[Task]: Created robot tasks (one task per shelf)
         """
         tasks = []
-        remaining_quantity = order_item.quantity
         
-        # Get shelf locations for this item
-        shelf_locations = self._simulation_data_service.get_item_shelf_locations(
-            order_item.item_id
-        )
-        
-        if not shelf_locations:
-            raise JobsProcessorError(f"No shelf locations found for item {order_item.item_id}")
-        
-        # Sort shelves by available quantity (prioritize fuller shelves)
-        shelf_locations.sort(key=lambda x: x.quantity, reverse=True)
-        
-        # Create one task per shelf (single-shelf allocation strategy)
-        for shelf_location in shelf_locations:
-            if remaining_quantity <= 0:
-                break
-            
-            # Check if shelf is already locked
-            with self._lock:
-                if shelf_location.shelf_id in self._locked_shelves:
-                    continue
-            
-            # Determine how much to pick from this shelf (single-shelf task)
-            quantity_to_pick = min(remaining_quantity, shelf_location.quantity)
+        # Check if shelf is already locked
+        with self._lock:
+            if shelf_id in self._locked_shelves:
+                raise JobsProcessorError(f"Shelf {shelf_id} is already locked")
             
             # Lock the shelf for this task
-            with self._lock:
-                self._locked_shelves.add(shelf_location.shelf_id)
-            
-            # Create allocation record
-            allocation = InventoryAllocation(
-                order_id=order.order_id,
-                item_id=order_item.item_id,
-                shelf_id=shelf_location.shelf_id,
-                quantity_allocated=quantity_to_pick,
-                quantity_requested=order_item.quantity
-            )
-            
-            with self._lock:
-                self._inventory_allocations[order.order_id].append(allocation)
-            
-            # Create single-shelf robot task (simple for robot controllers)
-            task = Task.create_pick_and_deliver_task(
-                task_id=f"task_{uuid.uuid4().hex[:8]}",
-                order_id=order.order_id,
-                shelf_id=shelf_location.shelf_id,
-                item_id=order_item.item_id,
-                quantity_to_pick=quantity_to_pick,
-                order_priority=order.priority.value.lower(),
-                customer_id=order.customer_id
-            )
-            
-            # Set coordination flags
-            task.inventory_reserved = True
-            task.shelf_locked = True
-            
-            tasks.append(task)
-            remaining_quantity -= quantity_to_pick
-            
-            self._logger.debug(f"Created single-shelf task {task.task_id} for {quantity_to_pick} of "
-                             f"{order_item.item_id} from shelf {shelf_location.shelf_id}")
+            self._locked_shelves.add(shelf_id)
         
-        if remaining_quantity > 0:
-            raise JobsProcessorError(
-                f"Could not allocate sufficient inventory for {order_item.item_id}: "
-                f"still need {remaining_quantity} items"
-            )
+        # Create allocation record
+        allocation = InventoryAllocation(
+            order_id=order.order_id,
+            item_id=order_item.item_id,
+            shelf_id=shelf_id,
+            quantity_allocated=order_item.quantity,
+            quantity_requested=order_item.quantity
+        )
+        
+        with self._lock:
+            self._inventory_allocations[order.order_id].append(allocation)
+        
+        # Create single-shelf robot task (simple for robot controllers)
+        task = Task.create_pick_and_deliver_task(
+            task_id=f"task_{uuid.uuid4().hex[:8]}",
+            order_id=order.order_id,
+            shelf_id=shelf_id,
+            item_id=order_item.item_id,
+            quantity_to_pick=order_item.quantity,
+            order_priority=order.priority.value.lower(),
+            customer_id=order.customer_id
+        )
+        
+        # Set coordination flags
+        task.inventory_reserved = True
+        task.shelf_locked = True
+        
+        tasks.append(task)
+        
+        self._logger.debug(f"Created single-shelf task {task.task_id} for {order_item.quantity} of "
+                         f"{order_item.item_id} from shelf {shelf_id}")
         
         return tasks
     
@@ -673,8 +689,8 @@ class JobsProcessorImpl(IJobsProcessor):
         # In a full implementation, we'd maintain a detailed error log
         return [
             {
-                "error_count": self._stats.processing_errors,
+                "error_count": self._stats.failed_orders,
                 "last_error_time": self._stats.last_processing_time,
                 "message": "Processing errors occurred (detailed logging available in logs)"
             }
-        ] if self._stats.processing_errors > 0 else [] 
+        ] if self._stats.failed_orders > 0 else [] 

@@ -24,6 +24,7 @@ from datetime import datetime
 from interfaces.jobs_queue_interface import IJobsQueue
 from interfaces.bidding_system_interface import IBiddingSystem, BiddingRound, TaskAssignment
 from interfaces.task_handler_interface import Task
+from interfaces.configuration_interface import IConfigurationProvider
 from robot.robot_agent import RobotAgent
 
 
@@ -58,7 +59,8 @@ class RobotController:
                  jobs_queue: IJobsQueue,
                  bidding_system: IBiddingSystem,
                  robot_pool: List[Any],
-                 polling_interval: float = 1.0):
+                 config_provider: Optional[IConfigurationProvider] = None,
+                 polling_interval: Optional[float] = None):
         """
         Initialize the robot controller.
         
@@ -66,12 +68,28 @@ class RobotController:
             jobs_queue: Queue containing available tasks
             bidding_system: Bidding system for task assignment
             robot_pool: List of available robot agents
+            config_provider: Configuration provider for system parameters
             polling_interval: How often to poll for new tasks (seconds)
         """
         self.jobs_queue = jobs_queue
         self.bidding_system = bidding_system
         self.robot_pool = robot_pool
-        self.polling_interval = polling_interval
+        self.config_provider = config_provider
+        
+        # Get configuration from provider or use provided/default values
+        if config_provider:
+            system_config = config_provider.get_system_config()
+            self.polling_interval = polling_interval or system_config.health_check_interval
+            # Use reasonable defaults for robot controller specific parameters
+            self.max_robots_per_round = 10
+            self.max_tasks_per_round = 20
+            self.round_timeout = 30.0
+        else:
+            # Use provided values or defaults
+            self.polling_interval = polling_interval or 1.0
+            self.max_robots_per_round = 10
+            self.max_tasks_per_round = 20
+            self.round_timeout = 30.0
         
         # Control loop management
         self._running = False
@@ -85,6 +103,14 @@ class RobotController:
         self._controller_start_time: Optional[datetime] = None
         
         print(f"[RobotController] Initialized with {len(robot_pool)} robots")
+    
+    def update_config_from_provider(self) -> None:
+        """Update controller parameters from configuration provider."""
+        if self.config_provider:
+            system_config = self.config_provider.get_system_config()
+            self.polling_interval = system_config.health_check_interval
+            # Keep existing values for robot controller specific parameters
+            # These could be added to SystemConfig in the future if needed
     
     def start(self) -> None:
         """

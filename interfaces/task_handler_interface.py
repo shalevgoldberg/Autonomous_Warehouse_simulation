@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime
 
+from .lane_follower_interface import ILaneFollower
+
 
 class OperationalStatus(Enum):
     """Robot operational status - managed by TaskHandler."""

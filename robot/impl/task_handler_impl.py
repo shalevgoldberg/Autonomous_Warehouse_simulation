@@ -30,6 +30,9 @@ from interfaces.path_planner_interface import IPathPlanner, Path, Cell, PathPlan
 from interfaces.motion_executor_interface import IMotionExecutor, MotionStatus, MotionExecutionError
 from interfaces.coordinate_system_interface import ICoordinateSystem
 from interfaces.simulation_data_service_interface import ISimulationDataService, SimulationDataServiceError
+from interfaces.lane_follower_interface import ILaneFollower, LaneFollowingStatus, LaneFollowingError
+from interfaces.navigation_types import Route
+from interfaces.configuration_interface import IConfigurationProvider
 
 
 class ReadWriteLock:
@@ -150,27 +153,33 @@ class TaskHandlerImpl(ITaskHandler):
     def __init__(self, 
                  state_holder: IStateHolder,
                  path_planner: IPathPlanner,
+                 lane_follower: ILaneFollower,
                  motion_executor: IMotionExecutor,
                  coordinate_system: ICoordinateSystem,
                  simulation_data_service: ISimulationDataService,
-                 robot_id: str = "robot_1"):
+                 robot_id: str = "robot_1",
+                 config_provider: Optional[IConfigurationProvider] = None):
         """
         Initialize TaskHandler with required dependencies.
         
         Args:
             state_holder: Robot state management
             path_planner: Route planning functionality
+            lane_follower: Lane-based navigation execution
             motion_executor: Motion execution and control
             coordinate_system: Coordinate conversion utilities
             simulation_data_service: Warehouse data and shelf management
             robot_id: Unique identifier for this robot
+            config_provider: Configuration provider for task parameters
         """
         self.state_holder = state_holder
         self.path_planner = path_planner
+        self.lane_follower = lane_follower
         self.motion_executor = motion_executor
         self.coordinate_system = coordinate_system
         self.simulation_data_service = simulation_data_service
         self.robot_id = robot_id
+        self.config_provider = config_provider
         
         # Setup logging with robot ID prefix
         self.logger = logging.getLogger(f"TaskHandler.{robot_id}")
@@ -192,27 +201,51 @@ class TaskHandlerImpl(ITaskHandler):
         # Stall handling
         self._stall_reason: Optional[str] = None
         self._stall_start_time: Optional[float] = None
-        self._stall_recovery_timeout = 10.0  # seconds
         
-        # Task execution parameters
-        self._position_tolerance = 0.1  # meters
-        # TODO: Replace sim-time sleeps with real robot feedback (e.g., "gripper closed")
-        self._picking_duration = 3.0   # seconds to simulate picking
-        self._dropping_duration = 2.0  # seconds to simulate dropping
-        self._charging_threshold = 0.2  # charge when below 20%
+        # Task execution parameters - get from config provider or use defaults
+        if config_provider:
+            robot_config = config_provider.get_robot_config(robot_id)
+            task_config = config_provider.get_task_config()
+            self._stall_recovery_timeout = robot_config.stall_recovery_timeout
+            self._position_tolerance = robot_config.position_tolerance
+            self._picking_duration = robot_config.picking_duration
+            self._dropping_duration = robot_config.dropping_duration
+            self._charging_threshold = robot_config.charging_threshold
+            self._task_timeout = task_config.task_timeout
+            self._retry_attempts = task_config.retry_attempts
+            self._retry_delay = task_config.retry_delay
+        else:
+            # Default values
+            self._stall_recovery_timeout = 10.0  # seconds
+            self._position_tolerance = 0.1  # meters
+            self._picking_duration = 3.0   # seconds to simulate picking
+            self._dropping_duration = 2.0  # seconds to simulate dropping
+            self._charging_threshold = 0.2  # charge when below 20%
+            self._task_timeout = 300.0  # seconds
+            self._retry_attempts = 3
+            self._retry_delay = 5.0  # seconds
         
         # Phase timing for simulation
         self._phase_start_time: Optional[float] = None
         
-        # Asynchronous path planning state
+        # Asynchronous route planning state
         self._planning_thread: Optional[threading.Thread] = None
-        self._planned_path: Optional[Path] = None
+        self._planned_route: Optional[Route] = None
         self._planning_error: Optional[str] = None
         self._planning_target: Optional[Tuple[float, float]] = None
         
         # Shelf locking state (for cleanup on errors)
         self._locked_shelf_id: Optional[str] = None
-        
+    
+    def update_config_from_robot(self, robot_config) -> None:
+        """Update task parameters with robot-specific configuration."""
+        if robot_config:
+            self._stall_recovery_timeout = robot_config.stall_recovery_timeout
+            self._position_tolerance = robot_config.position_tolerance
+            self._picking_duration = robot_config.picking_duration
+            self._dropping_duration = robot_config.dropping_duration
+            self._charging_threshold = robot_config.charging_threshold
+    
     def get_task_status(self) -> TaskHandlerStatus:
         """
         Get current task execution status.
@@ -252,6 +285,9 @@ class TaskHandlerImpl(ITaskHandler):
             if self._operational_status == OperationalStatus.EMERGENCY_STOP:
                 return
             
+            # Update lane following execution
+            self.lane_follower.update_lane_following()
+            
             # Update task execution based on current phase
             self._update_current_phase()
     
@@ -263,8 +299,9 @@ class TaskHandlerImpl(ITaskHandler):
         Immediately halts all motion and marks task as failed.
         """
         with WriteLock(self._status_lock):
-            # Stop motion immediately
+            # Stop motion and lane following immediately
             self.motion_executor.emergency_stop()
+            self.lane_follower.emergency_stop()  # Force release all locks in emergency
             
             # Mark task as failed
             if self._current_task:
@@ -361,8 +398,9 @@ class TaskHandlerImpl(ITaskHandler):
             self._stall_reason = reason
             self._stall_start_time = time.time()
             
-            # Stop motion immediately
+            # Stop motion and lane following immediately
             self.motion_executor.stop_execution()
+            self.lane_follower.stop_following(force_release=False)  # Safe stop
             
             print(f"[TaskHandler] Stall detected: {reason}")
     
@@ -459,13 +497,11 @@ class TaskHandlerImpl(ITaskHandler):
             return  # Planning still in progress
         
         # Check if planning completed
-        if self._planned_path is not None:
-            # Path planning succeeded
+        if self._planned_route is not None:
+            # Route planning succeeded
             try:
-                self._current_path = self._planned_path
-                print(f"[TaskHandler] Passing planned path to motion executor: {len(self._current_path.cells)} cells")
-                print(f"[TaskHandler] Path cells: {[(cell.x, cell.y) for cell in self._current_path.cells]}")
-                self.motion_executor.execute_path(self._current_path)
+                print(f"[TaskHandler] Starting lane following with {len(self._planned_route.segments)} segments")
+                self.lane_follower.follow_route(self._planned_route, self.robot_id)
                 
                 # Advance to next phase
                 if self._current_task.task_type == TaskType.PICK_AND_DELIVER:
@@ -476,11 +512,11 @@ class TaskHandlerImpl(ITaskHandler):
                     self._advance_to_phase(TaskPhase.NAVIGATING_TO_SHELF, OperationalStatus.MOVING_TO_SHELF)
                 
                 # Clear planning state
-                self._planned_path = None
+                self._planned_route = None
                 self._planning_target = None
                 
-            except MotionExecutionError as e:
-                self._handle_task_error(f"Motion execution failed: {e}")
+            except LaneFollowingError as e:
+                self._handle_task_error(f"Lane following failed: {e}")
             return
         
         # Check if planning failed
@@ -546,17 +582,15 @@ class TaskHandlerImpl(ITaskHandler):
                 self._handle_task_error(f"Planning initialization failed: {e}")
     
     def _handle_navigation_phase(self, expected_status: OperationalStatus) -> None:
-        """Internal: Handle navigation phases."""
+        """Internal: Handle navigation phases using lane following."""
         if not self._current_task:
             return  # No task to navigate for
             
-        # Check motion status
-        motion_status = self.motion_executor.get_motion_status()
+        # Check lane following status
+        lane_status = self.lane_follower.get_lane_following_status()
+        lane_result = self.lane_follower.get_lane_following_result()
         
-        if motion_status == MotionStatus.REACHED_TARGET:
-            # Clear the flag so it doesn't persist
-            self.motion_executor.clear_reached_target_flag()
-            
+        if lane_status == LaneFollowingStatus.COMPLETED:
             # Navigation completed
             if expected_status == OperationalStatus.MOVING_TO_SHELF:
                 if self._current_task.task_type == TaskType.PICK_AND_DELIVER:
@@ -571,11 +605,11 @@ class TaskHandlerImpl(ITaskHandler):
             elif expected_status == OperationalStatus.MOVING_TO_CHARGING:
                 self._advance_to_phase(TaskPhase.CHARGING_BATTERY, OperationalStatus.CHARGING)
         
-        elif motion_status == MotionStatus.ERROR:
-            self._handle_task_error("Motion execution error during navigation")
+        elif lane_status == LaneFollowingStatus.ERROR:
+            self._handle_task_error(f"Lane following error: {lane_result.error_message}")
         
-        elif motion_status == MotionStatus.BLOCKED:
-            self.handle_stall_event("Path blocked during navigation")
+        elif lane_status == LaneFollowingStatus.BLOCKED:
+            self.handle_stall_event("Path blocked during lane following")
     
     def _handle_picking_phase(self) -> None:
         """Internal: Handle item picking phase with shelf locking and inventory management."""
@@ -656,20 +690,29 @@ class TaskHandlerImpl(ITaskHandler):
             # Unlock shelf after picking
             self._unlock_current_shelf()
             
-            # Plan path to dropoff
+            # Plan route to dropoff using lane-based navigation
             try:
+                from interfaces.navigation_types import Point, TaskType as NavTaskType
+                
                 current_state = self.state_holder.get_robot_state()
                 dropoff_position = self._get_dropoff_position()
                 
-                self._current_path = self.path_planner.plan_path(
-                    start=current_state.position[:2],
-                    goal=dropoff_position[:2]
+                start_point = Point(x=current_state.position[0], y=current_state.position[1])
+                target_point = Point(x=dropoff_position[0], y=dropoff_position[1])
+                
+                planning_result = self.path_planner.plan_route(
+                    start=start_point,
+                    goal=target_point,
+                    task_type=NavTaskType.PICK_AND_DELIVER
                 )
                 
-                self.motion_executor.execute_path(self._current_path)
-                self._advance_to_phase(TaskPhase.NAVIGATING_TO_DROPOFF, OperationalStatus.MOVING_TO_DROPOFF)
+                if planning_result.success and planning_result.route:
+                    self.lane_follower.follow_route(planning_result.route, self.robot_id)
+                    self._advance_to_phase(TaskPhase.NAVIGATING_TO_DROPOFF, OperationalStatus.MOVING_TO_DROPOFF)
+                else:
+                    self._handle_task_error(f"Failed to plan dropoff route: {planning_result.error_message}")
                 
-            except (PathPlanningError, MotionExecutionError) as e:
+            except Exception as e:
                 self._handle_task_error(f"Failed to plan dropoff route: {e}")
     
     def _handle_dropping_phase(self) -> None:
@@ -781,8 +824,9 @@ class TaskHandlerImpl(ITaskHandler):
     
     def _reset_task_state(self) -> None:
         """Internal: Reset task state to idle with cleanup."""
-        # CRITICAL: Stop motion executor when task completes
+        # CRITICAL: Stop motion executor and lane follower when task completes
         self.motion_executor.stop_execution()
+        self.lane_follower.stop_following(force_release=False)  # Safe stop
         
         # Clean up shelf locks
         self._unlock_current_shelf()
@@ -797,7 +841,7 @@ class TaskHandlerImpl(ITaskHandler):
         self._stall_start_time = None
         
         # Clean up asynchronous planning state
-        self._planned_path = None
+        self._planned_route = None
         self._planning_error = None
         self._planning_target = None
         # Note: _planning_thread will be cleaned up by the thread itself
@@ -859,17 +903,17 @@ class TaskHandlerImpl(ITaskHandler):
                 return min(1.0, elapsed / duration)
         
         elif self._task_phase in [TaskPhase.NAVIGATING_TO_SHELF, TaskPhase.NAVIGATING_TO_DROPOFF, TaskPhase.NAVIGATING_TO_CHARGING]:
-            # Calculate navigation progress based on time elapsed (more accurate than fixed 0.5)
-            motion_status = self.motion_executor.get_motion_status()
-            if motion_status == MotionStatus.REACHED_TARGET:
-                return 1.0
-            elif motion_status == MotionStatus.EXECUTING and self._phase_start_time:
-                # Estimate based on time (assume average navigation takes 10 seconds)
-                elapsed = time.time() - self._phase_start_time
-                estimated_duration = 10.0  # seconds
-                return min(0.95, elapsed / estimated_duration)  # Cap at 95% until actually reached
+            # Calculate navigation progress based on lane following
+            lane_result = self.lane_follower.get_lane_following_result()
+            if lane_result.success:
+                # Use segment progress for more accurate progress calculation
+                current_route = self.lane_follower.get_current_route()
+                total_segments = len(current_route.segments) if current_route else 1
+                segment_progress = lane_result.progress_in_segment
+                completed_segments = lane_result.current_segment_index
+                return min(0.95, (completed_segments + segment_progress) / total_segments)
             else:
-                return 0.1  # Just started
+                return 0.1  # Just started or error
         
         return 0.0
     
@@ -978,28 +1022,43 @@ class TaskHandlerImpl(ITaskHandler):
     
     def _async_path_planning(self, start: Tuple[float, float], target: Tuple[float, float]) -> None:
         """
-        Internal: Asynchronous path planning that runs outside the critical section.
-        This prevents the expensive path_planner.plan_path() call from blocking 
+        Internal: Asynchronous route planning that runs outside the critical section.
+        This prevents the expensive path_planner.plan_route() call from blocking 
         the 10Hz control loop and other reader threads.
         """
         try:
+            # Convert tuple to Point objects for lane-based planning
+            from interfaces.navigation_types import Point, TaskType as NavTaskType
+            
+            start_point = Point(x=start[0], y=start[1])
+            target_point = Point(x=target[0], y=target[1])
+            
             # This runs outside the lock, allowing other operations to continue
-            planned_path = self.path_planner.plan_path(start=start, goal=target)
+            planning_result = self.path_planner.plan_route(
+                start=start_point, 
+                goal=target_point, 
+                task_type=NavTaskType.PICK_AND_DELIVER
+            )
             
             # Atomically store the result
             with WriteLock(self._status_lock):
                 if self._planning_target == target:  # Ensure this is still the current planning request
-                    self._planned_path = planned_path
-                    self._planning_error = None
-                    self.logger.debug(f"Path planning completed: {len(planned_path.cells)} cells")
+                    if planning_result.success and planning_result.route:
+                        self._planned_route = planning_result.route
+                        self._planning_error = None
+                        self.logger.debug(f"Route planning completed: {len(planning_result.route.segments)} segments")
+                    else:
+                        self._planned_route = None
+                        self._planning_error = planning_result.error_message
+                        self.logger.error(f"Route planning failed: {planning_result.error_message}")
                 
-        except (PathPlanningError, Exception) as e:
+        except Exception as e:
             # Atomically store the error
             with WriteLock(self._status_lock):
                 if self._planning_target == target:  # Ensure this is still the current planning request
-                    self._planned_path = None
+                    self._planned_route = None
                     self._planning_error = str(e)
-                    self.logger.error(f"Path planning failed: {e}")
+                    self.logger.error(f"Route planning failed: {e}")
         
         finally:
             # Clear the planning thread reference

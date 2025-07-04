@@ -15,6 +15,7 @@ from enum import Enum
 from interfaces.motion_executor_interface import IMotionExecutor, MotionCommand, MotionStatus, MotionExecutionError
 from interfaces.path_planner_interface import Path, Cell
 from interfaces.coordinate_system_interface import ICoordinateSystem
+from interfaces.configuration_interface import IConfigurationProvider
 
 
 class MotionMode(Enum):
@@ -48,7 +49,8 @@ class MotionExecutorImpl(IMotionExecutor):
     """
     
     def __init__(self, coordinate_system: ICoordinateSystem, 
-                 model=None, data=None, robot_id: str = "robot_1", physics_engine=None):
+                 model=None, data=None, robot_id: str = "robot_1", physics_engine=None,
+                 config_provider: Optional[IConfigurationProvider] = None):
         """
         Initialize MotionExecutor.
         
@@ -57,10 +59,13 @@ class MotionExecutorImpl(IMotionExecutor):
             model: MuJoCo model (optional)
             data: MuJoCo data (optional)
             robot_id: Robot identifier
+            physics_engine: Physics engine reference
+            config_provider: Configuration provider for motion parameters
         """
         self.coordinate_system = coordinate_system
         self.robot_id = robot_id
         self.physics_engine = physics_engine  # Store physics engine reference
+        self.config_provider = config_provider
         
         # MuJoCo integration
         self.model = model
@@ -76,13 +81,23 @@ class MotionExecutorImpl(IMotionExecutor):
         self._iteration_counter = 0  # Track control loop iterations
         self._motion_start_time = 0.0  # Initialize to 0.0 instead of None
         
-        # Motion parameters
-        self._max_linear_velocity = 2.0  # m/s (increased for faster movement)
-        self._max_angular_velocity = 2.0  # rad/s (increased for faster turning)
-        self._movement_speed = 1.5  # m/s (increased for faster movement)
-        self._position_tolerance = 0.20  # m (20cm snap threshold for task completion)
-        self._wheel_base = 0.3  # m
-        self._wheel_radius = 0.05  # m
+        # Motion parameters - get from config provider or use defaults
+        if config_provider:
+            robot_config = config_provider.get_robot_config(robot_id)
+            self._max_linear_velocity = robot_config.max_linear_velocity
+            self._max_angular_velocity = robot_config.max_angular_velocity
+            self._movement_speed = robot_config.movement_speed
+            self._position_tolerance = robot_config.position_tolerance
+            self._wheel_base = robot_config.wheel_base
+            self._wheel_radius = robot_config.wheel_radius
+        else:
+            # Default values
+            self._max_linear_velocity = 2.0  # m/s
+            self._max_angular_velocity = 2.0  # rad/s
+            self._movement_speed = 1.5  # m/s
+            self._position_tolerance = 0.20  # m (20cm snap threshold for task completion)
+            self._wheel_base = 0.3  # m
+            self._wheel_radius = 0.05  # m
         
         # Snap-to-target parameters
         self._snap_triggered = False
@@ -562,4 +577,53 @@ class MotionExecutorImpl(IMotionExecutor):
     def clear_reached_target_flag(self) -> None:
         """Clear the reached target flag after TaskHandler has processed it."""
         with self._status_lock:
-            self._reached_target_flag = False 
+            self._reached_target_flag = False
+    
+    # Lane-based navigation methods (required by interface)
+    def follow_route(self, route) -> None:
+        """
+        Follow a lane-based route (new interface method).
+        
+        This method converts a Route to a Path for compatibility with existing implementation.
+        """
+        from interfaces.navigation_types import Route
+        from interfaces.path_planner_interface import Path, Cell
+        
+        # Convert route segments to path cells for backward compatibility
+        cells = []
+        for segment in route.segments:
+            # Convert start and end points to cells (with null checks)
+            if segment.start_point is not None and segment.end_point is not None:
+                start_cell = Cell(int(segment.start_point.x), int(segment.start_point.y))
+                end_cell = Cell(int(segment.end_point.x), int(segment.end_point.y))
+                cells.extend([start_cell, end_cell])
+        
+        # Remove duplicates while preserving order
+        unique_cells = []
+        for cell in cells:
+            if not unique_cells or (cell.x != unique_cells[-1].x or cell.y != unique_cells[-1].y):
+                unique_cells.append(cell)
+        
+        # Create path and execute (add missing parameters)
+        path = Path(cells=unique_cells, total_distance=route.total_distance, estimated_time=route.estimated_time)
+        self.execute_path(path)
+    
+    def set_corner_speed(self, speed: float) -> None:
+        """Set corner speed for conflict boxes and bay navigation."""
+        with self._status_lock:
+            self._corner_speed = speed
+    
+    def get_corner_speed(self) -> float:
+        """Get current corner speed."""
+        with self._status_lock:
+            return getattr(self, '_corner_speed', 0.3)  # Default corner speed
+
+    def update_config_from_robot(self, robot_config) -> None:
+        """Update motion parameters with robot-specific configuration."""
+        if robot_config:
+            self._max_linear_velocity = robot_config.max_linear_velocity
+            self._max_angular_velocity = robot_config.max_angular_velocity
+            self._movement_speed = robot_config.movement_speed
+            self._position_tolerance = robot_config.position_tolerance
+            self._wheel_base = robot_config.wheel_base
+            self._wheel_radius = robot_config.wheel_radius 
