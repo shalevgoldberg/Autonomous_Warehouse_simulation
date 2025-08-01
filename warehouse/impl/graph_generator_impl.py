@@ -9,10 +9,9 @@ from pathlib import Path
 from typing import Dict, Set, List, Tuple, Optional
 from math import sqrt
 
-from interfaces.graph_generator_interface import (
-    IGraphGenerator, NavigationGraph, GraphNode, GraphEdge, ConflictBox
-)
-from interfaces.navigation_types import Point, LaneDirection
+from interfaces.graph_generator_interface import IGraphGenerator, ConflictBox, GraphEdge
+from interfaces.simulation_data_service_interface import NavigationGraph, GraphNode
+from interfaces.navigation_types import Point, LaneDirection, BoxRec
 
 
 class GraphGeneratorImpl(IGraphGenerator):
@@ -35,7 +34,7 @@ class GraphGeneratorImpl(IGraphGenerator):
             raise FileNotFoundError(f"Warehouse CSV not found: {warehouse_csv}")
         
         nodes: Dict[str, GraphNode] = {}
-        edges: Dict[str, Set[str]] = {}
+        edges: Dict[str, List[str]] = {}
         conflict_boxes: Dict[str, ConflictBox] = {}
         position_to_node: Dict[Tuple[float, float], str] = {}
         
@@ -45,10 +44,13 @@ class GraphGeneratorImpl(IGraphGenerator):
         # Build connections based on exit directions
         self._build_connections(nodes, position_to_node, edges)
         
+        # Convert conflict_boxes to BoxRec for NavigationGraph
+        boxrec_conflict_boxes = {box_id: BoxRec(box_id=box.box_id, center=box.position, size=box.size)
+                                 for box_id, box in conflict_boxes.items()}
         return NavigationGraph(
             nodes=nodes,
             edges=edges,
-            conflict_boxes=conflict_boxes,
+            conflict_boxes=boxrec_conflict_boxes,
             position_to_node=position_to_node
         )
     
@@ -72,9 +74,9 @@ class GraphGeneratorImpl(IGraphGenerator):
                 if cell_value in ['w', 'd', 'i', 'c']:  # walls, dock, idle, charging
                     continue
                 
-                # Calculate world position (assuming grid starts at origin)
+                # Calculate world position (matching warehouse map coordinate system)
                 x = col_idx * self.cell_size
-                y = -row_idx * self.cell_size  # Negative Y for downward rows
+                y = row_idx * self.cell_size  # Positive Y to match warehouse map
                 pos = (x, y)
                 
                 # Parse cell value
@@ -118,26 +120,26 @@ class GraphGeneratorImpl(IGraphGenerator):
                     nodes[node_id] = node
                     position_to_node[pos] = node_id
     
-    def _parse_directions(self, direction_str: str) -> Set[LaneDirection]:
+    def _parse_directions(self, direction_str: str) -> List[LaneDirection]:
         """Parse direction string into LaneDirection set."""
-        directions = set()
+        directions = []
         for char in direction_str.lower():  # Convert to lowercase for case-insensitive parsing
             if char == 'n':
-                directions.add(LaneDirection.NORTH)
+                directions.append(LaneDirection.NORTH)
             elif char == 's':
-                directions.add(LaneDirection.SOUTH)
+                directions.append(LaneDirection.SOUTH)
             elif char == 'e':
-                directions.add(LaneDirection.EAST)
+                directions.append(LaneDirection.EAST)
             elif char == 'w':
-                directions.add(LaneDirection.WEST)
+                directions.append(LaneDirection.WEST)
         return directions
     
     def _build_connections(self, nodes: Dict[str, GraphNode],
                           position_to_node: Dict[Tuple[float, float], str],
-                          edges: Dict[str, Set[str]]) -> None:
+                          edges: Dict[str, List[str]]) -> None:
         """Build connections between nodes based on exit directions."""
         for node_id, node in nodes.items():
-            edges[node_id] = set()
+            edges[node_id] = []
             
             # For each exit direction, find the target position and connect if it exists
             for direction in node.directions:
@@ -145,18 +147,18 @@ class GraphGeneratorImpl(IGraphGenerator):
                 target_node_id = position_to_node.get((target_pos.x, target_pos.y))
                 
                 if target_node_id:
-                    edges[node_id].add(target_node_id)
+                    edges[node_id].append(target_node_id)
     
     def _get_exit_position(self, position: Point, direction: LaneDirection) -> Point:
         """Calculate the position where the exit direction leads to."""
         if direction == LaneDirection.NORTH:
-            return Point(position.x, position.y + self.cell_size)
+            return Point(position.x, position.y - self.cell_size)  # Go UP (smaller Y)
         elif direction == LaneDirection.SOUTH:
-            return Point(position.x, position.y - self.cell_size)
+            return Point(position.x, position.y + self.cell_size)  # Go DOWN (larger Y)
         elif direction == LaneDirection.EAST:
-            return Point(position.x + self.cell_size, position.y)
+            return Point(position.x + self.cell_size, position.y)  # Go RIGHT
         elif direction == LaneDirection.WEST:
-            return Point(position.x - self.cell_size, position.y)
+            return Point(position.x - self.cell_size, position.y)  # Go LEFT
         else:
             raise ValueError(f"Unknown direction: {direction}")
     
@@ -167,7 +169,7 @@ class GraphGeneratorImpl(IGraphGenerator):
         # Check for isolated nodes
         isolated_nodes = []
         for node_id, node in graph.nodes.items():
-            if not graph.edges.get(node_id, set()) and not self._has_incoming_edges(node_id, graph.edges):
+            if not graph.edges.get(node_id, []) and not self._has_incoming_edges(node_id, graph.edges):
                 isolated_nodes.append(node_id)
         
         if isolated_nodes:
@@ -197,7 +199,7 @@ class GraphGeneratorImpl(IGraphGenerator):
         
         return warnings
     
-    def _has_incoming_edges(self, target_node_id: str, edges: Dict[str, Set[str]]) -> bool:
+    def _has_incoming_edges(self, target_node_id: str, edges: Dict[str, List[str]]) -> bool:
         """Check if a node has incoming edges."""
         for source_node_id, connections in edges.items():
             if target_node_id in connections:
