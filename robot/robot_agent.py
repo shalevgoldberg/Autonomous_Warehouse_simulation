@@ -1,15 +1,26 @@
 """
-Robot Agent - Complete robot integration with MuJoCo physics simulation.
+DEPRECATED: LEGACY ROBOT AGENT - DO NOT USE
 
-This implementation connects all robot components (TaskHandler, PathPlanner, 
-LaneFollower, MotionExecutor, StateHolder) with the MuJoCo physics engine following our
-architecture principles: loose coupling, interface-driven design, and SOLID principles.
+This module is DEPRECATED and should not be used in new code.
+Use robot_agent_lane_based.py instead.
 
-Updated for lane-based navigation with conflict box management.
+This was the original robot agent implementation that has been superseded by
+the lane-based robot agent which provides:
+- Better lane-based navigation
+- Conflict box management
+- Centralized configuration
+- Parallel bidding system
+- Enhanced database integration
+
+Migration Guide:
+- Replace: from robot.robot_agent import RobotAgent
+- With: from robot.robot_agent_lane_based import RobotAgent
+
+This file is kept for reference only and may be removed in future versions.
 """
 import threading
 import time
-from typing import Optional, Set, Tuple
+from typing import Optional, Set, Tuple, List, Dict, Any
 from dataclasses import dataclass
 
 from interfaces.task_handler_interface import ITaskHandler, Task, TaskType
@@ -66,7 +77,13 @@ class RobotConfiguration:
 
 class RobotAgent:
     """
-    Complete robot agent integrating all components with MuJoCo physics.
+    DEPRECATED: LEGACY ROBOT AGENT - DO NOT USE
+    
+    This class is DEPRECATED and should not be used in new code.
+    Use robot_agent_lane_based.RobotAgent instead.
+    
+    This was the original robot agent implementation that has been superseded by
+    the lane-based robot agent which provides better navigation and configuration.
     
     Architecture:
     - Interface-driven: All components accessed via interfaces
@@ -87,7 +104,11 @@ class RobotAgent:
                  config: Optional[RobotConfiguration] = None,
                  simulation_data_service: Optional[ISimulationDataService] = None):
         """
+        DEPRECATED: LEGACY ROBOT AGENT - DO NOT USE
+        
         Initialize robot agent with dependency injection.
+        
+        WARNING: This class is deprecated. Use robot_agent_lane_based.RobotAgent instead.
         
         Args:
             warehouse_map: Warehouse layout and obstacles
@@ -95,6 +116,13 @@ class RobotAgent:
             config: Robot configuration parameters
             simulation_data_service: Database service (created if not provided)
         """
+        import warnings
+        warnings.warn(
+            "RobotAgent from robot_agent.py is DEPRECATED. "
+            "Use robot_agent_lane_based.RobotAgent instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         self.config = config or RobotConfiguration()
         self.warehouse_map = warehouse_map
         self.physics = physics
@@ -111,9 +139,18 @@ class RobotAgent:
         # Initialize robot components via dependency injection
         self.state_holder = self._create_state_holder()
         self.path_planner = self._create_path_planner()
-        self.lane_follower = self._create_lane_follower()
         self.motion_executor = self._create_motion_executor()
+        self.lane_follower = self._create_lane_follower()
         self.task_handler = self._create_task_handler()
+        
+        # Initialize physics thread manager with state holder for 1kHz synchronization
+        from robot.impl.physics_integration import create_physics_thread_manager
+        self.physics_manager = create_physics_thread_manager(
+            physics=self.physics,
+            state_holder=self.state_holder,
+            frequency_hz=1000.0,
+            db_sync_frequency_hz=10.0
+        )
         
         # Control loop management
         self._running = False
@@ -142,7 +179,7 @@ class RobotAgent:
     def _create_simulation_data_service(self) -> ISimulationDataService:
         """Create simulation data service for database connectivity."""
         try:
-            service = SimulationDataServiceImpl()
+            service = SimulationDataServiceImpl(warehouse_map=self.warehouse_map)
             print(f"[RobotAgent] Database service initialized successfully")
             return service
         except Exception as e:
@@ -228,6 +265,10 @@ class RobotAgent:
         
         self._running = True
         
+        # Start physics simulation
+        self.physics_manager.start()
+        print(f"[RobotAgent] Started physics simulation for {self.config.robot_id}")
+        
         # Start control threads
         self._control_thread = threading.Thread(
             target=self._control_loop,
@@ -253,6 +294,10 @@ class RobotAgent:
         
         self._running = False
         
+        # Stop physics simulation
+        self.physics_manager.stop()
+        print(f"[RobotAgent] Stopped physics simulation for {self.config.robot_id}")
+        
         # Emergency stop motion and lane following
         self.motion_executor.emergency_stop()
         self.lane_follower.emergency_stop()
@@ -276,6 +321,105 @@ class RobotAgent:
             bool: True if task accepted, False if robot busy
         """
         return self.task_handler.start_task(task)
+    
+    def calculate_bids(self, tasks: List[Task]) -> List['RobotBid']:
+        """
+        Calculate bids for multiple tasks in parallel.
+        
+        This method uses the robot's bid calculator to evaluate all tasks
+        and return bids for tasks the robot can execute.
+        
+        Args:
+            tasks: List of tasks to bid on
+            
+        Returns:
+            List[RobotBid]: Bids for tasks the robot can execute
+        """
+        from interfaces.bidding_system_interface import RobotBid
+        
+        bids = []
+        robot_status = self.get_status()
+        
+        # Check if robot is available for bidding
+        if not self.is_available_for_bidding():
+            return bids
+        
+        # Get robot's current position and state
+        robot_position = robot_status.get('position', (0.0, 0.0))
+        robot_battery = robot_status.get('battery', 0.0)
+        
+        for task in tasks:
+            try:
+                # Check if robot can execute this task
+                if self._can_execute_task(task):
+                    # Calculate bid using bid calculator
+                    bid_value = self._calculate_task_bid(task, robot_position, robot_battery)
+                    
+                    bid = RobotBid(
+                        robot_id=self.config.robot_id,
+                        task=task,
+                        bid_value=bid_value,
+                        bid_metadata={
+                            "robot_position": robot_position,
+                            "robot_battery": robot_battery,
+                            "task_type": task.task_type.value,
+                            "parallel_bidding": True
+                        }
+                    )
+                    bids.append(bid)
+                    
+            except Exception as e:
+                print(f"[RobotAgent] Error calculating bid for task {task.task_id}: {e}")
+                continue
+        
+        return bids
+    
+    def is_available_for_bidding(self) -> bool:
+        """
+        Check if robot is available for bidding.
+        
+        Returns:
+            bool: True if robot can participate in bidding
+        """
+        try:
+            status = self.get_status()
+            
+            # Check if robot has an active task
+            if status.get('task_active', True):
+                return False
+            
+            # Check operational status
+            operational_status = status.get('operational_status', 'error')
+            if operational_status in ['error', 'emergency_stop', 'stalled']:
+                return False
+            
+            # Check battery level
+            battery_level = status.get('battery', 0.0)
+            if battery_level < 20.0:  # 20% battery threshold
+                return False
+            
+            return True
+            
+        except Exception as e:
+            print(f"[RobotAgent] Error checking availability: {e}")
+            return False
+    
+    def get_bid_calculation_statistics(self) -> Dict[str, Any]:
+        """
+        Get bid calculation statistics for monitoring.
+        
+        Returns:
+            Dict[str, Any]: Bid calculation performance metrics
+        """
+        # This would track bid calculation performance over time
+        # For now, return basic statistics
+        return {
+            'robot_id': self.config.robot_id,
+            'available_for_bidding': self.is_available_for_bidding(),
+            'current_position': self.get_status().get('position', (0.0, 0.0)),
+            'battery_level': self.get_status().get('battery', 0.0),
+            'operational_status': self.get_status().get('operational_status', 'unknown')
+        }
     
     def get_status(self) -> dict:
         """Get comprehensive robot status."""
@@ -307,8 +451,8 @@ class RobotAgent:
             start_time = time.time()
             
             try:
-                # Update state from physics
-                self.state_holder.update_from_simulation()
+                # State is now updated by physics thread at 1kHz
+                # No need to call update_from_simulation() here
                 
                 # Update task execution
                 self.task_handler.update_task_execution()
@@ -401,3 +545,67 @@ class RobotAgent:
     def simulation_data_service_interface(self) -> ISimulationDataService:
         """Access to simulation data service interface."""
         return self.simulation_data_service 
+
+    def _can_execute_task(self, task: Task) -> bool:
+        """
+        Check if robot can execute a specific task.
+        
+        Args:
+            task: Task to check
+            
+        Returns:
+            bool: True if robot can execute the task
+        """
+        # Basic task compatibility check
+        if task.task_type == TaskType.PICK_AND_DELIVER:
+            # Check if robot can reach the shelf
+            return True  # Simplified for now
+        elif task.task_type == TaskType.MOVE_TO_POSITION:
+            # Check if target position is reachable
+            target_pos = task.target_position
+            if target_pos:
+                x, y = target_pos[0], target_pos[1]
+                return self.warehouse_map.is_walkable(x, y)
+        elif task.task_type == TaskType.MOVE_TO_CHARGING:
+            # Check if robot can reach charging station
+            return True  # Simplified for now
+        
+        return False
+    
+    def _calculate_task_bid(self, task: Task, robot_position: Tuple[float, float], robot_battery: float) -> float:
+        """
+        Calculate bid value for a specific task.
+        
+        Args:
+            task: Task to bid on
+            robot_position: Current robot position
+            robot_battery: Current battery level
+            
+        Returns:
+            float: Bid value (lower is better)
+        """
+        # Simple bid calculation based on distance and battery
+        base_bid = 100.0
+        
+        # Distance factor
+        if task.target_position:
+            target_x, target_y = task.target_position[0], task.target_position[1]
+            distance = ((target_x - robot_position[0])**2 + (target_y - robot_position[1])**2)**0.5
+            distance_factor = distance * 10.0  # 10 units per meter
+        else:
+            distance_factor = 50.0  # Default distance for tasks without position
+        
+        # Battery factor (prefer robots with higher battery)
+        battery_factor = (100.0 - robot_battery) * 0.5  # 0.5 units per % battery
+        
+        # Task type factor
+        if task.task_type == TaskType.PICK_AND_DELIVER:
+            task_factor = 20.0  # Pick and deliver is more complex
+        elif task.task_type == TaskType.MOVE_TO_CHARGING:
+            task_factor = 10.0  # Charging is simple
+        else:
+            task_factor = 0.0  # Move to position is simple
+        
+        total_bid = base_bid + distance_factor + battery_factor + task_factor
+        
+        return total_bid 

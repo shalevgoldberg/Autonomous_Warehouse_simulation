@@ -1,5 +1,7 @@
 ---
-description:
-globs:
-alwaysApply: false
+description: 
+globs: 
+alwaysApply: true
 ---
+for running tests - dont ever declare success if not all the tests passed
+for running visualizations demo or tests - ask the user what was the result because you dont have the ability to analyze the visualization

@@ -49,6 +49,7 @@ class ConflictBoxStatus(Enum):
     LOCKING = "locking"
     LOCKED = "locked"
     UNLOCKING = "unlocking"
+    QUEUED = "queued"
     TIMEOUT = "timeout"
     ERROR = "error"
 
@@ -81,7 +82,7 @@ class LaneFollowingConfig:
     lock_retry_attempts: int = 3  # Number of lock retry attempts
     
     # Control parameters
-    position_tolerance: float = 0.05  # Meters for position checks
+    # Note: position_tolerance removed - Motion Executor is single source of truth
     velocity_smoothing_factor: float = 0.1  # Low-pass filter factor
     emergency_stop_distance: float = 0.5  # Meters for emergency stops
 

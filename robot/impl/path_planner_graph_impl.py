@@ -128,7 +128,7 @@ class PathPlannerGraphImpl(IPathPlanner):
             
             logger.debug(f"Planning route from node {start_node_id} to {goal_node_id}")
             
-            # Use Dijkstra to find shortest path
+            # Use Dijkstra to find shortest path (forbid idle nodes as intermediates)
             path_node_ids = self._dijkstra(start_node_id, goal_node_id, graph)
             
             if not path_node_ids or len(path_node_ids) < 2:
@@ -272,6 +272,11 @@ class PathPlannerGraphImpl(IPathPlanner):
                     dy = neighbor_node.position.y - current_node.position.y
                     edge_cost = (dx * dx + dy * dy) ** 0.5
                     
+                    # Forbid idle/charging nodes as intermediates: allow only if neighbor is goal
+                    if (neighbor_node_id.startswith('idle_') or neighbor_node_id.startswith('charge_')) \
+                        and neighbor_node_id != goal_node_id and current_node_id != start_node_id:
+                        continue
+
                     # Add penalty for conflict boxes to encourage alternative routes
                     if neighbor_node.is_conflict_box:
                         edge_cost *= 1.2  # 20% penalty for conflict boxes

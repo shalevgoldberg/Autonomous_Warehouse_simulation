@@ -3,10 +3,12 @@ Interface for SimulationDataService - manages warehouse static data and shelf op
 """
 from abc import ABC, abstractmethod
 from typing import Optional, List, Dict, Any, Tuple
-from dataclasses import dataclass
+from pathlib import Path
+from dataclasses import dataclass, field
 
 # Import lane-based navigation types
 from .navigation_types import LaneRec, BoxRec, Point, LaneDirection
+from .graph_persistence_interface import GraphPersistenceResult
 
 
 @dataclass
@@ -38,6 +40,7 @@ class NavigationGraph:
     nodes: Dict[str, 'GraphNode']  # node_id -> GraphNode
     edges: Dict[str, List[str]]    # node_id -> list of connected node_ids
     conflict_boxes: Dict[str, BoxRec]  # box_id -> BoxRec
+    position_to_node: Dict[Tuple[float, float], str] = field(default_factory=dict)
     
     def get_neighbors(self, node_id: str) -> List[str]:
         """Get neighboring node IDs for a given node."""
@@ -239,6 +242,21 @@ class ISimulationDataService(ABC):
             SimulationDataServiceError: If database operation fails
         """
         pass
+
+    # Graph Persistence Operations
+    @abstractmethod
+    def persist_navigation_graph_from_csv(self, csv_path: Path, clear_existing: bool = False) -> GraphPersistenceResult:
+        """
+        Generate and persist a navigation graph from a warehouse CSV file.
+
+        Args:
+            csv_path: Path to the warehouse CSV file.
+            clear_existing: If True, clear existing graph tables before persist.
+
+        Returns:
+            GraphPersistenceResult with counts of persisted boxes, nodes, and edges.
+        """
+        pass
     
     @abstractmethod
     def release_conflict_box_lock(self, box_id: str, robot_id: str) -> bool:
@@ -407,6 +425,60 @@ class ISimulationDataService(ABC):
             
         Returns:
             bool: True if inventory was updated successfully, False otherwise
+        """
+        pass
+    
+    @abstractmethod
+    def create_shelves_from_map(self, clear_existing: bool = False) -> int:
+        """
+        Create shelves in the database from warehouse map data.
+        
+        Args:
+            clear_existing: Whether to clear existing shelves before creating new ones
+            
+        Returns:
+            int: Number of shelves created
+            
+        Raises:
+            SimulationDataServiceError: If shelf creation fails
+        """
+        pass
+    
+    @abstractmethod
+    def populate_inventory(self, inventory_data: List[Dict[str, Any]]) -> int:
+        """
+        Populate inventory with items and assign them to shelves.
+        
+        Args:
+            inventory_data: List of inventory data dictionaries with format:
+                {
+                    'item_id': str,
+                    'name': str,
+                    'description': str (optional),
+                    'category': str (optional),
+                    'shelf_id': str,
+                    'quantity': int
+                }
+            
+        Returns:
+            int: Number of inventory entries created
+            
+        Raises:
+            SimulationDataServiceError: If inventory population fails
+        """
+        pass
+    
+    @abstractmethod
+    def get_inventory_statistics(self) -> Dict[str, Any]:
+        """
+        Get comprehensive inventory statistics.
+        
+        Returns:
+            Dict[str, Any]: Inventory statistics including:
+                - total_shelves: Number of shelves
+                - total_items: Number of unique items
+                - total_quantity: Total quantity across all shelves
+                - low_stock_items: Items with quantity < 5
         """
         pass
     

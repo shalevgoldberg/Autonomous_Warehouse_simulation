@@ -23,7 +23,7 @@ from enum import Enum
 from .task_handler_interface import Task
 
 if TYPE_CHECKING:
-    from robot.robot_agent import RobotAgent
+    from robot.robot_agent_lane_based import RobotAgent
 
 
 class BidStatus(Enum):

@@ -28,37 +28,20 @@ class SimpleLongDistanceDemo:
         )
         
         # Physics thread control
-        self.physics_running = False
-        self.physics_thread = None
+        from robot.impl.physics_integration import create_physics_thread_manager
+        self.physics_manager = create_physics_thread_manager(self.physics, frequency_hz=1000.0)
         
         print(f"   [OK] Warehouse: {self.warehouse_map.width}x{self.warehouse_map.height}")
         print(f"   [OK] Robot initialized at: {self.physics.get_robot_pose()}")
     
     def start_physics(self):
         """Start physics loop."""
-        self.physics_running = True
-        
-        def physics_loop():
-            physics_period = 1.0 / 1000.0  # 1000Hz
-            while self.physics_running:
-                start_time = time.time()
-                try:
-                    self.physics.step_physics()
-                except Exception as e:
-                    print(f"[Physics] Error: {e}")
-                elapsed = time.time() - start_time
-                sleep_time = max(0, physics_period - elapsed)
-                time.sleep(sleep_time)
-        
-        self.physics_thread = threading.Thread(target=physics_loop, daemon=True)
-        self.physics_thread.start()
+        self.physics_manager.start()
         print("   [OK] Physics loop started at 1000Hz")
     
     def stop_physics(self):
         """Stop physics loop."""
-        self.physics_running = False
-        if self.physics_thread:
-            self.physics_thread.join(timeout=1.0)
+        self.physics_manager.stop()
         print("   [OK] Physics loop stopped")
     
     def create_long_distance_tasks(self):

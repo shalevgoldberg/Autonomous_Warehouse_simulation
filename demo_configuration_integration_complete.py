@@ -176,8 +176,7 @@ def create_robot_agent(robot_id: str, config_provider: ConfigurationProvider,
     
     # Create robot agent
     robot = RobotAgentLaneBased(
-        warehouse_map=components['warehouse_map'],
-        physics=components['physics'],  # This will need to be created
+        physics=components['physics'],
         config_provider=config_provider,
         robot_id=robot_id,
         simulation_data_service=components['simulation_data_service']

@@ -121,6 +121,17 @@ class IMotionExecutor(ABC):
         Stop current motion execution immediately.
         """
         pass
+
+    @abstractmethod
+    def rotate_to_heading(self, target_heading_rad: float, angular_speed: Optional[float] = None) -> None:
+        """
+        Rotate in place to the requested world-frame heading.
+
+        Args:
+            target_heading_rad: Desired absolute heading (radians, [-pi, pi] normalized internally)
+            angular_speed: Optional angular speed cap (rad/s). If None, use configured max.
+        """
+        pass
     
     @abstractmethod
     def get_motion_status(self) -> MotionStatus:
@@ -215,5 +226,21 @@ class IMotionExecutor(ABC):
         """
         Clear the reached target flag after TaskHandler has processed it.
         This allows the motion executor to return to normal status reporting.
+        """
+        pass
+    
+    @abstractmethod
+    def is_at_target(self, target: Point) -> bool:
+        """
+        Check if robot is at the specified target position.
+        
+        Single Source of Truth for position accuracy - all components should
+        use this method instead of implementing their own position checking.
+        
+        Args:
+            target: Target position to check against
+            
+        Returns:
+            bool: True if robot is within position tolerance of target
         """
         pass 

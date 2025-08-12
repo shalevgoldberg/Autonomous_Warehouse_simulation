@@ -29,7 +29,7 @@ from interfaces.bidding_system_interface import (
 from interfaces.task_handler_interface import Task
 
 if TYPE_CHECKING:
-    from robot.robot_agent import RobotAgent
+    from robot.robot_agent_lane_based import RobotAgent
 
 class TransparentBiddingSystem(IBiddingSystem):
     """
@@ -90,7 +90,13 @@ class TransparentBiddingSystem(IBiddingSystem):
                 
                 for robot in available_robots:
                     try:
-                        robot_id = robot.config.robot_id
+                        # Handle both legacy and lane-based robot agents
+                        if hasattr(robot, 'config') and hasattr(robot.config, 'robot_id'):
+                            robot_id = robot.config.robot_id  # Legacy robot agent
+                        elif hasattr(robot, 'robot_id'):
+                            robot_id = robot.robot_id  # Lane-based robot agent
+                        else:
+                            raise BiddingSystemError("Robot agent has no robot_id attribute")
                     except Exception as e:
                         raise BiddingSystemError(f"Failed to get robot_id: {e}") from e
                     # Check if robot is available for bidding
@@ -398,7 +404,13 @@ class TransparentBiddingSystem(IBiddingSystem):
             battery_level = status.get('battery', 100.0)
             
             # Get robot ID for variation
-            robot_id = robot.config.robot_id
+            # Handle both legacy and lane-based robot agents
+            if hasattr(robot, 'config') and hasattr(robot.config, 'robot_id'):
+                robot_id = robot.config.robot_id  # Legacy robot agent
+            elif hasattr(robot, 'robot_id'):
+                robot_id = robot.robot_id  # Lane-based robot agent
+            else:
+                robot_id = "unknown_robot"  # Fallback
             
             # Calculate distance to task (simplified)
             # For PICK_AND_DELIVER tasks, we'd need shelf coordinates

@@ -156,10 +156,10 @@ class TestRobotAgentLaneBased(unittest.TestCase):
         """Test RobotAgent initialization with valid configuration."""
         with patch('robot.robot_agent_lane_based.SimulationDataServiceImpl', return_value=self.simulation_data_service):
             robot = RobotAgent(
-                warehouse_map=self.warehouse_map,
                 physics=self.physics,
                 config_provider=self.config_provider,
-                robot_id="test_robot"
+                robot_id="test_robot",
+                simulation_data_service=self.simulation_data_service
             )
             
             # Verify all components are created

@@ -21,6 +21,12 @@ from interfaces.state_holder_interface import IStateHolder
 from interfaces.motion_executor_interface import IMotionExecutor, MotionStatus
 from interfaces.simulation_data_service_interface import ISimulationDataService
 from interfaces.configuration_interface import IConfigurationProvider
+from interfaces.conflict_box_queue_interface import (
+    IConflictBoxQueue,
+    LockAcquisitionResult,
+    QueuePosition,
+    ConflictBoxQueueError
+)
 
 
 @dataclass
@@ -32,6 +38,9 @@ class ConflictBoxState:
     heartbeat_time: Optional[float] = None
     robot_inside: bool = False
     priority: int = 0
+    queue_position: Optional[int] = None
+    estimated_wait_time: Optional[float] = None
+    lock_acquisition_result: Optional[LockAcquisitionResult] = None
 
 
 @dataclass
@@ -61,7 +70,8 @@ class LaneFollowerImpl(ILaneFollower):
                  state_holder: IStateHolder,
                  motion_executor: IMotionExecutor,
                  simulation_data_service: ISimulationDataService,
-                 config_provider: Optional[IConfigurationProvider] = None):
+                 config_provider: Optional[IConfigurationProvider] = None,
+                 conflict_box_queue: Optional[IConflictBoxQueue] = None):
         """
         Initialize the lane follower.
         
@@ -71,12 +81,14 @@ class LaneFollowerImpl(ILaneFollower):
             motion_executor: Motion control service
             simulation_data_service: Database and navigation data service
             config_provider: Configuration provider for lane following parameters
+            conflict_box_queue: Queue-based conflict box management service
         """
         self._robot_id = robot_id
         self._state_holder = state_holder
         self._motion_executor = motion_executor
         self._simulation_data_service = simulation_data_service
         self._config_provider = config_provider
+        self._conflict_box_queue = conflict_box_queue
         
         # Thread safety
         self._lock = threading.RLock()
@@ -93,7 +105,7 @@ class LaneFollowerImpl(ILaneFollower):
                 lock_timeout=nav_config.conflict_box_lock_timeout,
                 heartbeat_interval=nav_config.conflict_box_heartbeat_interval,
                 lock_retry_attempts=3,
-                position_tolerance=0.05,
+                # position_tolerance removed - Motion Executor is single source of truth
                 velocity_smoothing_factor=0.1,
                 emergency_stop_distance=0.5
             )
@@ -120,6 +132,12 @@ class LaneFollowerImpl(ILaneFollower):
         # Safety monitoring
         self._last_deviation_report_time = 0.0
         self._consecutive_deviations = 0
+        self._max_deviation_observed = 0.0
+        self._last_deviation_value = 0.0
+
+        # Stop-and-turn coordination
+        self._pending_rotation_heading: Optional[float] = None
+        self._is_rotating: bool = False
         
         # Emergency state
         self._emergency_stopped = False
@@ -132,7 +150,7 @@ class LaneFollowerImpl(ILaneFollower):
             self._config.max_speed = robot_config.max_speed
             self._config.corner_speed = robot_config.corner_speed
             self._config.bay_approach_speed = robot_config.bay_approach_speed
-            self._config.position_tolerance = robot_config.position_tolerance
+            # position_tolerance removed - Motion Executor is single source of truth
     
     def follow_route(self, route: Route, robot_id: str) -> None:
         """Start following a lane-based route."""
@@ -215,6 +233,19 @@ class LaneFollowerImpl(ILaneFollower):
                 return
             
             try:
+                # Handle pending stop-and-turn rotation before moving to next segment
+                if self._is_rotating:
+                    motion_status = self._motion_executor.get_motion_status()
+                    if motion_status not in [MotionStatus.EXECUTING, MotionStatus.REACHED_TARGET]:
+                        # Rotation finished (executor reports IDLE after stopping)
+                        self._is_rotating = False
+                        self._pending_rotation_heading = None
+                        # Start the next segment now that heading is aligned
+                        self._start_next_segment()
+                        return
+                    # Still rotating; skip other updates until rotation completes
+                    return
+                
                 # Update current segment progress
                 self._update_segment_progress()
                 
@@ -322,28 +353,30 @@ class LaneFollowerImpl(ILaneFollower):
         current_time = time.time()
         
         with self._lock:
-            # Rate limiting
-            if current_time - self._last_deviation_report_time < 1.0:
-                return
-            
-            self._last_deviation_report_time = current_time
+            # Determine if we should suppress logs due to rate limiting, but never suppress counter updates
+            rate_limited = (current_time - self._last_deviation_report_time < 1.0)
+            if not rate_limited:
+                self._last_deviation_report_time = current_time
             
             if deviation_distance > self._config.lane_tolerance:
+                # Always count excessive deviations, even within the rate limit window
                 self._consecutive_deviations += 1
-                self._logger.warning(f"Lane deviation: {deviation_distance:.3f}m")
+                if not rate_limited:
+                    self._logger.warning(f"Lane deviation: {deviation_distance:.3f}m")
                 
                 # Critical deviation handling - using reasonable defaults
-                max_deviation = 1.0  # 1 meter max deviation
-                max_consecutive = 5  # 5 consecutive deviations
+                max_deviation = 1.5  # 1.5 meter max deviation (increased from 1.0)
+                max_consecutive = 8  # 8 consecutive deviations (increased from 5)
                 
                 if (deviation_distance > max_deviation or 
                     self._consecutive_deviations > max_consecutive):
-                    
                     error_msg = (f"Critical lane deviation: {deviation_distance:.3f}m, "
                                f"consecutive: {self._consecutive_deviations}")
+                    # Log critical regardless of rate limit to aid diagnostics
                     self._logger.error(error_msg)
                     raise LaneDeviationError(error_msg)
             else:
+                # Reset consecutive deviations when within tolerance
                 self._consecutive_deviations = 0
     
     def get_lane_deviation_stats(self) -> Dict[str, Any]:
@@ -352,45 +385,98 @@ class LaneFollowerImpl(ILaneFollower):
             return {
                 "consecutive_deviations": self._consecutive_deviations,
                 "last_deviation_time": self._last_deviation_report_time,
-                "tolerance": self._config.lane_tolerance
+                "tolerance": self._config.lane_tolerance,
+                "max_deviation": self._max_deviation_observed,
+                "last_deviation": self._last_deviation_value
             }
     
     def try_acquire_conflict_box_lock(self, box_id: str, priority: int = 0) -> bool:
-        """Try to acquire a conflict box lock."""
+        """Try to acquire a conflict box lock using queue system."""
         with self._lock:
             try:
-                success = self._simulation_data_service.try_acquire_conflict_box_lock(
-                    box_id, self._robot_id, priority)
-                
-                if success:
-                    self._locked_boxes.add(box_id)
-                    if box_id in self._conflict_boxes:
-                        self._conflict_boxes[box_id].status = ConflictBoxStatus.LOCKED
-                        self._conflict_boxes[box_id].heartbeat_time = time.time()
-                        self._conflict_boxes[box_id].priority = priority
-                    
-                    self._logger.info(f"Acquired conflict box lock: {box_id}")
+                # Use queue system if available, otherwise fallback to direct acquisition
+                if self._conflict_box_queue:
+                    return self._try_acquire_with_queue(box_id, priority)
                 else:
-                    self._logger.debug(f"Failed to acquire conflict box lock: {box_id}")
-                
-                return success
-                
+                    return self._try_acquire_direct(box_id, priority)
+                    
             except Exception as e:
                 self._logger.error(f"Error acquiring conflict box lock {box_id}: {e}")
                 raise ConflictBoxLockError(f"Failed to acquire lock for {box_id}: {e}")
+    
+    def _try_acquire_with_queue(self, box_id: str, priority: int = 0) -> bool:
+        """Try to acquire a conflict box lock using the queue system."""
+        try:
+            # Request lock through queue system
+            timeout_seconds = self._config.lock_timeout
+            if self._conflict_box_queue is None:
+                raise ConflictBoxLockError("Conflict box queue not available")
+            
+            result = self._conflict_box_queue.request_lock(
+                box_id, self._robot_id, priority, timeout_seconds)
+            
+            # Update conflict box state
+            if box_id in self._conflict_boxes:
+                state = self._conflict_boxes[box_id]
+                state.lock_acquisition_result = result
+                state.queue_position = result.queue_position
+                state.estimated_wait_time = result.estimated_wait_time
+                state.priority = priority
+                state.lock_attempt_time = time.time()
+                
+                if result.success:
+                    state.status = ConflictBoxStatus.LOCKED
+                    state.heartbeat_time = time.time()
+                    self._locked_boxes.add(box_id)
+                    self._logger.info(f"Acquired conflict box lock immediately: {box_id}")
+                else:
+                    state.status = ConflictBoxStatus.QUEUED
+                    self._logger.info(f"Queued for conflict box {box_id} at position {result.queue_position} "
+                                    f"(estimated wait: {result.estimated_wait_time:.1f}s)")
+            
+            return result.success
+            
+        except ConflictBoxQueueError as e:
+            self._logger.error(f"Queue error acquiring lock for {box_id}: {e}")
+            raise ConflictBoxLockError(f"Queue error for {box_id}: {e}")
+    
+    def _try_acquire_direct(self, box_id: str, priority: int = 0) -> bool:
+        """Try to acquire a conflict box lock directly (fallback method)."""
+        success = self._simulation_data_service.try_acquire_conflict_box_lock(
+            box_id, self._robot_id, priority)
+        
+        if success:
+            self._locked_boxes.add(box_id)
+            if box_id in self._conflict_boxes:
+                self._conflict_boxes[box_id].status = ConflictBoxStatus.LOCKED
+                self._conflict_boxes[box_id].heartbeat_time = time.time()
+                self._conflict_boxes[box_id].priority = priority
+            
+            self._logger.info(f"Acquired conflict box lock: {box_id}")
+        else:
+            self._logger.debug(f"Failed to acquire conflict box lock: {box_id}")
+        
+        return success
     
     def release_conflict_box_lock(self, box_id: str) -> bool:
         """Release a conflict box lock."""
         with self._lock:
             try:
-                success = self._simulation_data_service.release_conflict_box_lock(
-                    box_id, self._robot_id)
+                # Use queue system if available, otherwise fallback to direct release
+                if self._conflict_box_queue:
+                    success = self._conflict_box_queue.release_lock(box_id, self._robot_id)
+                else:
+                    success = self._simulation_data_service.release_conflict_box_lock(
+                        box_id, self._robot_id)
                 
                 if success:
                     self._locked_boxes.discard(box_id)
                     if box_id in self._conflict_boxes:
                         self._conflict_boxes[box_id].status = ConflictBoxStatus.UNLOCKED
                         self._conflict_boxes[box_id].heartbeat_time = None
+                        self._conflict_boxes[box_id].queue_position = None
+                        self._conflict_boxes[box_id].estimated_wait_time = None
+                        self._conflict_boxes[box_id].lock_acquisition_result = None
                     
                     self._logger.info(f"Released conflict box lock: {box_id}")
                 else:
@@ -411,16 +497,26 @@ class LaneFollowerImpl(ILaneFollower):
             return
         
         segment = self._current_route.segments[self._segment_index]
+        # Set current target to the segment end point (drive toward endpoint)
         self._current_segment = LaneSegmentProgress(
             segment_index=self._segment_index,
             segment=segment,
             progress_ratio=0.0,
             distance_remaining=self._calculate_segment_distance(segment),
-            current_target=segment.start_point
+            current_target=segment.end_point
         )
         
         self._status = LaneFollowingStatus.FOLLOWING_LANE
         
+        # Before starting motion, if this is the first segment or a sharp turn, pre-rotate
+        if self._should_prerotate_for_segment(self._segment_index):
+            target_heading = self._segment_heading(self._current_segment.segment)
+            self._motion_executor.rotate_to_heading(target_heading)
+            self._is_rotating = True
+            self._pending_rotation_heading = target_heading
+            self._logger.info(f"Pre-rotating to heading {target_heading:.3f} rad before segment {self._segment_index + 1}")
+            return
+
         # Start motion execution for this segment
         self._execute_segment_motion(segment)
         
@@ -478,6 +574,22 @@ class LaneFollowerImpl(ILaneFollower):
             self._distance_traveled += self._calculate_segment_distance(self._current_segment.segment)
             self._logger.info(f"Completed segment {self._segment_index + 1}")
         
+        # Determine if we need a stop-and-turn before the next segment
+        next_index = self._segment_index + 1
+        if self._current_route and next_index < len(self._current_route.segments):
+            curr_heading = self._segment_heading(self._current_segment.segment)
+            next_heading = self._segment_heading(self._current_route.segments[next_index])
+            if self._is_turn(curr_heading, next_heading):
+                # Advance to next segment index but perform rotation before starting motion
+                self._segment_index = next_index
+                self._pending_rotation_heading = next_heading
+                self._is_rotating = True
+                self._motion_executor.rotate_to_heading(next_heading)
+                self._logger.info(f"Stop-and-turn: rotating to heading {next_heading:.3f} rad before segment {self._segment_index + 1}")
+                # Do not start next segment until rotation completes
+                return
+        
+        # No rotation needed; advance and start next segment immediately
         self._segment_index += 1
         self._start_next_segment()
     
@@ -523,6 +635,10 @@ class LaneFollowerImpl(ILaneFollower):
         robot_pos = self._state_holder.get_position()
         robot_pos_2d = (robot_pos[0], robot_pos[1])
         deviation = self._calculate_lane_deviation(robot_pos_2d, self._current_segment.segment)
+        # Track last and max observed deviations
+        self._last_deviation_value = deviation
+        if deviation > self._max_deviation_observed:
+            self._max_deviation_observed = deviation
         
         if deviation > self._config.lane_tolerance:
             # Create Point objects for the interface
@@ -576,7 +692,11 @@ class LaneFollowerImpl(ILaneFollower):
             try:
                 with self._lock:
                     for box_id in list(self._locked_boxes):
-                        self._simulation_data_service.heartbeat_conflict_box_lock(box_id, self._robot_id)
+                        # Use queue system if available, otherwise fallback to direct heartbeat
+                        if self._conflict_box_queue:
+                            self._conflict_box_queue.heartbeat_lock(box_id, self._robot_id)
+                        else:
+                            self._simulation_data_service.heartbeat_conflict_box_lock(box_id, self._robot_id)
                 
                 time.sleep(self._config.heartbeat_interval)
                 
@@ -602,6 +722,35 @@ class LaneFollowerImpl(ILaneFollower):
             total_distance += self._calculate_distance((p1.x, p1.y), (p2.x, p2.y))
         
         return total_distance
+
+    def _segment_heading(self, segment: RouteSegment) -> float:
+        """Compute heading (radians) of the primary direction of a segment."""
+        waypoints = segment.lane.waypoints
+        if len(waypoints) >= 2:
+            p1 = waypoints[0]
+            p2 = waypoints[1]
+            return math.atan2(p2.y - p1.y, p2.x - p1.x)
+        return 0.0
+
+    def _is_turn(self, heading_a: float, heading_b: float, threshold_rad: float = 0.35) -> bool:
+        """Return True if the change in heading suggests a turn (not a straight)."""
+        diff = abs((heading_b - heading_a + math.pi) % (2 * math.pi) - math.pi)
+        return diff >= threshold_rad
+
+    def _should_prerotate_for_segment(self, seg_index: int) -> bool:
+        """Decide if we should pre-rotate before starting the given segment."""
+        # Pre-rotate for the first segment if current orientation is far from segment heading
+        if seg_index == 0:
+            try:
+                x, y, theta = self._state_holder.get_position()
+            except Exception:
+                theta = 0.0
+            desired = self._segment_heading(self._current_route.segments[seg_index])
+            diff = abs((desired - theta + math.pi) % (2 * math.pi) - math.pi)
+            return diff >= 0.35
+        
+        # For other segments, we will handle rotation between segments in _complete_current_segment
+        return False
     
     def _is_segment_in_conflict_box(self, segment: RouteSegment) -> bool:
         """Check if segment passes through any conflict box."""

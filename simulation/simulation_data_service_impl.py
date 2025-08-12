@@ -32,8 +32,11 @@ from interfaces.simulation_data_service_interface import (
     MapData,
     NavigationGraph,
     GraphNode,
-    SimulationDataServiceError
+    SimulationDataServiceError,
 )
+from interfaces.graph_persistence_interface import GraphPersistenceResult
+from warehouse.impl.graph_persistence_impl import GraphPersistenceImpl
+from pathlib import Path
 from interfaces.navigation_types import LaneRec, BoxRec, Point, LaneDirection
 from warehouse.map import WarehouseMap
 
@@ -258,6 +261,20 @@ class SimulationDataServiceImpl(ISimulationDataService):
         except Exception as e:
             logger.error(f"Failed to get map data: {e}")
             raise SimulationDataServiceError(f"Failed to get map data: {e}")
+
+    # Graph persistence API
+    def persist_navigation_graph_from_csv(self, csv_path: Path, clear_existing: bool = False) -> GraphPersistenceResult:
+        try:
+            gp = GraphPersistenceImpl(self)
+            result = gp.persist_from_csv(csv_path=csv_path, clear_existing=clear_existing)
+            logger.info(
+                "Persisted navigation graph from %s (boxes=%d, nodes=%d, edges=%d, cleared=%s)",
+                str(csv_path), result.boxes_persisted, result.nodes_persisted, result.edges_persisted, result.cleared_existing
+            )
+            return result
+        except Exception as e:
+            logger.error(f"Failed to persist navigation graph: {e}")
+            raise SimulationDataServiceError(f"Graph persistence failed: {e}")
     
     def get_shelf_position(self, shelf_id: str) -> Optional[Tuple[float, float]]:
         """
@@ -595,6 +612,181 @@ class SimulationDataServiceImpl(ISimulationDataService):
         except Exception as e:
             logger.error(f"Failed to update inventory: {e}")
             raise SimulationDataServiceError(f"Failed to update inventory: {e}")
+    
+    def create_shelves_from_map(self, clear_existing: bool = False) -> int:
+        """
+        Create shelves in the database from warehouse map data.
+        
+        Args:
+            clear_existing: Whether to clear existing shelves before creating new ones
+            
+        Returns:
+            int: Number of shelves created
+            
+        Raises:
+            SimulationDataServiceError: If shelf creation fails
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Clear existing shelves if requested
+                    if clear_existing:
+                        # Handle foreign key constraints by deleting in proper order
+                        cur.execute("DELETE FROM shelf_inventory")
+                        # Check if task_shelf_options table exists and clear it
+                        cur.execute("""
+                            SELECT EXISTS (
+                                SELECT FROM information_schema.tables 
+                                WHERE table_name = 'task_shelf_options'
+                            )
+                        """)
+                        if cur.fetchone()['exists']:
+                            cur.execute("DELETE FROM task_shelf_options")
+                        cur.execute("DELETE FROM shelves")
+                        logger.info("Cleared existing shelves and inventory")
+                    
+                    # Get shelf positions from warehouse map
+                    shelves_created = 0
+                    
+                    for shelf_id, (grid_x, grid_y) in self.warehouse_map.shelves.items():
+                        # Convert grid coordinates to world coordinates
+                        world_x = grid_x * self.warehouse_map.grid_size + self.warehouse_map.grid_size / 2
+                        world_y = grid_y * self.warehouse_map.grid_size + self.warehouse_map.grid_size / 2
+                        
+                        # Insert shelf into database
+                        cur.execute("""
+                            INSERT INTO shelves (shelf_id, position_x, position_y)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT (shelf_id) DO NOTHING
+                        """, (shelf_id, world_x, world_y))
+                        
+                        if cur.rowcount > 0:
+                            shelves_created += 1
+                    
+                    conn.commit()
+                    logger.info(f"Created {shelves_created} shelves from warehouse map")
+                    return shelves_created
+                    
+        except Exception as e:
+            logger.error(f"Failed to create shelves from map: {e}")
+            raise SimulationDataServiceError(f"Shelf creation failed: {e}")
+    
+    def populate_inventory(self, inventory_data: List[Dict[str, Any]]) -> int:
+        """
+        Populate inventory with items and assign them to shelves.
+        
+        Args:
+            inventory_data: List of inventory data dictionaries with format:
+                {
+                    'item_id': str,
+                    'name': str,
+                    'description': str (optional),
+                    'category': str (optional),
+                    'shelf_id': str,
+                    'quantity': int
+                }
+            
+        Returns:
+            int: Number of inventory entries created
+            
+        Raises:
+            SimulationDataServiceError: If inventory population fails
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    inventory_created = 0
+                    
+                    for item_data in inventory_data:
+                        # Insert item if it doesn't exist (let defaults handle created_at/updated_at)
+                        cur.execute("""
+                            INSERT INTO items (item_id, name)
+                            VALUES (%s, %s)
+                            ON CONFLICT (item_id) DO NOTHING
+                        """, (item_data['item_id'], item_data['name']))
+                        
+                        # Insert inventory on shelf
+                        cur.execute("""
+                            INSERT INTO shelf_inventory (shelf_id, item_id, quantity)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT (shelf_id, item_id)
+                            DO UPDATE SET quantity = EXCLUDED.quantity
+                        """, (
+                            item_data['shelf_id'],
+                            item_data['item_id'],
+                            item_data['quantity']
+                        ))
+                        
+                        if cur.rowcount > 0:
+                            inventory_created += 1
+                    
+                    conn.commit()
+                    logger.info(f"Populated {inventory_created} inventory entries")
+                    return inventory_created
+                    
+        except Exception as e:
+            logger.error(f"Failed to populate inventory: {e}")
+            logger.error(f"Error type: {type(e)}")
+            logger.error(f"Error details: {str(e)}")
+            raise SimulationDataServiceError(f"Inventory population failed: {e}")
+    
+    def get_inventory_statistics(self) -> Dict[str, Any]:
+        """
+        Get comprehensive inventory statistics.
+        
+        Returns:
+            Dict[str, Any]: Inventory statistics including:
+                - total_shelves: Number of shelves
+                - total_items: Number of unique items
+                - total_quantity: Total quantity across all shelves
+                - items_by_category: Items grouped by category
+                - low_stock_items: Items with quantity < 5
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Get basic statistics
+                    cur.execute("""
+                        SELECT 
+                            COUNT(DISTINCT s.shelf_id) as total_shelves,
+                            COUNT(DISTINCT i.item_id) as total_items,
+                            COALESCE(SUM(si.quantity), 0) as total_quantity
+                        FROM shelves s
+                        LEFT JOIN shelf_inventory si ON s.shelf_id = si.shelf_id
+                        LEFT JOIN items i ON si.item_id = i.item_id
+                    """)
+                    
+                    basic_stats = cur.fetchone()
+                    
+                    # Get low stock items
+                    cur.execute("""
+                        SELECT i.item_id, i.name, si.quantity, si.shelf_id
+                        FROM shelf_inventory si
+                        JOIN items i ON si.item_id = i.item_id
+                        WHERE si.quantity < 5
+                        ORDER BY si.quantity ASC
+                    """)
+                    
+                    low_stock_items = cur.fetchall()
+                    
+                    return {
+                        'total_shelves': basic_stats['total_shelves'],
+                        'total_items': basic_stats['total_items'],
+                        'total_quantity': basic_stats['total_quantity'],
+                        'low_stock_items': [
+                            {
+                                'item_id': item['item_id'],
+                                'name': item['name'],
+                                'quantity': item['quantity'],
+                                'shelf_id': item['shelf_id']
+                            }
+                            for item in low_stock_items
+                        ]
+                    }
+                    
+        except Exception as e:
+            logger.error(f"Failed to get inventory statistics: {e}")
+            raise SimulationDataServiceError(f"Failed to get inventory statistics: {e}")
     
     # KPI Logging
     def log_event(self, event_type: str, robot_id: str, event_data: Dict[str, Any]) -> None:

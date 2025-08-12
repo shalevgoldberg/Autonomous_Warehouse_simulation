@@ -5,19 +5,19 @@ This implementation provides thorough validation of all configuration parameters
 with detailed error messages and support for custom validation rules.
 """
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Callable
 from dataclasses import dataclass
 
 from interfaces.configuration_interface import (
     IConfigurationValidator, RobotConfig, DatabaseConfig, NavigationConfig,
-    TaskConfig, SystemConfig, ConfigurationError
+    TaskConfig, BidConfig, SystemConfig, ConfigurationError
 )
 
 
 @dataclass
 class ValidationRule:
     """A validation rule with condition and error message."""
-    condition: callable
+    condition: Callable
     error_message: str
     field_name: str
 
@@ -39,6 +39,7 @@ class ConfigurationValidatorImpl(IConfigurationValidator):
         self._database_rules = self._create_database_validation_rules()
         self._navigation_rules = self._create_navigation_validation_rules()
         self._task_rules = self._create_task_validation_rules()
+        self._bid_rules = self._create_bid_validation_rules()
         self._system_rules = self._create_system_validation_rules()
     
     def validate_robot_config(self, config: RobotConfig) -> List[str]:
@@ -196,6 +197,51 @@ class ConfigurationValidatorImpl(IConfigurationValidator):
         
         if config.metrics_collection_interval <= 0:
             errors.append("System.metrics_collection_interval: Metrics collection interval must be positive")
+        
+        return errors
+    
+    def validate_bid_config(self, config: BidConfig) -> List[str]:
+        """
+        Validate bid configuration.
+        
+        Args:
+            config: Bid configuration to validate
+            
+        Returns:
+            List[str]: List of validation errors
+        """
+        errors = []
+        
+        # Apply all validation rules
+        for rule in self._bid_rules:
+            if not rule.condition(config):
+                errors.append(f"Bid.{rule.field_name}: {rule.error_message}")
+        
+        # Cross-field validation
+        if config.max_parallel_workers < 1:
+            errors.append("Bid.max_parallel_workers: Must be at least 1")
+        
+        if config.battery_threshold < 0 or config.battery_threshold > 1:
+            errors.append("Bid.battery_threshold: Must be between 0 and 1")
+        
+        if config.calculation_timeout <= 0:
+            errors.append("Bid.calculation_timeout: Must be positive")
+        
+        if config.max_distance_normalization <= 0:
+            errors.append("Bid.max_distance_normalization: Must be positive")
+        
+        # Validate factor weights
+        weight_fields = [
+            config.distance_weight, config.battery_weight, config.workload_weight,
+            config.task_type_compatibility_weight, config.robot_capabilities_weight,
+            config.time_urgency_weight, config.conflict_box_availability_weight,
+            config.shelf_accessibility_weight
+        ]
+        
+        for weight in weight_fields:
+            if weight < 0 or weight > 1:
+                errors.append("Bid factor weights: Must be between 0 and 1")
+                break
         
         return errors
     
@@ -446,6 +492,31 @@ class ConfigurationValidatorImpl(IConfigurationValidator):
                 lambda c: c.battery_cost_factor >= 0,
                 "Battery cost factor must be non-negative",
                 "battery_cost_factor"
+            ),
+        ]
+    
+    def _create_bid_validation_rules(self) -> List[ValidationRule]:
+        """Create validation rules for bid configuration."""
+        return [
+            ValidationRule(
+                lambda c: c.max_parallel_workers > 0,
+                "Max parallel workers must be positive",
+                "max_parallel_workers"
+            ),
+            ValidationRule(
+                lambda c: 0 <= c.battery_threshold <= 1,
+                "Battery threshold must be between 0 and 1",
+                "battery_threshold"
+            ),
+            ValidationRule(
+                lambda c: c.calculation_timeout > 0,
+                "Calculation timeout must be positive",
+                "calculation_timeout"
+            ),
+            ValidationRule(
+                lambda c: c.max_distance_normalization > 0,
+                "Max distance normalization must be positive",
+                "max_distance_normalization"
             ),
         ]
     

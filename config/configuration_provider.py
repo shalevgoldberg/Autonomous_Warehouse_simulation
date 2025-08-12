@@ -8,7 +8,7 @@ import threading
 from typing import Dict, Any, Optional, List
 from interfaces.configuration_interface import (
     IConfigurationProvider, IConfigurationSource, IConfigurationValidator,
-    RobotConfig, DatabaseConfig, NavigationConfig, TaskConfig, SystemConfig,
+    RobotConfig, DatabaseConfig, NavigationConfig, TaskConfig, BidConfig, SystemConfig,
     ConfigurationSource, ConfigurationValue, ConfigurationError
 )
 from config.configuration_sources import (
@@ -82,16 +82,17 @@ class ConfigurationProvider(IConfigurationProvider):
             position_tolerance=c.get("robot.position_tolerance", 0.1),
             control_frequency=c.get("robot.control_frequency", 10.0),
             motion_frequency=c.get("robot.motion_frequency", 100.0),
-            lane_tolerance=c.get("robot.lane_tolerance", 0.1),
+            cell_size=c.get("robot.cell_size", 0.5),  # Match warehouse map cell size
+            lane_tolerance=c.get("robot.lane_tolerance", 0.3),  # Increased from 0.1 to 0.3 for more reasonable deviation tolerance
             corner_speed=c.get("robot.corner_speed", 0.3),
             bay_approach_speed=c.get("robot.bay_approach_speed", 0.2),
             conflict_box_lock_timeout=c.get("robot.conflict_box_lock_timeout", 30.0),
             conflict_box_heartbeat_interval=c.get("robot.conflict_box_heartbeat_interval", 5.0),
             max_linear_velocity=c.get("robot.max_linear_velocity", 2.0),
-            max_angular_velocity=c.get("robot.max_angular_velocity", 2.0),
+            max_angular_velocity=c.get("robot.max_angular_velocity", 1.0),  # Reduced from 2.0 to 1.0
             movement_speed=c.get("robot.movement_speed", 1.5),
             wheel_base=c.get("robot.wheel_base", 0.3),
-            wheel_radius=c.get("robot.wheel_radius", 0.05),
+            wheel_radius=c.get("robot.wheel_radius", 0.12),  # Increased from 0.05 to 0.12 (more realistic)
             picking_duration=c.get("robot.picking_duration", 5.0),
             dropping_duration=c.get("robot.dropping_duration", 3.0),
             charging_threshold=c.get("robot.charging_threshold", 0.2),
@@ -144,6 +145,43 @@ class ConfigurationProvider(IConfigurationProvider):
             max_bid_value=c.get("task.max_bid_value", 1000.0),
             distance_cost_factor=c.get("task.distance_cost_factor", 10.0),
             battery_cost_factor=c.get("task.battery_cost_factor", 5.0),
+        )
+
+    def get_bid_config(self) -> BidConfig:
+        c = {**self._config, **self._overrides}
+        return BidConfig(
+            # Parallel processing
+            max_parallel_workers=c.get("bid.max_parallel_workers", 4),
+            
+            # Factor weights
+            distance_weight=c.get("bid.distance_weight", 0.4),
+            battery_weight=c.get("bid.battery_weight", 0.3),
+            workload_weight=c.get("bid.workload_weight", 0.2),
+            task_type_compatibility_weight=c.get("bid.task_type_compatibility_weight", 0.1),
+            robot_capabilities_weight=c.get("bid.robot_capabilities_weight", 0.0),
+            time_urgency_weight=c.get("bid.time_urgency_weight", 0.0),
+            conflict_box_availability_weight=c.get("bid.conflict_box_availability_weight", 0.0),
+            shelf_accessibility_weight=c.get("bid.shelf_accessibility_weight", 0.0),
+            
+            # Factor enablement
+            enable_distance_factor=c.get("bid.enable_distance_factor", True),
+            enable_battery_factor=c.get("bid.enable_battery_factor", True),
+            enable_workload_factor=c.get("bid.enable_workload_factor", True),
+            enable_task_type_compatibility_factor=c.get("bid.enable_task_type_compatibility_factor", True),
+            enable_robot_capabilities_factor=c.get("bid.enable_robot_capabilities_factor", False),
+            enable_time_urgency_factor=c.get("bid.enable_time_urgency_factor", False),
+            enable_conflict_box_availability_factor=c.get("bid.enable_conflict_box_availability_factor", False),
+            enable_shelf_accessibility_factor=c.get("bid.enable_shelf_accessibility_factor", False),
+            
+            # Calculation parameters
+            battery_threshold=c.get("bid.battery_threshold", 0.2),
+            calculation_timeout=c.get("bid.calculation_timeout", 1.0),
+            max_distance_normalization=c.get("bid.max_distance_normalization", 20.0),
+            
+            # Performance tuning
+            enable_parallel_calculation=c.get("bid.enable_parallel_calculation", True),
+            enable_calculation_statistics=c.get("bid.enable_calculation_statistics", True),
+            enable_factor_breakdown=c.get("bid.enable_factor_breakdown", True),
         )
 
     def get_system_config(self) -> SystemConfig:

@@ -83,6 +83,7 @@ class WarehouseMap:
         - Each cell represents a warehouse grid cell
         - Values: '.' or '0' = free space, 'w' or '1' = wall, 's' or '2' = shelf, 
                  'c' or '3' = charging, 'i' or '4' = idle zone, 'd' or '5' = drop-off
+        - Lane/junction encodings (e.g., 'ls', 'lw', 'lne', 'js', etc.) are treated as walkable
         """
         try:
             with open(csv_file, 'r', newline='') as file:
@@ -101,6 +102,7 @@ class WarehouseMap:
                 'i': 4, '4': 4,         # Idle zone
                 'd': 5, '5': 5          # Drop-off station
             }
+            lane_prefixes = ('l', 'j')  # Lane and junction prefixes
             
             # Load the grid
             for y, row in enumerate(rows):
@@ -115,11 +117,13 @@ class WarehouseMap:
                     
                     if cell_value in value_map:
                         self.grid[y, x] = value_map[cell_value]
-                        
                         # Create shelf entry if it's a shelf
                         if value_map[cell_value] == 2:  # Shelf
                             shelf_id = f"shelf_{len(self.shelves)}"
                             self.shelves[shelf_id] = (x, y)
+                    elif cell_value.startswith(lane_prefixes):
+                        # Treat all lane/junction encodings as walkable (free space)
+                        self.grid[y, x] = 0
                     else:
                         # Default to free space for unknown values
                         self.grid[y, x] = 0

@@ -71,12 +71,13 @@ class GraphGeneratorImpl(IGraphGenerator):
         conflict_box_counter = 0
         for row_idx, row in enumerate(grid):
             for col_idx, cell_value in enumerate(row):
-                if cell_value in ['w', 'd', 'i', 'c']:  # walls, dock, idle, charging
+                # Treat idle ('i'/'4') and charging ('c'/'3') as graph nodes; skip 'w' (walls) and 'd' (drop-off) for now
+                if cell_value in ['w', 'd']:  # walls, dock
                     continue
                 
-                # Calculate world position (matching warehouse map coordinate system)
-                x = col_idx * self.cell_size
-                y = row_idx * self.cell_size  # Positive Y to match warehouse map
+                # Calculate world position at the CENTER of the cell (matches WarehouseMap)
+                x = (col_idx + 0.5) * self.cell_size
+                y = (row_idx + 0.5) * self.cell_size
                 pos = (x, y)
                 
                 # Parse cell value
@@ -119,6 +120,27 @@ class GraphGeneratorImpl(IGraphGenerator):
                     )
                     nodes[node_id] = node
                     position_to_node[pos] = node_id
+                elif cell_value in ['i', '4']:  # Idle zone as a graph node (non-through)
+                    # Idle nodes have no encoded directions; we connect them to adjacent lanes/junctions later
+                    node_id = f"idle_{row_idx}_{col_idx}"
+                    node = GraphNode(
+                        node_id=node_id,
+                        position=Point(x, y),
+                        directions=[],
+                        is_conflict_box=False
+                    )
+                    nodes[node_id] = node
+                    position_to_node[pos] = node_id
+                elif cell_value in ['c', '3']:  # Charging zone as a graph node (non-through)
+                    node_id = f"charge_{row_idx}_{col_idx}"
+                    node = GraphNode(
+                        node_id=node_id,
+                        position=Point(x, y),
+                        directions=[],
+                        is_conflict_box=False
+                    )
+                    nodes[node_id] = node
+                    position_to_node[pos] = node_id
     
     def _parse_directions(self, direction_str: str) -> List[LaneDirection]:
         """Parse direction string into LaneDirection set."""
@@ -148,6 +170,30 @@ class GraphGeneratorImpl(IGraphGenerator):
                 
                 if target_node_id:
                     edges[node_id].append(target_node_id)
+
+        # Connect idle/charging nodes to adjacent lane/junction nodes (bidirectional)
+        for node_id, node in nodes.items():
+            if node_id.startswith('idle_') or node_id.startswith('charge_'):
+                x, y = node.position.x, node.position.y
+                neighbor_positions = [
+                    (x, y - self.cell_size),  # N
+                    (x, y + self.cell_size),  # S
+                    (x + self.cell_size, y),  # E
+                    (x - self.cell_size, y),  # W
+                ]
+                for nx, ny in neighbor_positions:
+                    neighbor_id = position_to_node.get((nx, ny))
+                    if not neighbor_id:
+                        continue
+                    if neighbor_id.startswith('lane_') or neighbor_id.startswith('box_'):
+                        # idle -> neighbor
+                        if neighbor_id not in edges[node_id]:
+                            edges[node_id].append(neighbor_id)
+                        # neighbor -> idle
+                        if neighbor_id not in edges:
+                            edges[neighbor_id] = []
+                        if node_id not in edges[neighbor_id]:
+                            edges[neighbor_id].append(node_id)
     
     def _get_exit_position(self, position: Point, direction: LaneDirection) -> Point:
         """Calculate the position where the exit direction leads to."""

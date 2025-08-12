@@ -84,3 +84,26 @@ def lines_intersect(p1, p2, p3, p4):
         return (C[1] - A[1]) * (B[0] - A[0]) > (B[1] - A[1]) * (C[0] - A[0])
     
     return ccw(p1, p3, p4) != ccw(p2, p3, p4) and ccw(p1, p2, p3) != ccw(p1, p2, p4) 
+
+def mapdata_to_warehouse_map(map_data):
+    """
+    Convert MapData (from SimulationDataService) to a WarehouseMap instance.
+    Args:
+        map_data (MapData): The map data object from the data service.
+    Returns:
+        WarehouseMap: A reconstructed warehouse map.
+    """
+    from warehouse.map import WarehouseMap
+    warehouse_map = WarehouseMap(width=map_data.width, height=map_data.height)
+    warehouse_map.grid_size = map_data.cell_size
+    # Clear grid
+    warehouse_map.grid[:, :] = 0
+    # Set obstacles
+    for (x, y) in map_data.obstacles:
+        warehouse_map.grid[y, x] = 1
+    # Set shelves
+    warehouse_map.shelves = dict(map_data.shelves)
+    for shelf_id, (x, y) in map_data.shelves.items():
+        warehouse_map.grid[y, x] = 2
+    # Do not assign dropoff_stations or charging_zones directly; rely on WarehouseMap methods
+    return warehouse_map 

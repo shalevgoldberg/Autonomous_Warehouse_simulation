@@ -16,6 +16,7 @@ from interfaces.motion_executor_interface import IMotionExecutor, MotionCommand,
 from interfaces.path_planner_interface import Path, Cell
 from interfaces.coordinate_system_interface import ICoordinateSystem
 from interfaces.configuration_interface import IConfigurationProvider
+from interfaces.navigation_types import Point
 
 
 class MotionMode(Enum):
@@ -164,6 +165,9 @@ class MotionExecutorImpl(IMotionExecutor):
             self._stop_motion_internal()
             
             # Set new path
+            # Reset snap state for new motion
+            self._snap_triggered = False
+            self._snap_start_time = None
             self._current_path = path
             self._path_index = 0
             self._iteration_counter = 0  # Reset iteration counter for new path
@@ -195,6 +199,9 @@ class MotionExecutorImpl(IMotionExecutor):
             self._stop_motion_internal()
             
             # Set single move target
+            # Reset snap state for new motion
+            self._snap_triggered = False
+            self._snap_start_time = None
             self._current_path = None
             self._path_index = 0
             self._current_mode = MotionMode.SINGLE_MOVE
@@ -225,21 +232,42 @@ class MotionExecutorImpl(IMotionExecutor):
             else:
                 return MotionStatus.IDLE
     
-    def is_at_target(self, target: Tuple[float, float], tolerance: float = 0.1) -> bool:
+    def is_at_target(self, target) -> bool:
         """
-        Check if robot has reached the target position.
+        Check if robot is at the specified target position.
+        
+        Single Source of Truth for position accuracy - all components should
+        use this method instead of implementing their own position checking.
         
         Args:
-            target: Target position (x, y)
-            tolerance: Position tolerance in meters
+            target: Target position (Point object or tuple (x, y))
             
         Returns:
-            bool: True if at target, False otherwise
+            bool: True if robot is within position tolerance of target
         """
-        # For now, simulate position checking
-        # In real implementation, would get current position from StateHolder
-        # For testing, assume we're at target if tolerance is large enough
-        return tolerance > 0.05
+        # Handle both Point objects and tuples
+        if hasattr(target, 'x') and hasattr(target, 'y'):
+            target_x, target_y = target.x, target.y
+        else:
+            target_x, target_y = target
+        
+        # Get current position from physics engine or state holder
+        if hasattr(self, 'physics_engine') and self.physics_engine:
+            try:
+                current_pos = self.physics_engine.get_robot_pose()
+                current_x, current_y = current_pos[0], current_pos[1]
+            except Exception:
+                # Fallback if physics engine not available
+                current_x, current_y = 0.0, 0.0
+        else:
+            # Fallback for testing without physics
+            current_x, current_y = 0.0, 0.0
+        
+        # Calculate distance to target
+        distance = math.sqrt((target_x - current_x)**2 + (target_y - current_y)**2)
+        
+        # Use configured position tolerance as single source of truth
+        return distance <= self._position_tolerance
     
     def get_current_target(self) -> Optional[Tuple[float, float]]:
         """Get the current target position being moved to."""
@@ -287,6 +315,21 @@ class MotionExecutorImpl(IMotionExecutor):
                 self._update_single_move()
             elif self._current_mode == MotionMode.ROTATING:
                 self._update_rotation()
+
+    def rotate_to_heading(self, target_heading_rad: float, angular_speed: Optional[float] = None) -> None:
+        """Rotate in place to the requested heading."""
+        with self._status_lock:
+            self._stop_motion_internal()
+            self._current_mode = MotionMode.ROTATING
+            self._target_heading = target_heading_rad
+            self._rotation_speed_cap = (
+                max(0.1, min(self._max_angular_velocity, angular_speed))
+                if angular_speed is not None else self._max_angular_velocity
+            )
+            self._motion_start_time = time.time()
+            # Clear any leftover reached flag from previous segment
+            self._reached_target_flag = False
+            print(f"[MotionExecutor] Rotating to heading {target_heading_rad:.3f} rad (cap {self._rotation_speed_cap:.2f} rad/s)")
     
     def set_wheel_commands_atomic(self, left_vel: float, right_vel: float) -> None:
         """
@@ -325,6 +368,9 @@ class MotionExecutorImpl(IMotionExecutor):
         self._current_target = None
         self._path_index = 0
         self._iteration_counter = 0  # Reset iteration counter on stop
+        # Reset snap state
+        self._snap_triggered = False
+        self._snap_start_time = None
         self.set_wheel_commands_atomic(0.0, 0.0)
     
     def _update_path_following(self) -> None:
@@ -358,6 +404,9 @@ class MotionExecutorImpl(IMotionExecutor):
                     # Set next target
                     next_cell = self._current_path.cells[self._path_index]
                     self._current_target = self.coordinate_system.cell_to_world(next_cell)
+                    # Reset snap state on waypoint advance
+                    self._snap_triggered = False
+                    self._snap_start_time = None
                     print(f"[MotionExecutor] Reached waypoint {self._path_index-1}, moving to waypoint {self._path_index}")
                 else:
                     # Path completed
@@ -407,15 +456,29 @@ class MotionExecutorImpl(IMotionExecutor):
         self._calculate_motion_to_target()
     
     def _update_rotation(self) -> None:
-        """Internal: Update rotation motion."""
-        # Simulate rotation completion
-        if time.time() - self._motion_start_time > 1.0:  # Simulate 1-second rotation
+        """Internal: Update rotation motion toward absolute heading."""
+        # Get current pose
+        if hasattr(self, 'physics_engine') and self.physics_engine:
+            current_x, current_y, current_theta = self.physics_engine.get_robot_pose()
+        else:
+            current_theta = 0.0
+
+        # Normalize error to [-pi, pi]
+        theta_error = self._target_heading - current_theta
+        while theta_error > math.pi:
+            theta_error -= 2 * math.pi
+        while theta_error < -math.pi:
+            theta_error += 2 * math.pi
+
+        # Stop when within tolerance
+        if abs(theta_error) <= self._angular_tolerance:
             self._current_mode = MotionMode.STOPPED
-            self._current_target = None
+            self.set_wheel_commands_atomic(0.0, 0.0)
             return
-        
-        # Calculate rotation commands
-        angular_vel = self._max_angular_velocity
+
+        # Proportional angular velocity with cap
+        k_p = 1.2
+        angular_vel = max(-self._rotation_speed_cap, min(self._rotation_speed_cap, k_p * theta_error))
         left_vel, right_vel = self._angular_to_wheel_velocities(0.0, angular_vel)
         self.set_wheel_commands_atomic(left_vel, right_vel)
     
@@ -482,7 +545,7 @@ class MotionExecutorImpl(IMotionExecutor):
             else:
                 # Normal proportional control with gradual speed reduction
                 linear_vel = self._movement_speed * max(0.2, 1 - abs(theta_error))  # Never less than 20% of speed
-                angular_vel = 2.0 * theta_error  # Proportional steering
+                angular_vel = 0.8 * theta_error  # Reduced from 2.0 to 0.8 for less aggressive steering
             
             # Clamp angular velocity
             angular_vel = max(-self._max_angular_velocity, min(self._max_angular_velocity, angular_vel))
@@ -500,7 +563,7 @@ class MotionExecutorImpl(IMotionExecutor):
         right_vel = (linear_vel + angular_vel * self._wheel_base / 2) / self._wheel_radius
         
         # Clamp to reasonable limits
-        max_wheel_vel = 10.0  # rad/s
+        max_wheel_vel = 15.0  # rad/s (increased from 10.0 to allow higher velocities)
         left_vel = max(-max_wheel_vel, min(max_wheel_vel, left_vel))
         right_vel = max(-max_wheel_vel, min(max_wheel_vel, right_vel))
         
@@ -582,31 +645,49 @@ class MotionExecutorImpl(IMotionExecutor):
     # Lane-based navigation methods (required by interface)
     def follow_route(self, route) -> None:
         """
-        Follow a lane-based route (new interface method).
+        Follow a lane-based route (new interface method) using world targets.
         
-        This method converts a Route to a Path for compatibility with existing implementation.
+        Motion layer does not reason about lanes. It receives a segment and
+        drives to the segment's end point in world coordinates with the
+        single-move controller.
         """
+        # Defensive import for type hints without circular deps at module import
         from interfaces.navigation_types import Route
-        from interfaces.path_planner_interface import Path, Cell
         
-        # Convert route segments to path cells for backward compatibility
-        cells = []
-        for segment in route.segments:
-            # Convert start and end points to cells (with null checks)
-            if segment.start_point is not None and segment.end_point is not None:
-                start_cell = Cell(int(segment.start_point.x), int(segment.start_point.y))
-                end_cell = Cell(int(segment.end_point.x), int(segment.end_point.y))
-                cells.extend([start_cell, end_cell])
+        if route is None or not getattr(route, 'segments', None):
+            # Nothing to follow
+            with self._status_lock:
+                self._stop_motion_internal()
+            return
         
-        # Remove duplicates while preserving order
-        unique_cells = []
-        for cell in cells:
-            if not unique_cells or (cell.x != unique_cells[-1].x or cell.y != unique_cells[-1].y):
-                unique_cells.append(cell)
+        # Use the first (or only) segment's end point as the target.
+        segment = route.segments[0]
+        end_point = getattr(segment, 'end_point', None)
+        if end_point is None:
+            # If end point missing, fall back to start point
+            end_point = getattr(segment, 'start_point', None)
         
-        # Create path and execute (add missing parameters)
-        path = Path(cells=unique_cells, total_distance=route.total_distance, estimated_time=route.estimated_time)
-        self.execute_path(path)
+        if end_point is None:
+            # No valid target - stop
+            with self._status_lock:
+                self._stop_motion_internal()
+            return
+        
+        # Configure single-move toward the world target
+        with self._status_lock:
+            # Stop any current motion
+            self._stop_motion_internal()
+            # Set world target directly (bypass grid conversion)
+            self._current_path = None
+            self._path_index = 0
+            self._current_mode = MotionMode.SINGLE_MOVE
+            self._current_target = (float(end_point.x), float(end_point.y))
+            self._motion_start_time = time.time()
+            self._reached_target_flag = False
+            # Reset snap state for new segment
+            self._snap_triggered = False
+            self._snap_start_time = None
+            print(f"[MotionExecutor] Following segment to world target ({end_point.x:.3f}, {end_point.y:.3f})")
     
     def set_corner_speed(self, speed: float) -> None:
         """Set corner speed for conflict boxes and bay navigation."""

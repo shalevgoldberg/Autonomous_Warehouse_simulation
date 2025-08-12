@@ -201,13 +201,15 @@ class TaskHandlerImpl(ITaskHandler):
         # Stall handling
         self._stall_reason: Optional[str] = None
         self._stall_start_time: Optional[float] = None
+        self._stall_retry_count: int = 0
+        self._stall_retry_start_time: Optional[float] = None
         
         # Task execution parameters - get from config provider or use defaults
         if config_provider:
             robot_config = config_provider.get_robot_config(robot_id)
             task_config = config_provider.get_task_config()
             self._stall_recovery_timeout = robot_config.stall_recovery_timeout
-            self._position_tolerance = robot_config.position_tolerance
+            # position_tolerance removed - Motion Executor is single source of truth
             self._picking_duration = robot_config.picking_duration
             self._dropping_duration = robot_config.dropping_duration
             self._charging_threshold = robot_config.charging_threshold
@@ -217,7 +219,7 @@ class TaskHandlerImpl(ITaskHandler):
         else:
             # Default values
             self._stall_recovery_timeout = 10.0  # seconds
-            self._position_tolerance = 0.1  # meters
+            # position_tolerance removed - Motion Executor is single source of truth
             self._picking_duration = 3.0   # seconds to simulate picking
             self._dropping_duration = 2.0  # seconds to simulate dropping
             self._charging_threshold = 0.2  # charge when below 20%
@@ -241,7 +243,7 @@ class TaskHandlerImpl(ITaskHandler):
         """Update task parameters with robot-specific configuration."""
         if robot_config:
             self._stall_recovery_timeout = robot_config.stall_recovery_timeout
-            self._position_tolerance = robot_config.position_tolerance
+            # position_tolerance removed - Motion Executor is single source of truth
             self._picking_duration = robot_config.picking_duration
             self._dropping_duration = robot_config.dropping_duration
             self._charging_threshold = robot_config.charging_threshold
@@ -394,15 +396,23 @@ class TaskHandlerImpl(ITaskHandler):
             if self._operational_status == OperationalStatus.IDLE:
                 return  # Not executing a task
             
+            # Increment retry count if this is a retry
+            if self._operational_status == OperationalStatus.STALLED:
+                self._stall_retry_count += 1
+                print(f"[TaskHandler] Stall retry #{self._stall_retry_count}: {reason}")
+            else:
+                # First stall, reset retry count
+                self._stall_retry_count = 1
+                print(f"[TaskHandler] Initial stall detected: {reason}")
+            
             self._operational_status = OperationalStatus.STALLED
             self._stall_reason = reason
             self._stall_start_time = time.time()
+            self._stall_retry_start_time = time.time()
             
             # Stop motion and lane following immediately
             self.motion_executor.stop_execution()
             self.lane_follower.stop_following(force_release=False)  # Safe stop
-            
-            print(f"[TaskHandler] Stall detected: {reason}")
     
     def is_idle(self) -> bool:
         """
@@ -748,21 +758,68 @@ class TaskHandlerImpl(ITaskHandler):
             self._complete_task()
     
     def _handle_stall_recovery(self) -> None:
-        """Internal: Attempt to recover from stall condition."""
+        """
+        Internal: Attempt to recover from stall condition with retry logic.
+        
+        TODO: STALL RECOVERY EXPANSION
+        Current implementation uses simple retry logic. Future enhancements should include:
+        
+        1. **Intelligent Retry Strategies**:
+           - Different retry delays based on stall reason (obstacle vs. traffic vs. mechanical)
+           - Exponential backoff for repeated stalls
+           - Maximum retry limits per task phase
+        
+        2. **Path Replanning Integration**:
+           - Automatic path replanning when stalls occur during navigation
+           - Alternative route generation for blocked paths
+           - Conflict box lock management during replanning
+        
+        3. **Stall Classification**:
+           - Categorize stalls by type (temporary obstacle, permanent blockage, traffic jam)
+           - Different recovery strategies for different stall types
+           - Integration with traffic management system
+        
+        4. **Advanced Recovery Actions**:
+           - Backward movement to clear blocked position
+           - Sideways movement for narrow passages
+           - Communication with other robots for coordinated recovery
+        
+        5. **Monitoring and Analytics**:
+           - Stall frequency tracking per robot and location
+           - Performance metrics for recovery success rates
+           - Integration with warehouse analytics system
+        """
         if not self._stall_start_time:
             return
         
         elapsed_time = time.time() - self._stall_start_time
+        retry_elapsed = time.time() - (self._stall_retry_start_time or self._stall_start_time)
         
+        # Check if we've exceeded maximum retry attempts
+        if self._stall_retry_count > self._retry_attempts:
+            self._handle_task_error(f"Maximum stall retries ({self._retry_attempts}) exceeded: {self._stall_reason}")
+            return
+        
+        # Check if we've exceeded the overall stall timeout
         if elapsed_time > self._stall_recovery_timeout:
-            # Stall recovery timeout, fail the task
-            self._handle_task_error(f"Stall recovery timeout: {self._stall_reason}")
-        else:
-            # Try to continue (simplified recovery)
-            self._operational_status = self._get_status_for_phase(self._task_phase)
-            self._stall_reason = None
-            self._stall_start_time = None
-            print(f"[TaskHandler] Stall recovery: resuming task")
+            self._handle_task_error(f"Stall recovery timeout ({self._stall_recovery_timeout}s): {self._stall_reason}")
+            return
+        
+        # Wait for retry delay before attempting recovery
+        if retry_elapsed < self._retry_delay:
+            return  # Still waiting for retry delay
+        
+        # Attempt recovery
+        print(f"[TaskHandler] Attempting stall recovery (attempt {self._stall_retry_count}/{self._retry_attempts})")
+        
+        # Simple recovery: try to resume the current phase
+        self._operational_status = self._get_status_for_phase(self._task_phase)
+        self._stall_reason = None
+        self._stall_start_time = None
+        self._stall_retry_start_time = None
+        # Note: _stall_retry_count will be reset on next stall event
+        
+        print(f"[TaskHandler] Stall recovery successful: resuming task")
     
     def _advance_to_phase(self, new_phase: TaskPhase, new_status: OperationalStatus) -> None:
         """Internal: Advance to next task phase."""
@@ -839,6 +896,8 @@ class TaskHandlerImpl(ITaskHandler):
         self._phase_start_time = None
         self._stall_reason = None
         self._stall_start_time = None
+        self._stall_retry_count = 0
+        self._stall_retry_start_time = None
         
         # Clean up asynchronous planning state
         self._planned_route = None

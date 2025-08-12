@@ -64,8 +64,8 @@ class TaskSimulationManager:
         print(f"   ✅ Robot agent created: {self.robot_config.robot_id}")
         
         # Physics simulation control
-        self._physics_running = False
-        self._physics_thread: Optional[threading.Thread] = None
+        from robot.impl.physics_integration import create_physics_thread_manager
+        self.physics_manager = create_physics_thread_manager(self.physics, frequency_hz=1000.0)
         
         # Task management
         self.available_shelves = self._discover_shelf_positions()
@@ -188,36 +188,11 @@ class TaskSimulationManager:
     
     def _start_physics_loop(self) -> None:
         """Start physics simulation loop."""
-        self._physics_running = True
-        self._physics_thread = threading.Thread(
-            target=self._physics_loop,
-            name="PhysicsSimulation",
-            daemon=True
-        )
-        self._physics_thread.start()
+        self.physics_manager.start()
     
     def _stop_physics_loop(self) -> None:
         """Stop physics simulation loop."""
-        self._physics_running = False
-        if self._physics_thread:
-            self._physics_thread.join(timeout=1.0)
-    
-    def _physics_loop(self) -> None:
-        """Physics simulation loop at 1000Hz."""
-        physics_period = 1.0 / 1000.0  # 1000Hz (1kHz) to match physics timestep
-        
-        while self._physics_running:
-            start_time = time.time()
-            
-            try:
-                self.physics.step_physics()
-            except Exception as e:
-                print(f"[Physics] Error: {e}")
-            
-            # Maintain frequency
-            elapsed = time.time() - start_time
-            sleep_time = max(0, physics_period - elapsed)
-            time.sleep(sleep_time)
+        self.physics_manager.stop()
 
 
 def demo_automated_tasks():

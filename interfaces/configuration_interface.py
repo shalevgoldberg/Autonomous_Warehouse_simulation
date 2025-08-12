@@ -49,6 +49,9 @@ class RobotConfig:
     control_frequency: float  # Hz
     motion_frequency: float  # Hz
     
+    # Coordinate system parameters
+    cell_size: float  # meters per grid cell for coordinate system
+    
     # Lane-based navigation parameters
     lane_tolerance: float  # meters from center-line
     corner_speed: float  # m/s in conflict boxes and turns
@@ -130,6 +133,43 @@ class TaskConfig:
     max_bid_value: float
     distance_cost_factor: float
     battery_cost_factor: float
+
+
+@dataclass
+class BidConfig:
+    """Bid calculation configuration."""
+    # Parallel processing
+    max_parallel_workers: int  # Maximum threads for parallel bid calculation
+    
+    # Factor weights (0.0 to 1.0)
+    distance_weight: float
+    battery_weight: float
+    workload_weight: float
+    task_type_compatibility_weight: float
+    robot_capabilities_weight: float
+    time_urgency_weight: float
+    conflict_box_availability_weight: float
+    shelf_accessibility_weight: float
+    
+    # Factor enablement
+    enable_distance_factor: bool
+    enable_battery_factor: bool
+    enable_workload_factor: bool
+    enable_task_type_compatibility_factor: bool
+    enable_robot_capabilities_factor: bool
+    enable_time_urgency_factor: bool
+    enable_conflict_box_availability_factor: bool
+    enable_shelf_accessibility_factor: bool
+    
+    # Calculation parameters
+    battery_threshold: float  # Minimum battery level for bidding (0.0 to 1.0)
+    calculation_timeout: float  # Maximum time per bid calculation (seconds)
+    max_distance_normalization: float  # Maximum distance for normalization (meters)
+    
+    # Performance tuning
+    enable_parallel_calculation: bool
+    enable_calculation_statistics: bool
+    enable_factor_breakdown: bool
 
 
 @dataclass
@@ -216,6 +256,19 @@ class IConfigurationProvider(ABC):
         
         Returns:
             TaskConfig: Task configuration
+            
+        Raises:
+            ConfigurationError: If configuration cannot be loaded
+        """
+        pass
+    
+    @abstractmethod
+    def get_bid_config(self) -> BidConfig:
+        """
+        Get bid calculation configuration.
+        
+        Returns:
+            BidConfig: Bid calculation configuration
             
         Raises:
             ConfigurationError: If configuration cannot be loaded
@@ -354,7 +407,20 @@ class IConfigurationValidator(ABC):
             config: Task configuration to validate
             
         Returns:
-            List[str]: List of validation errors
+            List[str]: List of validation errors (empty if valid)
+        """
+        pass
+    
+    @abstractmethod
+    def validate_bid_config(self, config: BidConfig) -> List[str]:
+        """
+        Validate bid calculation configuration.
+        
+        Args:
+            config: Bid configuration to validate
+            
+        Returns:
+            List[str]: List of validation errors (empty if valid)
         """
         pass
     

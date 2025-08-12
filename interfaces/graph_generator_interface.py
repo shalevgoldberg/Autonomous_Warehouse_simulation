@@ -17,7 +17,7 @@ class GraphNode:
     """Represents a node in the navigation graph."""
     node_id: str
     position: Point
-    directions: Set[LaneDirection]  # Available exit directions
+    directions: List[LaneDirection]  # Available exit directions
     is_conflict_box: bool = False
     conflict_box_id: Optional[str] = None
 
@@ -38,7 +38,7 @@ class ConflictBox:
     position: Point
     size: float
     participating_nodes: Set[str]
-    directions: Set[LaneDirection]
+    directions: List[LaneDirection]
 
 
 @dataclass

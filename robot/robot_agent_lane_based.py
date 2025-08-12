@@ -9,7 +9,7 @@ Updated for lane-based navigation with conflict box management and centralized c
 """
 import threading
 import time
-from typing import Optional, Set, Tuple
+from typing import Optional, Set, Tuple, List, Dict, Any
 from dataclasses import dataclass
 
 from interfaces.task_handler_interface import ITaskHandler, Task, TaskType
@@ -19,7 +19,9 @@ from interfaces.state_holder_interface import IStateHolder
 from interfaces.coordinate_system_interface import ICoordinateSystem
 from interfaces.lane_follower_interface import ILaneFollower
 from interfaces.simulation_data_service_interface import ISimulationDataService
-from interfaces.configuration_interface import IConfigurationProvider
+from interfaces.configuration_interface import IConfigurationProvider, BidConfig
+from interfaces.bid_calculator_interface import IBidCalculator
+from interfaces.bidding_system_interface import RobotBid
 
 from robot.impl.task_handler_impl import TaskHandlerImpl
 from robot.impl.path_planner_graph_impl import PathPlannerGraphImpl
@@ -28,10 +30,12 @@ from robot.impl.motion_executor_impl import MotionExecutorImpl
 from robot.impl.state_holder_impl import StateHolderImpl
 from robot.impl.coordinate_system_impl import CoordinateSystemImpl
 from robot.impl.physics_integration import create_command_adapter, create_state_adapter
+from robot.impl.bid_calculator_impl import BidCalculatorImpl
 from simulation.simulation_data_service_impl import SimulationDataServiceImpl
 
 from warehouse.map import WarehouseMap
 from simulation.mujoco_env import SimpleMuJoCoPhysics
+from utils.geometry import mapdata_to_warehouse_map
 
 
 class RobotAgent:
@@ -45,15 +49,16 @@ class RobotAgent:
     - SOLID principles: Single responsibility, dependency injection
     - Lane-based navigation: Uses NavigationGraph and conflict box management
     - Centralized configuration: Uses ConfigurationProvider for all parameters
+    - Parallel bidding: Supports asynchronous bid calculation for task assignment
     
     Threading Model:
     - Control Thread: 10Hz task management
     - Motion Thread: 100Hz motion control  
     - Physics Thread: 1000Hz physics simulation (external)
+    - Bidding Thread: On-demand bid calculation (parallel)
     """
     
     def __init__(self, 
-                 warehouse_map: WarehouseMap,
                  physics: SimpleMuJoCoPhysics,
                  config_provider: IConfigurationProvider,
                  robot_id: str = "robot_1",
@@ -62,7 +67,6 @@ class RobotAgent:
         Initialize robot agent with dependency injection.
         
         Args:
-            warehouse_map: Warehouse layout and obstacles
             physics: MuJoCo physics simulation
             config_provider: Configuration provider for all parameters
             robot_id: Robot identifier
@@ -70,17 +74,18 @@ class RobotAgent:
         """
         self.config_provider = config_provider
         self.robot_id = robot_id
-        self.warehouse_map = warehouse_map
         self.physics = physics
         
         # Get robot configuration from provider
         self.robot_config = self.config_provider.get_robot_config(robot_id)
         
-        # Validate configuration
-        self._validate_configuration()
-        
         # Initialize simulation data service (database connectivity)
         self.simulation_data_service = simulation_data_service or self._create_simulation_data_service()
+        # Get warehouse map from data service
+        map_data = self.simulation_data_service.get_map_data()
+        self.warehouse_map = mapdata_to_warehouse_map(map_data)
+        # Validate configuration (must be after warehouse_map is set)
+        self._validate_configuration()
         
         # Initialize coordinate system (simplified for lane-based navigation)
         self.coordinate_system = self._create_coordinate_system()
@@ -93,13 +98,25 @@ class RobotAgent:
         self.lane_follower = self._create_lane_follower()
         self.task_handler = self._create_task_handler()
         
+        # Initialize bid calculator for parallel bidding
+        self.bid_calculator = self._create_bid_calculator()
+        
+        # Initialize physics thread manager with state holder for 1kHz synchronization
+        from robot.impl.physics_integration import create_physics_thread_manager
+        self.physics_manager = create_physics_thread_manager(
+            physics=self.physics,
+            state_holder=self.state_holder,
+            frequency_hz=1000.0,
+            db_sync_frequency_hz=10.0
+        )
+        
         # Control loop management
         self._running = False
         self._control_thread: Optional[threading.Thread] = None
         self._motion_thread: Optional[threading.Thread] = None
         
         print(f"[RobotAgent] Initialized {self.robot_id} with lane-based navigation")
-        print(f"[RobotAgent] Components: PathPlanner, LaneFollower, MotionExecutor, TaskHandler")
+        print(f"[RobotAgent] Components: PathPlanner, LaneFollower, MotionExecutor, TaskHandler, BidCalculator")
         print(f"[RobotAgent] Database: {type(self.simulation_data_service).__name__}")
         print(f"[RobotAgent] Configuration: {len(self.config_provider.errors)} validation errors")
     
@@ -148,12 +165,12 @@ class RobotAgent:
     
     def _create_coordinate_system(self) -> ICoordinateSystem:
         """Create coordinate system for lane-based navigation."""
-        # For lane-based navigation, we use a simple coordinate system
-        # that maps world coordinates to navigation points
+        # Use cell size from configuration to match warehouse map
+        cell_size = self.robot_config.cell_size
         return CoordinateSystemImpl(
-            cell_size=0.25,  # Standard cell size for compatibility
-            grid_width=int(self.warehouse_map.width * self.warehouse_map.grid_size / 0.25),
-            grid_height=int(self.warehouse_map.height * self.warehouse_map.grid_size / 0.25)
+            cell_size=cell_size,  # Use configured cell size (default 0.5)
+            grid_width=self.warehouse_map.width,   # Use actual warehouse dimensions
+            grid_height=self.warehouse_map.height  # Use actual warehouse dimensions
         )
     
     def _create_state_holder(self) -> IStateHolder:
@@ -220,6 +237,82 @@ class RobotAgent:
         
         return task_handler
     
+    def _create_bid_calculator(self) -> IBidCalculator:
+        """Create bid calculator for parallel bidding."""
+        # Get bid configuration from provider
+        bid_config = self.config_provider.get_bid_config()
+        
+        bid_calculator = BidCalculatorImpl(
+            robot_id=self.robot_id,
+            simulation_data_service=self.simulation_data_service,
+            max_workers=bid_config.max_parallel_workers
+        )
+        
+        # Configure bid calculator with robot-specific settings
+        self._configure_bid_calculator(bid_calculator, bid_config)
+        
+        return bid_calculator
+    
+    def _configure_bid_calculator(self, bid_calculator: IBidCalculator, bid_config: BidConfig) -> None:
+        """Configure bid calculator with robot-specific settings."""
+        from interfaces.bid_calculator_interface import BidFactor, BidFactorWeight
+        
+        # Set factor weights from configuration
+        weights = []
+        
+        if bid_config.enable_distance_factor:
+            weights.append(BidFactorWeight(BidFactor.DISTANCE, bid_config.distance_weight))
+        
+        if bid_config.enable_battery_factor:
+            weights.append(BidFactorWeight(BidFactor.BATTERY_LEVEL, bid_config.battery_weight))
+        
+        if bid_config.enable_workload_factor:
+            weights.append(BidFactorWeight(BidFactor.WORKLOAD, bid_config.workload_weight))
+        
+        if bid_config.enable_task_type_compatibility_factor:
+            weights.append(BidFactorWeight(BidFactor.TASK_TYPE_COMPATIBILITY, bid_config.task_type_compatibility_weight))
+        
+        if bid_config.enable_robot_capabilities_factor:
+            weights.append(BidFactorWeight(BidFactor.ROBOT_CAPABILITIES, bid_config.robot_capabilities_weight))
+        
+        if bid_config.enable_time_urgency_factor:
+            weights.append(BidFactorWeight(BidFactor.TIME_URGENCY, bid_config.time_urgency_weight))
+        
+        if bid_config.enable_conflict_box_availability_factor:
+            weights.append(BidFactorWeight(BidFactor.CONFLICT_BOX_AVAILABILITY, bid_config.conflict_box_availability_weight))
+        
+        if bid_config.enable_shelf_accessibility_factor:
+            weights.append(BidFactorWeight(BidFactor.SHELF_ACCESSIBILITY, bid_config.shelf_accessibility_weight))
+        
+        # Apply weights to calculator
+        if weights:
+            bid_calculator.set_bid_factor_weights(weights)
+        
+        # Disable factors that are not enabled
+        if not bid_config.enable_distance_factor:
+            bid_calculator.enable_factor(BidFactor.DISTANCE, False)
+        
+        if not bid_config.enable_battery_factor:
+            bid_calculator.enable_factor(BidFactor.BATTERY_LEVEL, False)
+        
+        if not bid_config.enable_workload_factor:
+            bid_calculator.enable_factor(BidFactor.WORKLOAD, False)
+        
+        if not bid_config.enable_task_type_compatibility_factor:
+            bid_calculator.enable_factor(BidFactor.TASK_TYPE_COMPATIBILITY, False)
+        
+        if not bid_config.enable_robot_capabilities_factor:
+            bid_calculator.enable_factor(BidFactor.ROBOT_CAPABILITIES, False)
+        
+        if not bid_config.enable_time_urgency_factor:
+            bid_calculator.enable_factor(BidFactor.TIME_URGENCY, False)
+        
+        if not bid_config.enable_conflict_box_availability_factor:
+            bid_calculator.enable_factor(BidFactor.CONFLICT_BOX_AVAILABILITY, False)
+        
+        if not bid_config.enable_shelf_accessibility_factor:
+            bid_calculator.enable_factor(BidFactor.SHELF_ACCESSIBILITY, False)
+    
     def initialize_position(self) -> None:
         """Initialize robot position in physics simulation."""
         # Get start position from configuration or warehouse default
@@ -239,6 +332,10 @@ class RobotAgent:
             return
         
         self._running = True
+        
+        # Start physics simulation
+        self.physics_manager.start()
+        print(f"[RobotAgent] Started physics simulation for {self.robot_id}")
         
         # Start control thread
         self._control_thread = threading.Thread(
@@ -266,6 +363,10 @@ class RobotAgent:
         
         self._running = False
         
+        # Stop physics simulation
+        self.physics_manager.stop()
+        print(f"[RobotAgent] Stopped physics simulation for {self.robot_id}")
+        
         # Stop motion execution
         self.motion_executor.stop_execution()
         
@@ -281,6 +382,69 @@ class RobotAgent:
         """Assign a task to the robot."""
         return self.task_handler.start_task(task)
     
+    # Bid calculation methods for parallel bidding
+    
+    def calculate_bids(self, tasks: List[Task]) -> List[RobotBid]:
+        """
+        Calculate bids for multiple tasks in parallel.
+        
+        This method is called by the controller to get bids from this robot
+        for available tasks. It runs bid calculation in parallel threads.
+        
+        Args:
+            tasks: List of tasks to calculate bids for
+            
+        Returns:
+            List[RobotBid]: Bids for all tasks (may be empty if robot unavailable)
+        """
+        try:
+            return self.bid_calculator.calculate_bids(tasks, self.state_holder)
+        except Exception as e:
+            print(f"[RobotAgent] Error calculating bids: {e}")
+            return []
+    
+    def calculate_single_bid(self, task: Task) -> Optional[RobotBid]:
+        """
+        Calculate bid for a single task.
+        
+        Args:
+            task: Task to calculate bid for
+            
+        Returns:
+            Optional[RobotBid]: Bid for the task, or None if robot cannot bid
+        """
+        try:
+            return self.bid_calculator.calculate_single_bid(task, self.state_holder)
+        except Exception as e:
+            print(f"[RobotAgent] Error calculating bid for task {task.task_id}: {e}")
+            return None
+    
+    def is_available_for_bidding(self) -> bool:
+        """
+        Check if robot is available for bidding.
+        
+        Returns:
+            bool: True if robot can participate in bidding
+        """
+        try:
+            return self.bid_calculator.is_available_for_bidding(self.state_holder)
+        except Exception as e:
+            print(f"[RobotAgent] Error checking bidding availability: {e}")
+            return False
+    
+    def get_bid_calculation_statistics(self) -> Dict[str, Any]:
+        """
+        Get bid calculation statistics.
+        
+        Returns:
+            Dict[str, Any]: Statistics including calculation times, success rates, etc.
+        """
+        try:
+            return self.bid_calculator.get_calculation_statistics()
+        except Exception as e:
+            print(f"[RobotAgent] Error getting bid statistics: {e}")
+            return {}
+    
     def get_status(self) -> dict:
         """Get comprehensive robot status."""
         return {
@@ -292,7 +456,8 @@ class RobotAgent:
             'task_status': self.task_handler.get_task_status(),
             'motion_status': self.motion_executor.get_motion_status(),
             'lane_following_status': self.lane_follower.get_lane_following_status(),
-            'configuration_errors': self.config_provider.errors
+            'configuration_errors': self.config_provider.errors,
+            'bid_calculation_stats': self.get_bid_calculation_statistics()
         }
     
     def _control_loop(self) -> None:
@@ -376,4 +541,8 @@ class RobotAgent:
     
     @property
     def simulation_data_service_interface(self) -> ISimulationDataService:
-        return self.simulation_data_service 
+        return self.simulation_data_service
+    
+    @property
+    def bid_calculator_interface(self) -> IBidCalculator:
+        return self.bid_calculator 
