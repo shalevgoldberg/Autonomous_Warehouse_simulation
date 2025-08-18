@@ -17,11 +17,22 @@ Migration Guide:
 - With: from robot.robot_agent_lane_based import RobotAgent
 
 This file is kept for reference only and may be removed in future versions.
+
+WARNING: This module will raise ImportError in future versions.
 """
+import warnings
 import threading
 import time
 from typing import Optional, Set, Tuple, List, Dict, Any
 from dataclasses import dataclass
+
+# DEPRECATION WARNING - This module will be removed
+warnings.warn(
+    "robot_agent.py is DEPRECATED and will be removed in future versions. "
+    "Use robot_agent_lane_based.py instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 from interfaces.task_handler_interface import ITaskHandler, Task, TaskType
 from interfaces.path_planner_interface import IPathPlanner
@@ -46,7 +57,20 @@ from simulation.mujoco_env import SimpleMuJoCoPhysics
 
 @dataclass
 class RobotConfiguration:
-    """Robot configuration parameters following Single Responsibility Principle."""
+    """
+    DEPRECATED: LEGACY ROBOT CONFIGURATION - DO NOT USE
+    
+    This class is DEPRECATED and should not be used in new code.
+    Use RobotConfig from interfaces.configuration_interface instead.
+    """
+    def __post_init__(self):
+        warnings.warn(
+            "RobotConfiguration from robot_agent.py is DEPRECATED. "
+            "Use RobotConfig from interfaces.configuration_interface instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+    
     robot_id: str = "robot_1"
     max_speed: float = 1.0
     position_tolerance: float = 0.1
@@ -123,43 +147,12 @@ class RobotAgent:
             DeprecationWarning,
             stacklevel=2
         )
-        self.config = config or RobotConfiguration()
-        self.warehouse_map = warehouse_map
-        self.physics = physics
-        
-        # Validate configuration
-        self._validate_configuration()
-        
-        # Initialize simulation data service (database connectivity)
-        self.simulation_data_service = simulation_data_service or self._create_simulation_data_service()
-        
-        # Initialize coordinate system (simplified for lane-based navigation)
-        self.coordinate_system = self._create_coordinate_system()
-        
-        # Initialize robot components via dependency injection
-        self.state_holder = self._create_state_holder()
-        self.path_planner = self._create_path_planner()
-        self.motion_executor = self._create_motion_executor()
-        self.lane_follower = self._create_lane_follower()
-        self.task_handler = self._create_task_handler()
-        
-        # Initialize physics thread manager with state holder for 1kHz synchronization
-        from robot.impl.physics_integration import create_physics_thread_manager
-        self.physics_manager = create_physics_thread_manager(
-            physics=self.physics,
-            state_holder=self.state_holder,
-            frequency_hz=1000.0,
-            db_sync_frequency_hz=10.0
+        raise RuntimeError(
+            "RobotAgent from robot_agent.py is DEPRECATED and no longer supported. "
+            "Use robot_agent_lane_based.RobotAgent instead. "
+            "Migration guide: Replace 'from robot.robot_agent import RobotAgent' "
+            "with 'from robot.agent_lane_based import RobotAgent'"
         )
-        
-        # Control loop management
-        self._running = False
-        self._control_thread: Optional[threading.Thread] = None
-        self._motion_thread: Optional[threading.Thread] = None
-        
-        print(f"[RobotAgent] Initialized {self.config.robot_id} with lane-based navigation")
-        print(f"[RobotAgent] Components: PathPlanner, LaneFollower, MotionExecutor, TaskHandler")
-        print(f"[RobotAgent] Database: {type(self.simulation_data_service).__name__}")
     
     def _validate_configuration(self) -> None:
         """Validate robot configuration against warehouse constraints."""
