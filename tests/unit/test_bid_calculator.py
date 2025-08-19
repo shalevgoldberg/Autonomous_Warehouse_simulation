@@ -64,7 +64,7 @@ class MockSimulationDataService:
     
     def get_shelf_info(self, shelf_id: str):
         """Get mock shelf info."""
-        if shelf_id == "shelf_1":
+        if shelf_id == "shelf_3_3":
             mock_shelf = Mock()
             mock_shelf.position = (5.0, 5.0, 0.0)
             return mock_shelf
@@ -127,7 +127,7 @@ class TestBidCalculatorImpl:
             task_id="pick_1",
             task_type=TaskType.PICK_AND_DELIVER,
             order_id="order_1",
-            shelf_id="shelf_1",
+            shelf_id="shelf_3_3",
             item_id="item_1"
         )
     

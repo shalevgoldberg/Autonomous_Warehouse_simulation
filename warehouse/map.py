@@ -84,6 +84,34 @@ class WarehouseMap:
         - Values: '.' or '0' = free space, 'w' or '1' = wall, 's' or '2' = shelf, 
                  'c' or '3' = charging, 'i' or '4' = idle zone, 'd' or '5' = drop-off
         - Lane/junction encodings (e.g., 'ls', 'lw', 'lne', 'js', etc.) are treated as walkable
+        
+        Shelf ID Convention:
+        - Shelves are named using their grid coordinates: shelf_{x}_{y}
+        - This provides meaningful, human-readable shelf identification
+        - Example: shelf_3_3 is located at grid position (3, 3)
+        
+        Future Adapter Pattern Implementation:
+        If you need to support legacy shelf ID formats (e.g., shelf_1, shelf_2) in the future,
+        you can implement an adapter pattern here:
+        
+        ```python
+        class ShelfIDAdapter:
+            def __init__(self, warehouse_map):
+                self.warehouse_map = warehouse_map
+                self.legacy_id_map = {}  # legacy_id -> coordinate_id mapping
+                
+            def get_shelf_position(self, shelf_id: str) -> Tuple[float, float]:
+                if shelf_id.startswith("shelf_") and "_" in shelf_id:
+                    # Coordinate-based ID (e.g., shelf_3_3)
+                    return self.warehouse_map.get_shelf_position(shelf_id)
+                else:
+                    # Legacy ID (e.g., shelf_1) - convert to coordinate-based
+                    coordinate_id = self.legacy_id_map.get(shelf_id)
+                    if coordinate_id:
+                        return self.warehouse_map.get_shelf_position(coordinate_id)
+                    else:
+                        raise ValueError(f"Unknown shelf ID format: {shelf_id}")
+        ```
         """
         try:
             with open(csv_file, 'r', newline='') as file:
@@ -119,7 +147,9 @@ class WarehouseMap:
                         self.grid[y, x] = value_map[cell_value]
                         # Create shelf entry if it's a shelf
                         if value_map[cell_value] == 2:  # Shelf
-                            shelf_id = f"shelf_{len(self.shelves)}"
+                            # Use grid coordinates for shelf IDs when loading from CSV
+                            # This makes shelf IDs more meaningful and matches demo expectations
+                            shelf_id = f"shelf_{x}_{y}"
                             self.shelves[shelf_id] = (x, y)
                     elif cell_value.startswith(lane_prefixes):
                         # Treat all lane/junction encodings as walkable (free space)
@@ -216,7 +246,9 @@ class WarehouseMap:
             # Place shelf line
             for x in range(shelf_start_x, shelf_end_x):
                 if self.grid[y, x] == 0:  # Only place if not already occupied
-                    shelf_id = f"shelf_{len(self.shelves)}"
+                    # Use coordinate-based shelf IDs for consistency with CSV loading
+                    # This ensures both CSV and generated warehouses use the same naming convention
+                    shelf_id = f"shelf_{x}_{y}"
                     self.shelves[shelf_id] = (x, y)
                     self.grid[y, x] = 2  # Shelf cell
             
@@ -289,6 +321,18 @@ class WarehouseMap:
                     world_y = (y + 0.5) * self.grid_size
                     stations.append((world_x, world_y))
         return stations
+    
+    def _get_charging_zones(self) -> List[Tuple[float, float]]:
+        """Get charging zone positions."""
+        charging_positions = []
+        for y in range(self.height):
+            for x in range(self.width):
+                if self.grid[y, x] == 3:  # Charging zone
+                    # Return the center of the cell instead of the corner
+                    world_x = (x + 0.5) * self.grid_size
+                    world_y = (y + 0.5) * self.grid_size
+                    charging_positions.append((world_x, world_y))
+        return charging_positions
         
     def _get_idle_zones(self) -> List[Tuple[float, float]]:
         """Get idle zone positions."""

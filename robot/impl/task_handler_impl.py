@@ -14,6 +14,7 @@ import threading
 import time
 import math
 import logging
+import uuid
 from typing import Optional, List, Tuple
 from datetime import datetime
 from dataclasses import dataclass, replace
@@ -113,6 +114,7 @@ class TaskPhase(Enum):
     NAVIGATING_TO_CHARGING = "navigating_to_charging"
     CHARGING_BATTERY = "charging_battery"
     COMPLETED = "completed"
+    NAVIGATING_TO_IDLE = "navigating_to_idle"
 
 
 # Explicit phase ordering for progress calculation (safer than enum string comparison)
@@ -124,6 +126,7 @@ TASK_PHASE_ORDER = [
     TaskPhase.DROPPING_ITEM,
     TaskPhase.NAVIGATING_TO_CHARGING,
     TaskPhase.CHARGING_BATTERY,
+    TaskPhase.NAVIGATING_TO_IDLE,
     TaskPhase.COMPLETED
 ]
 
@@ -359,6 +362,10 @@ class TaskHandlerImpl(ITaskHandler):
             elif task.task_type == TaskType.MOVE_TO_POSITION:
                 self._task_phase = TaskPhase.PLANNING
                 self._operational_status = OperationalStatus.MOVING_TO_SHELF  # Generic movement
+            elif task.task_type == TaskType.IDLE_PARK:
+                # Explicitly mark as moving to idle so status reflects intent during planning
+                self._task_phase = TaskPhase.PLANNING
+                self._operational_status = OperationalStatus.MOVING_TO_IDLE
             
             # Log task start event
             self._log_kpi_event("task_start", {
@@ -486,6 +493,8 @@ class TaskHandlerImpl(ITaskHandler):
                 self._handle_navigation_phase(OperationalStatus.MOVING_TO_CHARGING)
             elif self._task_phase == TaskPhase.CHARGING_BATTERY:
                 self._handle_charging_phase()
+            elif self._task_phase == TaskPhase.NAVIGATING_TO_IDLE:
+                self._handle_navigation_phase(OperationalStatus.MOVING_TO_IDLE)
             
         except Exception as e:
             print(f"[TaskHandler] Error in phase {self._task_phase}: {e}")
@@ -520,6 +529,8 @@ class TaskHandlerImpl(ITaskHandler):
                     self._advance_to_phase(TaskPhase.NAVIGATING_TO_CHARGING, OperationalStatus.MOVING_TO_CHARGING)
                 elif self._current_task.task_type == TaskType.MOVE_TO_POSITION:
                     self._advance_to_phase(TaskPhase.NAVIGATING_TO_SHELF, OperationalStatus.MOVING_TO_SHELF)
+                elif self._current_task.task_type == TaskType.IDLE_PARK:
+                    self._advance_to_phase(TaskPhase.NAVIGATING_TO_IDLE, OperationalStatus.MOVING_TO_IDLE)
                 
                 # Clear planning state
                 self._planned_route = None
@@ -573,6 +584,9 @@ class TaskHandlerImpl(ITaskHandler):
                 elif self._current_task.task_type == TaskType.MOVE_TO_CHARGING:
                     target_position = self._get_charging_station_position()
                 
+                elif self._current_task.task_type == TaskType.IDLE_PARK:
+                    target_position = self._get_idle_zone_position()
+                
                 else:
                     raise TaskHandlingError(f"Unsupported task type: {self._current_task.task_type}")
                 
@@ -608,12 +622,28 @@ class TaskHandlerImpl(ITaskHandler):
                 else:
                     # Simple move to position task completed
                     self._complete_task()
+                
+                # Reset lane follower status to IDLE so it can start new routes
+                self.lane_follower.stop_following()
             
             elif expected_status == OperationalStatus.MOVING_TO_DROPOFF:
                 self._advance_to_phase(TaskPhase.DROPPING_ITEM, OperationalStatus.DROPPING)
+                
+                # Reset lane follower status to IDLE so it can start new routes
+                self.lane_follower.stop_following()
             
             elif expected_status == OperationalStatus.MOVING_TO_CHARGING:
                 self._advance_to_phase(TaskPhase.CHARGING_BATTERY, OperationalStatus.CHARGING)
+                
+                # Reset lane follower status to IDLE so it can start new routes
+                self.lane_follower.stop_following()
+            
+            elif expected_status == OperationalStatus.MOVING_TO_IDLE:
+                # Idle zone reached - complete the IDLE_PARK task
+                self._complete_task()
+                
+                # Reset lane follower status to IDLE so it can start new routes
+                self.lane_follower.stop_following()
         
         elif lane_status == LaneFollowingStatus.ERROR:
             self._handle_task_error(f"Lane following error: {lane_result.error_message}")
@@ -829,28 +859,70 @@ class TaskHandlerImpl(ITaskHandler):
         print(f"[TaskHandler] Advanced to phase: {new_phase.value}")
     
     def _complete_task(self) -> None:
-        """Internal: Mark current task as completed with KPI logging."""
+        """Internal: Complete the current task with cleanup and state reset."""
         if not self._current_task:
             return
-        
+            
+        # Mark task as completed
         self._current_task.status = TaskStatus.COMPLETED
         self._current_task.completed_at = datetime.now()
         
-        task_duration = time.time() - self._task_start_time if self._task_start_time else 0
-        
         # Log task completion event
-        self._log_kpi_event("task_complete", {
+        task_duration = time.time() - self._task_start_time if self._task_start_time else 0
+        self._log_kpi_event("task_completed", {
             "task_id": self._current_task.task_id,
             "order_id": self._current_task.order_id,
             "duration_seconds": task_duration,
-            "success": True
+            "phase": self._task_phase.value
         })
         
-        print(f"[TaskHandler] Task {self._current_task.task_id} completed in {task_duration:.1f}s")
+        print(f"[TaskHandler] Task {self._current_task.task_id} completed successfully")
         
-        # Add to history and reset
+        # Add to history
         self._add_to_history(self._current_task)
+        
+        # Capture the completed task type before resetting state
+        completed_task_type = self._current_task.task_type
+        
+        # Reset task state first so the robot is truly idle and ready for the next task
+        # This prevents "robot busy" when starting the auto IDLE_PARK task
         self._reset_task_state()
+        
+        # Automatically navigate to idle zone after task completion (AFTER state reset)
+        # But only for non-IDLE_PARK tasks to prevent infinite loops
+        if completed_task_type != TaskType.IDLE_PARK:
+            self._navigate_to_idle_zone_after_completion()
+    
+    def _navigate_to_idle_zone_after_completion(self) -> None:
+        """
+        Internal: Automatically create and start an IDLE_PARK task after task completion.
+        
+        This ensures robots automatically move to idle zones instead of staying in place.
+        """
+        try:
+            # Prevent infinite loop: don't create IDLE_PARK task if we just completed one
+            if (self._current_task and 
+                self._current_task.task_type == TaskType.IDLE_PARK):
+                print(f"[TaskHandler] Skipping auto IDLE_PARK creation - just completed IDLE_PARK task")
+                return
+            
+            # Create a new IDLE_PARK task using the factory method
+            idle_task = Task.create_idle_park_task(
+                task_id=f"idle_park_{uuid.uuid4().hex[:8]}",
+                robot_id=self.robot_id
+            )
+            
+            print(f"[TaskHandler] Auto-creating IDLE_PARK task: {idle_task.task_id}")
+            
+            # Start the idle park task immediately
+            if self.start_task(idle_task):
+                print(f"[TaskHandler] Successfully started auto IDLE_PARK task")
+            else:
+                print(f"[TaskHandler] Failed to start auto IDLE_PARK task - robot busy")
+                
+        except Exception as e:
+            print(f"[TaskHandler] Error creating auto IDLE_PARK task: {e}")
+            # Don't fail the main task completion - this is just a convenience feature
     
     def _handle_task_error(self, error_message: str) -> None:
         """Internal: Handle task execution error with cleanup and KPI logging."""
@@ -930,6 +1002,12 @@ class TaskHandlerImpl(ITaskHandler):
                 TaskPhase.NAVIGATING_TO_CHARGING: 0.4,
                 TaskPhase.CHARGING_BATTERY: 0.5
             }
+        elif self._current_task.task_type == TaskType.IDLE_PARK:
+            # Treat IDLE_PARK as a simple navigation task to idle
+            phase_weights = {
+                TaskPhase.PLANNING: 0.1,
+                TaskPhase.NAVIGATING_TO_IDLE: 0.9
+            }
         else:
             phase_weights = {
                 TaskPhase.PLANNING: 0.1,
@@ -961,7 +1039,12 @@ class TaskHandlerImpl(ITaskHandler):
                            else self._dropping_duration)
                 return min(1.0, elapsed / duration)
         
-        elif self._task_phase in [TaskPhase.NAVIGATING_TO_SHELF, TaskPhase.NAVIGATING_TO_DROPOFF, TaskPhase.NAVIGATING_TO_CHARGING]:
+        elif self._task_phase in [
+            TaskPhase.NAVIGATING_TO_SHELF,
+            TaskPhase.NAVIGATING_TO_DROPOFF,
+            TaskPhase.NAVIGATING_TO_CHARGING,
+            TaskPhase.NAVIGATING_TO_IDLE
+        ]:
             # Calculate navigation progress based on lane following
             lane_result = self.lane_follower.get_lane_following_result()
             if lane_result.success:
@@ -999,7 +1082,8 @@ class TaskHandlerImpl(ITaskHandler):
             TaskPhase.DROPPING_ITEM: OperationalStatus.DROPPING,
             TaskPhase.NAVIGATING_TO_CHARGING: OperationalStatus.MOVING_TO_CHARGING,
             TaskPhase.CHARGING_BATTERY: OperationalStatus.CHARGING,
-            TaskPhase.COMPLETED: OperationalStatus.IDLE
+            TaskPhase.COMPLETED: OperationalStatus.IDLE,
+            TaskPhase.NAVIGATING_TO_IDLE: OperationalStatus.MOVING_TO_IDLE
         }
         return phase_status_map.get(phase, OperationalStatus.IDLE)
     
@@ -1042,6 +1126,37 @@ class TaskHandlerImpl(ITaskHandler):
         except SimulationDataServiceError as e:
             self.logger.error(f"Failed to get charging station position: {e}")
             return (0.0, 0.0)  # Fallback position
+    
+    def _get_idle_zone_position(self) -> Tuple[float, float]:
+        """Internal: Get optimal idle zone position from SimulationDataService."""
+        try:
+            current_state = self.state_holder.get_robot_state()
+            current_position = current_state.position[:2]  # (x, y)
+            
+            # Get optimal idle zone from simulation data service
+            optimal_zone = self.simulation_data_service.get_optimal_idle_zone(
+                current_position, self.robot_id
+            )
+            
+            if optimal_zone:
+                print(f"[TaskHandler] Selected idle zone: {optimal_zone}")
+                return optimal_zone
+            else:
+                # Fallback: use first available idle zone
+                idle_zones = self.simulation_data_service.get_idle_zones()
+                if idle_zones:
+                    fallback_zone = idle_zones[0]
+                    print(f"[TaskHandler] Using fallback idle zone: {fallback_zone}")
+                    return fallback_zone
+                else:
+                    # Last resort: use a safe default position
+                    print(f"[TaskHandler] No idle zones available, using default position")
+                    return (10.0, 10.0)
+                    
+        except Exception as e:
+            self.logger.error(f"Failed to get idle zone position: {e}")
+            # Return a safe fallback position
+            return (10.0, 10.0)
     
     def _unlock_current_shelf(self) -> None:
         """Internal: Unlock currently locked shelf if any."""

@@ -203,8 +203,8 @@ class EndToEndFlowTester:
             # Create jobs queue with some tasks
             jobs_queue = JobsQueueImpl()
             test_tasks = [
-                Task(task_id="test_1", task_type=TaskType.PICK_AND_DELIVER, shelf_id="shelf_1", item_id="item_1"),
-                Task(task_id="test_2", task_type=TaskType.PICK_AND_DELIVER, shelf_id="shelf_2", item_id="item_2"),
+                Task(task_id="test_1", task_type=TaskType.PICK_AND_DELIVER, shelf_id="shelf_3_3", item_id="item_1"),
+                Task(task_id="test_2", task_type=TaskType.PICK_AND_DELIVER, shelf_id="shelf_4_3", item_id="item_2"),
             ]
             
             for task in test_tasks:
@@ -244,7 +244,7 @@ class EndToEndFlowTester:
             test_task = Task(
                 task_id="execution_test",
                 task_type=TaskType.PICK_AND_DELIVER,
-                shelf_id="shelf_1",
+                shelf_id="shelf_3_3",
                 item_id="item_1"
             )
             

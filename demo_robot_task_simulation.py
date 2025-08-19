@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Complete Robot Task Simulation Demo
+Complete Robot Task Simulation Demo - PICK_AND_DELIVER Edition
 
 Demonstrates a fully integrated robot task simulation with:
 - MuJoCo physics simulation
 - Complete robot agent with all components
-- Task creation and execution
+- PICK_AND_DELIVER task execution (shelf → drop-off → idle)
+- Real database integration with inventory management
 - Real-time visualization
 - Clean architecture with loose coupling
 
@@ -35,6 +36,8 @@ from interfaces.visualization_interface import IVisualization
 from simulation.mujoco_visualization import MujocoVisualization
 from simulation.visualization_thread import VisualizationThread
 from interfaces.lane_follower_interface import LaneFollowingConfig
+from config.configuration_provider import ConfigurationProvider
+from simulation.simulation_data_service_impl import SimulationDataServiceImpl
 
 
 class TaskSimulationManager:
@@ -47,7 +50,7 @@ class TaskSimulationManager:
     
     def __init__(self, warehouse_csv: str = "sample_warehouse.csv"):
         """Initialize simulation manager."""
-        print("🚀 Initializing Robot Task Simulation")
+        print("🚀 Initializing Robot Task Simulation - PICK_AND_DELIVER Edition")
         
         # Load warehouse
         self.warehouse_map = WarehouseMap(csv_file=warehouse_csv)
@@ -55,9 +58,20 @@ class TaskSimulationManager:
         
         # Initialize physics
         self.physics = SimpleMuJoCoPhysics(self.warehouse_map)
-        print(f"   ✅ Physics ready: {self.physics.is_simulation_ready()}")
+        print("   ✅ Physics ready: {self.physics.is_simulation_ready()}")
         
-        # Create robot agent
+        # Create real configuration provider
+        self.config_provider = ConfigurationProvider()
+        print("   ✅ Configuration provider initialized")
+        
+        # Create real simulation data service
+        self.simulation_data_service = SimulationDataServiceImpl(self.warehouse_map)
+        print("   ✅ Simulation data service initialized")
+        
+        # Populate inventory for demo
+        self._populate_demo_inventory()
+        
+        # Create robot agent with real services
         self.robot_config = RobotConfig(
             robot_id="warehouse_robot_1",
             max_speed=2.0,
@@ -82,68 +96,11 @@ class TaskSimulationManager:
             stall_recovery_timeout=10.0
         )
         
-        # Create mock configuration provider
-        config_provider = MagicMock()
-        config_provider.get_robot_config.return_value = self.robot_config
-        config_provider.get_database_config.return_value = MagicMock()
-        config_provider.get_value.return_value = MagicMock(value=(0.0, 0.0))
-        config_provider.errors = []
-        
-        # Create bid configuration
-        bid_config = MagicMock()
-        bid_config.distance_weight = 0.3
-        bid_config.battery_weight = 0.2
-        bid_config.workload_weight = 0.2
-        bid_config.task_type_compatibility_weight = 0.1
-        bid_config.robot_capabilities_weight = 0.2
-        bid_config.time_urgency_weight = 0.1
-        bid_config.conflict_box_availability_weight = 0.1
-        bid_config.shelf_accessibility_weight = 0.1
-        bid_config.enable_distance_factor = True
-        bid_config.enable_battery_factor = True
-        bid_config.enable_workload_factor = True
-        bid_config.enable_task_type_compatibility_factor = True
-        bid_config.enable_robot_capabilities_factor = True
-        bid_config.enable_time_urgency_factor = True
-        bid_config.enable_conflict_box_availability_factor = True
-        bid_config.enable_shelf_accessibility_factor = True
-        bid_config.battery_threshold = 0.2
-        bid_config.calculation_timeout = 5.0
-        bid_config.max_distance_normalization = 100.0
-        bid_config.enable_parallel_calculation = True
-        bid_config.enable_calculation_statistics = True
-        bid_config.enable_factor_breakdown = True
-        bid_config.max_parallel_workers = 4
-        config_provider.get_bid_config.return_value = bid_config
-        
-        # Create mock simulation data service
-        mock_sim_service = MagicMock()
-        mock_sim_service.get_map_data.return_value = MagicMock(
-            width=10,
-            height=14,
-            cell_size=1.0,
-            start_position=(0.0, 0.0),
-            walkable_cells=[(x, y) for x in range(10) for y in range(14)],
-            blocked_cells=[],
-            obstacles=[],
-            shelves={},
-            dropoff_zones=[(5.0, 5.0)]
-        )
-        mock_sim_service.get_navigation_graph.return_value = MagicMock()
-        mock_sim_service.get_blocked_cells.return_value = {}
-        mock_sim_service.try_acquire_conflict_box_lock.return_value = True
-        mock_sim_service.release_conflict_box_lock.return_value = True
-        mock_sim_service.heartbeat_conflict_box_lock.return_value = True
-        mock_sim_service.get_shelf_position.return_value = (1.0, 1.0)
-        mock_sim_service.get_dropoff_zones.return_value = [(5.0, 5.0)]
-        mock_sim_service.lock_shelf.return_value = True
-        mock_sim_service.unlock_shelf.return_value = True
-        mock_sim_service.log_event.return_value = None
-        
+        # Create robot agent with real simulation data service
         self.robot = RobotAgent(
             physics=self.physics,
-            config_provider=config_provider,
-            simulation_data_service=mock_sim_service
+            config_provider=self.config_provider,
+            simulation_data_service=self.simulation_data_service
         )
         print(f"   ✅ Robot agent created: {self.robot_config.robot_id}")
         
@@ -175,6 +132,46 @@ class TaskSimulationManager:
         print(f"   ✅ Found {len(self.available_shelves)} shelves for tasks")
         print("🎯 Simulation ready!")
     
+    def _populate_demo_inventory(self) -> None:
+        """Populate shelves with demo inventory for PICK_AND_DELIVER tasks."""
+        print("   📦 Populating demo inventory...")
+        
+        try:
+            # Create shelves from warehouse map
+            shelves_created = self.simulation_data_service.create_shelves_from_map(clear_existing=True)
+            print(f"      ✅ Created {shelves_created} shelves from warehouse map")
+            
+            # Create demo inventory data based on actual warehouse layout
+            # From sample_warehouse.csv: shelves are in rows 3, 6, 9 (0-indexed)
+            # Warehouse is 10x14, with shelves from x=3 to x=7
+            # Shelf IDs now use grid coordinates: shelf_x_y
+            demo_inventory = [
+                {'item_id': 'laptop_001', 'name': 'Gaming Laptop', 'shelf_id': 'shelf_3_3', 'quantity': 5},
+                {'item_id': 'phone_001', 'name': 'Smartphone', 'shelf_id': 'shelf_4_3', 'quantity': 10},
+                {'item_id': 'tablet_001', 'name': 'Tablet', 'shelf_id': 'shelf_6_3', 'quantity': 8},
+                {'item_id': 'headphones_001', 'name': 'Wireless Headphones', 'shelf_id': 'shelf_7_3', 'quantity': 15},
+                {'item_id': 'keyboard_001', 'name': 'Mechanical Keyboard', 'shelf_id': 'shelf_3_6', 'quantity': 12},
+                {'item_id': 'mouse_001', 'name': 'Gaming Mouse', 'shelf_id': 'shelf_4_6', 'quantity': 20},
+                {'item_id': 'monitor_001', 'name': '4K Monitor', 'shelf_id': 'shelf_6_6', 'quantity': 6},
+                {'item_id': 'speaker_001', 'name': 'Bluetooth Speaker', 'shelf_id': 'shelf_7_6', 'quantity': 9},
+                {'item_id': 'camera_001', 'name': 'Action Camera', 'shelf_id': 'shelf_3_9', 'quantity': 7},
+                {'item_id': 'drone_001', 'name': 'Quadcopter Drone', 'shelf_id': 'shelf_4_9', 'quantity': 4},
+                {'item_id': 'gaming_console_001', 'name': 'Gaming Console', 'shelf_id': 'shelf_6_9', 'quantity': 3},
+                {'item_id': 'vr_headset_001', 'name': 'VR Headset', 'shelf_id': 'shelf_7_9', 'quantity': 8},
+            ]
+            
+            # Populate inventory
+            inventory_created = self.simulation_data_service.populate_inventory(demo_inventory)
+            print(f"      ✅ Populated {inventory_created} inventory items")
+            
+            # Get inventory statistics
+            stats = self.simulation_data_service.get_inventory_statistics()
+            print(f"      📊 Inventory stats: {stats['total_items']} items across {stats['total_shelves']} shelves")
+            
+        except Exception as e:
+            print(f"      ⚠️  Warning: Could not populate inventory: {e}")
+            print("      Continuing with mock inventory...")
+    
     def _discover_shelf_positions(self) -> List[tuple]:
         """Discover shelf positions from warehouse map."""
         shelves = []
@@ -182,7 +179,8 @@ class TaskSimulationManager:
             for x in range(self.warehouse_map.width):
                 if self.warehouse_map.grid[y, x] == 2:  # Shelf
                     world_pos = self.warehouse_map.grid_to_world(x, y)
-                    shelves.append((f"shelf_{x}_{y}", world_pos[0], world_pos[1]))
+                    shelf_id = f"shelf_{x}_{y}"
+                    shelves.append((shelf_id, world_pos[0], world_pos[1]))
         return shelves
     
     def start_simulation(self) -> None:
@@ -235,58 +233,58 @@ class TaskSimulationManager:
         print("   ✅ Simulation stopped cleanly")
     
     def assign_next_task(self) -> bool:
-        """Assign next task to robot - with LONG DISTANCE movements for clear visualization."""
+        """Assign next PICK_AND_DELIVER task to robot."""
         
-        # Define long-distance waypoints using robot coordinate system
-        # Robot uses 0.25m cells, warehouse uses 0.5m cells (2x scaling)
-        # Grid is 22x26 in robot coordinates (11x13 warehouse * 2)
-        # Avoid shelf rows in robot coordinates: (6,7), (12,13), (18,19)
-        # Use walkable rows: 0,1,2,3,4,5,8,9,10,11,14,15,16,17,20,21,22,23,24,25
-        robot_grid_targets = [
-            ("Far East", 18, 4),              # Robot grid (18,4) - Far East side
-            ("Far North", 18, 22),            # Robot grid (18,22) - Far North side  
-            ("Far West", 2, 10),              # Robot grid (2,10) - Far West side
-            ("Center East", 14, 16),          # Robot grid (14,16) - Center East
-            ("Center", 10, 10),               # Robot grid (10,10) - Center
-        ]
-        
-        # Convert robot grid to world coordinates using robot's coordinate system
-        long_distance_targets = []
-        for name, robot_grid_x, robot_grid_y in robot_grid_targets:
-            # Use robot's coordinate system for conversion
-            cell = Cell(robot_grid_x, robot_grid_y)
-            world_x, world_y = self.robot.coordinate_system.cell_to_world(cell)
-            long_distance_targets.append((name, world_x, world_y))
-        
-        if self.current_task_index >= len(long_distance_targets):
-            print("   ⚠️  All long-distance tasks completed")
+        if self.current_task_index >= len(self.available_shelves):
+            print("   ⚠️  All PICK_AND_DELIVER tasks completed")
             return False
         
-        # Get current target
-        target_name, target_x, target_y = long_distance_targets[self.current_task_index]
+        # Get current shelf target
+        shelf_id, shelf_x, shelf_y = self.available_shelves[self.current_task_index]
         
-        task = Task(
-            task_id=f"long_distance_{self.current_task_index + 1}",
-            task_type=TaskType.MOVE_TO_POSITION,
-            target_position=(target_x, target_y, 0.0),
-            priority=1,
-            metadata={
-                "target_name": target_name,
-                "distance_type": "long_distance_demo"
-            }
+        # Map shelf IDs to item IDs based on our inventory
+        shelf_to_item_map = {
+            'shelf_3_3': 'laptop_001',
+            'shelf_4_3': 'phone_001',
+            'shelf_6_3': 'tablet_001',
+            'shelf_7_3': 'headphones_001',
+            'shelf_3_6': 'keyboard_001',
+            'shelf_4_6': 'mouse_001',
+            'shelf_6_6': 'monitor_001',
+            'shelf_7_6': 'speaker_001',
+            'shelf_3_9': 'camera_001',
+            'shelf_4_9': 'drone_001',
+            'shelf_6_9': 'gaming_console_001',
+            'shelf_7_9': 'vr_headset_001',
+        }
+        
+        # Get the item ID for this shelf
+        item_id = shelf_to_item_map.get(shelf_id, f"item_{self.current_task_index + 1}")
+        
+        # Create PICK_AND_DELIVER task
+        task = Task.create_pick_and_deliver_task(
+            task_id=f"pick_deliver_{self.current_task_index + 1}",
+            order_id=f"demo_order_{self.current_task_index + 1}",
+            shelf_id=shelf_id,
+            item_id=item_id,
+            quantity_to_pick=1,
+            order_priority="normal",
+            customer_id=f"demo_customer_{self.current_task_index + 1}",
+            dropoff_zone="default_dropoff"
         )
         
         # Assign to robot
-        success = self.robot.assign_task(task)
+        success = self.robot.task_handler.start_task(task)
         
         if success:
             # Calculate distance from current position
             current_pos = self.physics.get_robot_pose()
-            distance = ((target_x - current_pos[0])**2 + (target_y - current_pos[1])**2)**0.5
+            distance = ((shelf_x - current_pos[0])**2 + (shelf_y - current_pos[1])**2)**0.5
             
-            print(f"   ✅ Assigned {task.task_id}: Move to {target_name}")
-            print(f"       From ({current_pos[0]:.1f}, {current_pos[1]:.1f}) -> To ({target_x:.1f}, {target_y:.1f})")
-            print(f"       🚀 LONG DISTANCE: {distance:.1f} meters across warehouse!")
+            print(f"   ✅ Assigned {task.task_id}: Pick from {shelf_id}")
+            print(f"       From ({current_pos[0]:.1f}, {current_pos[1]:.1f}) -> To shelf at ({shelf_x:.1f}, {shelf_y:.1f})")
+            print(f"       📦 PICK_AND_DELIVER: {distance:.1f} meters to shelf!")
+            print(f"       🎯 Task: Pick 1x {task.item_id} from {shelf_id}")
             self.current_task_index += 1
         else:
             print(f"   ❌ Robot busy, cannot assign {task.task_id}")
@@ -308,9 +306,9 @@ class TaskSimulationManager:
 
 
 def demo_automated_tasks():
-    """Demo: Automated task execution."""
+    """Demo: Automated PICK_AND_DELIVER task execution."""
     print("=" * 60)
-    print("🤖 AUTOMATED ROBOT TASK SIMULATION")
+    print("🤖 AUTOMATED ROBOT PICK_AND_DELIVER SIMULATION")
     print("=" * 60)
     
     # Create simulation
@@ -320,40 +318,57 @@ def demo_automated_tasks():
         # Start simulation
         sim.start_simulation()
         
-        print("\n⏳ Running automated task sequence...")
-        print("   Robot will automatically execute pick and deliver tasks")
+        print("\n⏳ Running automated PICK_AND_DELIVER task sequence...")
+        print("   Robot will automatically execute: SHELF → DROP-OFF → IDLE ZONE")
         
-        # Run for all available tasks
+        # Run for exactly 3 tasks
+        max_tasks = 3
         task_cycle = 1
-        while True:
-            print(f"\n--- Task Cycle {task_cycle} ---")
+        while task_cycle <= max_tasks:
+            print(f"\n--- Task Cycle {task_cycle}/{max_tasks} ---")
             
             # Assign task
             if sim.assign_next_task():
                 # Wait for task completion
                 task_start_time = time.time()
-                max_task_time = 60.0  # 60 seconds max per task (longer for remote targets)
+                max_task_time = 120.0  # 120 seconds max per task (longer for PICK_AND_DELIVER)
                 
                 while time.time() - task_start_time < max_task_time:
                     status = sim.get_simulation_status()
                     robot_status = status['robot']
                     
-                    # Detailed progress logging every 2 seconds
-                    if int(time.time() - task_start_time) % 2 == 0:
-                        print(f"   Status: {robot_status['operational_status']} | "
-                              f"Progress: {robot_status['task_progress']:.1%} | "
-                              f"Position: ({robot_status['position'][0]:.2f}, {robot_status['position'][1]:.2f}) | "
-                              f"Motion: {robot_status['motion_status']}")
+                    # Detailed progress logging every 3 seconds
+                    if int(time.time() - task_start_time) % 3 == 0:
+                        # Get status from task handler instead of robot status
+                        task_status = robot_status.get('task_status')
+                        if task_status:
+                            operational_status = task_status.operational_status.value
+                            progress = task_status.progress
+                        else:
+                            operational_status = 'unknown'
+                            progress = 0.0
+                        
+                        position = robot_status.get('position', [0.0, 0.0, 0.0])
+                        motion_status = robot_status.get('motion_status', 'unknown')
+                        
+                        print(f"   Status: {operational_status} | "
+                              f"Progress: {progress:.1%} | "
+                              f"Position: ({position[0]:.2f}, {position[1]:.2f}) | "
+                              f"Motion: {motion_status}")
                     
                     # Check if task completed
-                    if not robot_status['task_active']:
+                    task_status = robot_status.get('task_status')
+                    if task_status and not task_status.has_active_task:
                         # Get task history to verify actual completion
                         task_history = sim.robot.task_handler.get_task_history(limit=1)
                         if task_history:
                             completed_task = task_history[0]
                             if completed_task.status.value == 'completed':
+                                # Safely get final position
+                                final_position = robot_status.get('position', [0.0, 0.0, 0.0])
                                 print(f"   ✅ Task {completed_task.task_id} SUCCESSFULLY completed!")
-                                print(f"      Final position: ({robot_status['position'][0]:.2f}, {robot_status['position'][1]:.2f})")
+                                print(f"      Final position: ({final_position[0]:.2f}, {final_position[1]:.2f})")
+                                print(f"      🎯 PICK_AND_DELIVER: Shelf → Drop-off → Idle Zone")
                                 break
                             else:
                                 print(f"   ❌ Task {completed_task.task_id} failed with status: {completed_task.status.value}")
@@ -368,13 +383,14 @@ def demo_automated_tasks():
                     print(f"   ⚠️  Task timeout after {max_task_time}s")
             else:
                 # No more tasks available
-                print("   ✅ All available tasks have been completed!")
+                print("   ❌ Failed to assign task - robot busy or no more shelves")
                 break
             
             time.sleep(1.0)  # Brief pause between tasks
             task_cycle += 1
         
-        print(f"\n🎉 Completed {sim.current_task_index} tasks successfully!")
+        print(f"\n🎉 Completed {task_cycle - 1} PICK_AND_DELIVER tasks successfully!")
+        print("   📦 Full lifecycle: SHELF → DROP-OFF → IDLE ZONE")
         
     except KeyboardInterrupt:
         print("\n⚠️  Simulation interrupted by user")
@@ -384,11 +400,16 @@ def demo_automated_tasks():
 
 
 def main():
-    """Main demo function - console-based robot task simulation."""
-    print("🤖 Robot Task Simulation Demo")
-    print("=" * 40)
-    print("Console-based autonomous warehouse robot simulation")
-    print("Following Phase 2 objectives: Single robot executing multiple tasks")
+    """Main demo function - PICK_AND_DELIVER robot task simulation."""
+    print("🤖 Robot PICK_AND_DELIVER Task Simulation Demo")
+    print("=" * 50)
+    print("Complete autonomous warehouse robot simulation")
+    print("Demonstrating full task lifecycle:")
+    print("   📍 Navigate to Shelf")
+    print("   🤖 Pick Item")
+    print("   🚚 Navigate to Drop-off")
+    print("   📦 Drop Item")
+    print("   🏠 Navigate to Idle Zone")
     print()
     
     try:

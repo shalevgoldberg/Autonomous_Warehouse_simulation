@@ -11,12 +11,13 @@ def add_sample_inventory():
     print("📦 Adding sample inventory for sample_orders.json items...")
     
     # Items from sample_orders.json
+    # Updated to use coordinate-based shelf IDs for consistency with warehouse map
     sample_items = [
-        {'item_id': 'book_001', 'name': 'Sample Book', 'shelf_id': 'shelf_10', 'quantity': 10},
-        {'item_id': 'phone_001', 'name': 'Sample Phone', 'shelf_id': 'shelf_11', 'quantity': 5},
-        {'item_id': 'laptop_001', 'name': 'Sample Laptop', 'shelf_id': 'shelf_12', 'quantity': 3},
-        {'item_id': 'tablet_001', 'name': 'Sample Tablet', 'shelf_id': 'shelf_13', 'quantity': 4},
-        {'item_id': 'audio_001', 'name': 'Sample Audio Device', 'shelf_id': 'shelf_14', 'quantity': 6},
+        {'item_id': 'book_001', 'name': 'Sample Book', 'shelf_id': 'shelf_3_3', 'quantity': 10},
+        {'item_id': 'phone_001', 'name': 'Sample Phone', 'shelf_id': 'shelf_4_3', 'quantity': 5},
+        {'item_id': 'laptop_001', 'name': 'Sample Laptop', 'shelf_id': 'shelf_6_3', 'quantity': 3},
+        {'item_id': 'tablet_001', 'name': 'Sample Tablet', 'shelf_id': 'shelf_7_3', 'quantity': 4},
+        {'item_id': 'audio_001', 'name': 'Sample Audio Device', 'shelf_id': 'shelf_3_6', 'quantity': 6},
     ]
     
     try:

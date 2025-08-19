@@ -45,6 +45,7 @@ class TestTaskHandler(unittest.TestCase):
             motion_executor=self.mock_motion_executor,
             coordinate_system=self.mock_coordinate_system,
             simulation_data_service=self.mock_simulation_data_service,
+            lane_follower=Mock(),  # Add missing lane_follower parameter
             robot_id="test_robot"
         )
         
@@ -83,7 +84,7 @@ class TestTaskHandler(unittest.TestCase):
             task_id="task_001",
             task_type=TaskType.PICK_AND_DELIVER,
             order_id="order_001",
-            shelf_id="shelf_001",
+            shelf_id="shelf_3_3",
             item_id="item_123",
             priority=1
         )
@@ -130,7 +131,7 @@ class TestTaskHandler(unittest.TestCase):
             task_id="valid_001",
             task_type=TaskType.PICK_AND_DELIVER,
             order_id="order_001",
-            shelf_id="shelf_001",
+            shelf_id="shelf_3_3",
             item_id="item_001"
         )
         result = self.task_handler.start_task(valid_task)
@@ -143,7 +144,7 @@ class TestTaskHandler(unittest.TestCase):
             task_id="task_001",
             task_type=TaskType.PICK_AND_DELIVER,
             order_id="order_001",
-            shelf_id="shelf_001",
+            shelf_id="shelf_3_3",
             item_id="item_001"
         )
         self.task_handler.start_task(task)
@@ -168,7 +169,7 @@ class TestTaskHandler(unittest.TestCase):
             task_id="task_001",
             task_type=TaskType.PICK_AND_DELIVER,
             order_id="order_001",
-            shelf_id="shelf_001",
+            shelf_id="shelf_3_3",
             item_id="item_001"
         )
         self.task_handler.start_task(task)

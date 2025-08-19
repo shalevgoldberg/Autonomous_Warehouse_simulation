@@ -102,13 +102,13 @@ class TestInventoryDataIntegration(unittest.TestCase):
             {
                 'item_id': 'test_book_1',
                 'name': 'Test Book 1',
-                'shelf_id': 'shelf_0',
+                'shelf_id': 'shelf_3_3',
                 'quantity': 10
             },
             {
                 'item_id': 'test_electronics_1',
                 'name': 'Test Electronics 1',
-                'shelf_id': 'shelf_1',
+                'shelf_id': 'shelf_4_3',
                 'quantity': 5
             }
         ]
@@ -144,7 +144,7 @@ class TestInventoryDataIntegration(unittest.TestCase):
             {
                 'item_id': 'test_item_location',
                 'name': 'Test Item for Location',
-                'shelf_id': 'shelf_2',
+                'shelf_id': 'shelf_6_3',
                 'quantity': 15
             }
         ]
@@ -155,7 +155,7 @@ class TestInventoryDataIntegration(unittest.TestCase):
         shelf_id = self.simulation_data_service.get_item_location('test_item_location')
         
         # Verify result
-        self.assertEqual(shelf_id, 'shelf_2')
+        self.assertEqual(shelf_id, 'shelf_6_3')
         
         # Test non-existent item
         shelf_id = self.simulation_data_service.get_item_location('nonexistent_item')
@@ -168,7 +168,7 @@ class TestInventoryDataIntegration(unittest.TestCase):
             {
                 'item_id': 'test_update_item',
                 'name': 'Test Item for Updates',
-                'shelf_id': 'shelf_3',
+                'shelf_id': 'shelf_7_3',
                 'quantity': 20
             }
         ]
@@ -176,7 +176,7 @@ class TestInventoryDataIntegration(unittest.TestCase):
         self.simulation_data_service.populate_inventory(test_inventory)
         
         # Test adding inventory
-        result = self.simulation_data_service.update_inventory('shelf_3', 'test_update_item', 'add', 5)
+        result = self.simulation_data_service.update_inventory('shelf_7_3', 'test_update_item', 'add', 5)
         self.assertTrue(result)
         
         # Verify quantity increased
@@ -187,7 +187,7 @@ class TestInventoryDataIntegration(unittest.TestCase):
                 self.assertEqual(result['quantity'], 25)
         
         # Test removing inventory
-        result = self.simulation_data_service.update_inventory('shelf_3', 'test_update_item', 'remove', 10)
+        result = self.simulation_data_service.update_inventory('shelf_7_3', 'test_update_item', 'remove', 10)
         self.assertTrue(result)
         
         # Verify quantity decreased
@@ -204,19 +204,19 @@ class TestInventoryDataIntegration(unittest.TestCase):
             {
                 'item_id': 'test_stats_1',
                 'name': 'Test Stats Item 1',
-                'shelf_id': 'shelf_4',
+                'shelf_id': 'shelf_3_6',
                 'quantity': 10
             },
             {
                 'item_id': 'test_stats_2',
                 'name': 'Test Stats Item 2',
-                'shelf_id': 'shelf_5',
+                'shelf_id': 'shelf_4_6',
                 'quantity': 5
             },
             {
                 'item_id': 'test_stats_3',
                 'name': 'Test Stats Item 3',
-                'shelf_id': 'shelf_6',
+                'shelf_id': 'shelf_6_6',
                 'quantity': 3  # Low stock
             }
         ]
@@ -244,7 +244,7 @@ class TestInventoryDataIntegration(unittest.TestCase):
             {
                 'item_id': 'test_concurrent',
                 'name': 'Test Concurrent Item',
-                'shelf_id': 'shelf_7',
+                'shelf_id': 'shelf_7_6',
                 'quantity': 50
             }
         ]
@@ -261,11 +261,11 @@ class TestInventoryDataIntegration(unittest.TestCase):
                 for i in range(5):
                     # Get item location
                     shelf_id = self.simulation_data_service.get_item_location('test_concurrent')
-                    if shelf_id != 'shelf_7':
+                    if shelf_id != 'shelf_7_6':
                         raise Exception(f"Wrong shelf ID: {shelf_id}")
                     
                     # Update inventory
-                    result = self.simulation_data_service.update_inventory('shelf_7', 'test_concurrent', 'remove', 1)
+                    result = self.simulation_data_service.update_inventory('shelf_7_6', 'test_concurrent', 'remove', 1)
                     if not result:
                         raise Exception("Inventory update failed")
                     
@@ -307,13 +307,13 @@ class TestInventoryDataIntegration(unittest.TestCase):
         
         # Test updating non-existent item
         with self.assertRaises(SimulationDataServiceError) as context:
-            self.simulation_data_service.update_inventory('shelf_0', 'nonexistent_item', 'add', 1)
+            self.simulation_data_service.update_inventory('shelf_3_9', 'nonexistent_item', 'add', 1)
         
         self.assertIn("does not exist", str(context.exception))
         
         # Test invalid operation
         with self.assertRaises(SimulationDataServiceError) as context:
-            self.simulation_data_service.update_inventory('shelf_0', 'test_item', 'invalid_op', 1)
+            self.simulation_data_service.update_inventory('shelf_3_9', 'test_item', 'invalid_op', 1)
         
         self.assertIn("Invalid operation", str(context.exception))
     

@@ -23,6 +23,26 @@ class ShelfInfo:
 
 
 @dataclass
+class ItemInventoryInfo:
+    """Information about an inventory item."""
+    item_id: str
+    name: str
+    quantity: int
+    shelf_id: str
+    description: Optional[str] = None
+    category: Optional[str] = None
+
+
+@dataclass
+class ItemShelfLocation:
+    """Information about item location on a shelf."""
+    item_id: str
+    shelf_id: str
+    quantity: int
+    last_updated: float  # Unix timestamp
+
+
+@dataclass
 class MapData:
     """Static map data for the warehouse."""
     width: int
@@ -118,6 +138,31 @@ class ISimulationDataService(ABC):
         
         Returns:
             List[Tuple[float, float]]: List of dropoff positions
+        """
+        pass
+    
+    @abstractmethod
+    def get_idle_zones(self) -> List[Tuple[float, float]]:
+        """
+        Get all idle zone positions.
+        
+        Returns:
+            List[Tuple[float, float]]: List of idle zone positions
+        """
+        pass
+    
+    @abstractmethod
+    def get_optimal_idle_zone(self, robot_position: Tuple[float, float], 
+                             robot_id: str) -> Optional[Tuple[float, float]]:
+        """
+        Get the optimal idle zone for a robot based on position and availability.
+        
+        Args:
+            robot_position: Current robot position (x, y)
+            robot_id: Robot identifier for tracking
+            
+        Returns:
+            Optional[Tuple[float, float]]: Optimal idle zone position or None if none available
         """
         pass
     

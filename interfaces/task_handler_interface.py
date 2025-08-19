@@ -19,6 +19,7 @@ class OperationalStatus(Enum):
     DROPPING = "dropping"
     MOVING_TO_CHARGING = "moving_to_charging"
     CHARGING = "charging"
+    MOVING_TO_IDLE = "moving_to_idle"
     STALLED = "stalled"
     ERROR = "error"
     EMERGENCY_STOP = "emergency_stop"
@@ -141,6 +142,28 @@ class Task:
             order_priority=order_priority,
             customer_id=customer_id,
             dropoff_zone=dropoff_zone
+        )
+    
+    @classmethod
+    def create_idle_park_task(cls, task_id: str, robot_id: str,
+                             bay_id: Optional[str] = None) -> 'Task':
+        """
+        Factory method to create idle park tasks.
+        
+        Args:
+            task_id: Unique task identifier
+            robot_id: Robot identifier
+            bay_id: Specific idle zone bay (optional, will be auto-assigned if None)
+            
+        Returns:
+            Task: Configured idle park task
+        """
+        return cls(
+            task_id=task_id,
+            task_type=TaskType.IDLE_PARK,
+            order_id=f"system_idle_{robot_id}",
+            bay_id=bay_id or "auto_assigned",
+            priority=0  # Low priority system task
         )
     
     def __eq__(self, other) -> bool:

@@ -33,6 +33,8 @@ from interfaces.simulation_data_service_interface import (
     NavigationGraph,
     GraphNode,
     SimulationDataServiceError,
+    ItemInventoryInfo,
+    ItemShelfLocation,
 )
 from interfaces.graph_persistence_interface import GraphPersistenceResult
 from warehouse.impl.graph_persistence_impl import GraphPersistenceImpl
@@ -319,6 +321,52 @@ class SimulationDataServiceImpl(ISimulationDataService):
              cell[1] * self.warehouse_map.grid_size + self.warehouse_map.grid_size/2)
             for cell in dropoff_cells
         ]
+    
+    def get_idle_zones(self) -> List[Tuple[float, float]]:
+        """
+        Get all idle zone positions.
+        
+        Returns:
+            List[Tuple[float, float]]: List of idle zone positions
+        """
+        # Get idle zones from warehouse map
+        return self.warehouse_map._get_idle_zones()
+    
+    def get_optimal_idle_zone(self, robot_position: Tuple[float, float], 
+                             robot_id: str) -> Optional[Tuple[float, float]]:
+        """
+        Get the optimal idle zone for a robot based on position and availability.
+        
+        Simple strategy: choose the closest available idle zone.
+        Future enhancements: consider zone occupancy, traffic patterns, etc.
+        
+        Args:
+            robot_position: Current robot position (x, y)
+            robot_id: Robot identifier for tracking
+            
+        Returns:
+            Optional[Tuple[float, float]]: Optimal idle zone position or None if none available
+        """
+        idle_zones = self.get_idle_zones()
+        if not idle_zones:
+            logger.warning("No idle zones available")
+            return None
+        
+        # Simple strategy: find closest idle zone
+        # Future enhancement: consider zone occupancy, traffic patterns, etc.
+        closest_zone = None
+        min_distance = float('inf')
+        
+        for zone_pos in idle_zones:
+            distance = ((zone_pos[0] - robot_position[0]) ** 2 + 
+                       (zone_pos[1] - robot_position[1]) ** 2) ** 0.5
+            if distance < min_distance:
+                min_distance = distance
+                closest_zone = zone_pos
+        
+        logger.debug(f"Selected idle zone {closest_zone} for robot {robot_id} "
+                    f"(distance: {min_distance:.2f})")
+        return closest_zone
     
     # Shelf Operations
     def lock_shelf(self, shelf_id: str, robot_id: str) -> bool:
@@ -787,6 +835,92 @@ class SimulationDataServiceImpl(ISimulationDataService):
         except Exception as e:
             logger.error(f"Failed to get inventory statistics: {e}")
             raise SimulationDataServiceError(f"Failed to get inventory statistics: {e}")
+    
+    def get_item_inventory(self, item_id: str) -> Optional['ItemInventoryInfo']:
+        """
+        Get inventory information for a specific item.
+        
+        Args:
+            item_id: Item identifier
+            
+        Returns:
+            Optional[ItemInventoryInfo]: Item inventory information or None if not found
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Get item details
+                    cur.execute("""
+                        SELECT i.item_id, i.name, i.category
+                        FROM items i
+                        WHERE i.item_id = %s
+                    """, (item_id,))
+                    
+                    item = cur.fetchone()
+                    if not item:
+                        return None
+                    
+                    # Get inventory across all shelves
+                    cur.execute("""
+                        SELECT si.shelf_id, si.quantity, s.is_locked
+                        FROM shelf_inventory si
+                        JOIN shelves s ON si.shelf_id = s.shelf_id
+                        WHERE si.item_id = %s
+                    """, (item_id,))
+                    
+                    shelf_data = cur.fetchall()
+                    
+                    total_quantity = sum(row['quantity'] for row in shelf_data)
+                    available_quantity = sum(row['quantity'] for row in shelf_data if not row['is_locked'])
+                    shelf_locations = [row['shelf_id'] for row in shelf_data]
+                    
+                    return ItemInventoryInfo(
+                        item_id=item_id,
+                        available_quantity=available_quantity,
+                        total_quantity=total_quantity,
+                        reserved_quantity=total_quantity - available_quantity,
+                        shelf_locations=shelf_locations
+                    )
+                    
+        except Exception as e:
+            logger.error(f"Failed to get item inventory for {item_id}: {e}")
+            raise SimulationDataServiceError(f"Failed to get item inventory: {e}")
+    
+    def get_item_shelf_locations(self, item_id: str) -> List['ItemShelfLocation']:
+        """
+        Get all shelf locations where a specific item is stored.
+        
+        Args:
+            item_id: Item identifier
+            
+        Returns:
+            List[ItemShelfLocation]: List of shelf locations containing the item
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT si.shelf_id, si.quantity, s.is_locked, s.locked_by
+                        FROM shelf_inventory si
+                        JOIN shelves s ON si.shelf_id = s.shelf_id
+                        WHERE si.item_id = %s
+                        ORDER BY si.quantity DESC
+                    """, (item_id,))
+                    
+                    locations = []
+                    for row in cur.fetchall():
+                        locations.append(ItemShelfLocation(
+                            shelf_id=row['shelf_id'],
+                            quantity=row['quantity'],
+                            is_reserved=row['is_locked'],
+                            reserved_by=row['locked_by']
+                        ))
+                    
+                    return locations
+                    
+        except Exception as e:
+            logger.error(f"Failed to get shelf locations for item {item_id}: {e}")
+            raise SimulationDataServiceError(f"Failed to get shelf locations: {e}")
     
     # KPI Logging
     def log_event(self, event_type: str, robot_id: str, event_data: Dict[str, Any]) -> None:

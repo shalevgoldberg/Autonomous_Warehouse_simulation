@@ -119,7 +119,7 @@ class MockSimulationDataService(ISimulationDataService):
         )
     
     def get_item_location(self, item_id: str):
-        return "SHELF_001"  # Default shelf
+        return "shelf_3_3"  # Default shelf - updated to coordinate-based format
     
     def update_inventory(self, shelf_id: str, item_id: str, operation: str, quantity: int = 1):
         return True  # Always successful

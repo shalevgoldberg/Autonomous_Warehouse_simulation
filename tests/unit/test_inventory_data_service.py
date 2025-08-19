@@ -55,13 +55,13 @@ class TestInventoryDataService(unittest.TestCase):
             {
                 'item_id': 'book-fantasy',
                 'name': 'Fantasy Novel',
-                'shelf_id': 'shelf_0',
+                'shelf_id': 'shelf_3_3',
                 'quantity': 10
             },
             {
                 'item_id': 'electronics-phone',
                 'name': 'Smartphone',
-                'shelf_id': 'shelf_1',
+                'shelf_id': 'shelf_4_3',
                 'quantity': 5
             }
         ]
@@ -168,7 +168,7 @@ class TestInventoryDataService(unittest.TestCase):
         ]
         
         # Mock item location result
-        mock_cursor.fetchone.return_value = {'shelf_id': 'shelf_0'}
+        mock_cursor.fetchone.return_value = {'shelf_id': 'shelf_3_3'}
         
         with patch.dict('os.environ', {'WAREHOUSE_DB_PASSWORD': 'test_password'}):
             service = InventoryDataService(
@@ -180,7 +180,7 @@ class TestInventoryDataService(unittest.TestCase):
             shelf_id = service.get_item_location('book-fantasy')
             
             # Verify results
-            self.assertEqual(shelf_id, 'shelf_0')
+            self.assertEqual(shelf_id, 'shelf_3_3')
     
     @patch('warehouse.impl.inventory_data_service.psycopg2.pool.ThreadedConnectionPool')
     def test_get_item_location_not_found(self, mock_pool):
@@ -239,7 +239,7 @@ class TestInventoryDataService(unittest.TestCase):
             )
             
             # Test adding inventory
-            result = service.update_inventory('shelf_0', 'book-fantasy', 'add', 5)
+            result = service.update_inventory('shelf_3_3', 'book-fantasy', 'add', 5)
             
             # Verify results
             self.assertTrue(result)
@@ -272,7 +272,7 @@ class TestInventoryDataService(unittest.TestCase):
             )
             
             # Test removing inventory
-            result = service.update_inventory('shelf_0', 'book-fantasy', 'remove', 2)
+            result = service.update_inventory('shelf_3_3', 'book-fantasy', 'remove', 2)
             
             # Verify results
             self.assertTrue(result)
@@ -302,7 +302,7 @@ class TestInventoryDataService(unittest.TestCase):
             
             # Test invalid operation
             with self.assertRaises(InventoryDataServiceError) as context:
-                service.update_inventory('shelf_0', 'book-fantasy', 'invalid_op', 1)
+                service.update_inventory('shelf_3_3', 'book-fantasy', 'invalid_op', 1)
             
             self.assertIn("Invalid operation", str(context.exception))
     
@@ -347,7 +347,7 @@ class TestInventoryDataService(unittest.TestCase):
         """Test ShelfInventory dataclass properties."""
         # Create shelf inventory with reserved quantity
         shelf_inv = ShelfInventory(
-            shelf_id='shelf_0',
+            shelf_id='shelf_3_3',
             item_id='book-fantasy',
             quantity=10,
             reserved_quantity=3
@@ -379,7 +379,7 @@ class TestInventoryDataService(unittest.TestCase):
         ]
         
         # Mock item location results
-        mock_cursor.fetchone.return_value = {'shelf_id': 'shelf_0'}
+        mock_cursor.fetchone.return_value = {'shelf_id': 'shelf_3_3'}
         
         with patch.dict('os.environ', {'WAREHOUSE_DB_PASSWORD': 'test_password'}):
             service = InventoryDataService(
@@ -414,7 +414,7 @@ class TestInventoryDataService(unittest.TestCase):
             self.assertEqual(len(errors), 0)
             
             for thread_id, shelf_id in results:
-                self.assertEqual(shelf_id, 'shelf_0')
+                self.assertEqual(shelf_id, 'shelf_3_3')
     
     @patch('warehouse.impl.inventory_data_service.psycopg2.pool.ThreadedConnectionPool')
     def test_cache_clearing(self, mock_pool):

@@ -328,7 +328,7 @@ class TestEnhancedTask:
             task_id="equal_001",
             task_type=TaskType.PICK_AND_DELIVER,
             order_id="order_1",
-            shelf_id="shelf_1",
+            shelf_id="shelf_3_3",
             item_id="item_1"
         )
         
@@ -336,7 +336,7 @@ class TestEnhancedTask:
             task_id="equal_001",  # Same task_id
             task_type=TaskType.MOVE_TO_CHARGING,  # Different type
             order_id="order_2",  # Different order
-            shelf_id="shelf_2",  # Different shelf
+            shelf_id="shelf_4_3",  # Different shelf
             item_id="item_2"  # Different item
         )
         
@@ -344,7 +344,7 @@ class TestEnhancedTask:
             task_id="equal_002",  # Different task_id
             task_type=TaskType.PICK_AND_DELIVER,
             order_id="order_1",
-            shelf_id="shelf_1",
+            shelf_id="shelf_3_3",
             item_id="item_1"
         )
         

@@ -55,13 +55,13 @@ class TestInventoryManagement(unittest.TestCase):
             {
                 'item_id': 'book-fantasy',
                 'name': 'Fantasy Novel',
-                'shelf_id': 'shelf_0',
+                'shelf_id': 'shelf_3_3',
                 'quantity': 10
             },
             {
                 'item_id': 'electronics-phone',
                 'name': 'Smartphone',
-                'shelf_id': 'shelf_1',
+                'shelf_id': 'shelf_4_3',
                 'quantity': 5
             }
         ]
@@ -187,7 +187,7 @@ class TestInventoryManagement(unittest.TestCase):
         ]
         
         # Mock item location result
-        mock_cursor.fetchone.return_value = {'shelf_id': 'shelf_0'}
+        mock_cursor.fetchone.return_value = {'shelf_id': 'shelf_3_3'}
         
         with patch.dict('os.environ', {'WAREHOUSE_DB_PASSWORD': 'test_password'}):
             service = SimulationDataServiceImpl(
@@ -199,7 +199,7 @@ class TestInventoryManagement(unittest.TestCase):
             shelf_id = service.get_item_location('book-fantasy')
             
             # Verify results
-            self.assertEqual(shelf_id, 'shelf_0')
+            self.assertEqual(shelf_id, 'shelf_3_3')
     
     @patch('simulation.simulation_data_service_impl.psycopg2.pool.ThreadedConnectionPool')
     def test_get_item_location_not_found(self, mock_pool):
@@ -261,7 +261,7 @@ class TestInventoryManagement(unittest.TestCase):
             )
             
             # Test adding inventory
-            result = service.update_inventory('shelf_0', 'book-fantasy', 'add', 5)
+            result = service.update_inventory('shelf_3_3', 'book-fantasy', 'add', 5)
             
             # Verify results
             self.assertTrue(result)
@@ -295,7 +295,7 @@ class TestInventoryManagement(unittest.TestCase):
             )
             
             # Test removing inventory
-            result = service.update_inventory('shelf_0', 'book-fantasy', 'remove', 2)
+            result = service.update_inventory('shelf_3_3', 'book-fantasy', 'remove', 2)
             
             # Verify results
             self.assertTrue(result)
@@ -326,7 +326,7 @@ class TestInventoryManagement(unittest.TestCase):
             
             # Test invalid operation
             with self.assertRaises(SimulationDataServiceError) as context:
-                service.update_inventory('shelf_0', 'book-fantasy', 'invalid_op', 1)
+                service.update_inventory('shelf_3_3', 'book-fantasy', 'invalid_op', 1)
             
             self.assertIn("Invalid operation", str(context.exception))
     
@@ -390,7 +390,7 @@ class TestInventoryManagement(unittest.TestCase):
         ]
         
         # Mock item location results
-        mock_cursor.fetchone.return_value = {'shelf_id': 'shelf_0'}
+        mock_cursor.fetchone.return_value = {'shelf_id': 'shelf_3_3'}
         
         with patch.dict('os.environ', {'WAREHOUSE_DB_PASSWORD': 'test_password'}):
             service = SimulationDataServiceImpl(
@@ -425,7 +425,7 @@ class TestInventoryManagement(unittest.TestCase):
             self.assertEqual(len(errors), 0)
             
             for thread_id, shelf_id in results:
-                self.assertEqual(shelf_id, 'shelf_0')
+                self.assertEqual(shelf_id, 'shelf_3_3')
 
 
 if __name__ == '__main__':

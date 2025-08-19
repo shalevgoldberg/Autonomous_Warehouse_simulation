@@ -51,7 +51,7 @@ def test_database_connectivity():
         print(f"✅ Inventory: {stats['total_shelves']} shelves, {stats['total_items']} items")
         
         # Test shelf operations
-        shelf_info = service.get_shelf_info('shelf_10')
+        shelf_info = service.get_shelf_info('shelf_3_3')
         if shelf_info:
             print(f"✅ Shelf info: {shelf_info.shelf_id} at {shelf_info.position}")
         
@@ -81,7 +81,7 @@ def test_inventory_operations():
         )
         
         # Test inventory updates with existing items
-        test_shelf = 'shelf_20'
+        test_shelf = 'shelf_4_3'
         test_item = 'book_001'  # Use existing item
         
         # Add inventory to new shelf
@@ -122,7 +122,7 @@ def test_shelf_locking():
             db_password=os.getenv('WAREHOUSE_DB_PASSWORD')
         )
         
-        test_shelf = 'shelf_30'
+        test_shelf = 'shelf_6_3'
         robot_id = 'test_robot_001'
         
         # Test lock
@@ -178,7 +178,7 @@ def test_concurrent_access():
                     results.append(f"Thread {thread_id}: Stats OK")
                 elif thread_id == 2:
                     # Thread 2: Shelf operations
-                    shelf_info = service.get_shelf_info('shelf_10')
+                    shelf_info = service.get_shelf_info('shelf_3_3')
                     results.append(f"Thread {thread_id}: Shelf OK")
                 elif thread_id == 3:
                     # Thread 3: Item location
@@ -186,8 +186,8 @@ def test_concurrent_access():
                     results.append(f"Thread {thread_id}: Location OK")
                 elif thread_id == 4:
                     # Thread 4: Lock operations
-                    service.lock_shelf('shelf_40', f'robot_{thread_id}')
-                    service.unlock_shelf('shelf_40', f'robot_{thread_id}')
+                    service.lock_shelf('shelf_7_3', f'robot_{thread_id}')
+                    service.unlock_shelf('shelf_7_3', f'robot_{thread_id}')
                     results.append(f"Thread {thread_id}: Lock OK")
                     
             except Exception as e:
@@ -299,14 +299,14 @@ def test_database_performance():
         # Test write performance with existing items
         start_time = time.time()
         for i in range(10):
-            service.update_inventory(f'shelf_{50+i}', 'book_001', 'add', 1)
+            service.update_inventory(f'shelf_{3+i}_{3+i}', 'book_001', 'add', 1)
         write_time = time.time() - start_time
         print(f"✅ 10 writes in {write_time:.3f}s ({10/write_time:.1f} ops/sec)")
         
         # Test lock performance with valid shelves
         start_time = time.time()
         for i in range(20):
-            shelf_id = f'shelf_{i % 63}'  # Use valid shelf IDs (0-62)
+            shelf_id = f'shelf_{3+(i%3)}_{3+(i%3)}'  # Use valid coordinate-based shelf IDs
             service.lock_shelf(shelf_id, f'robot_{i}')
             service.unlock_shelf(shelf_id, f'robot_{i}')
         lock_time = time.time() - start_time
