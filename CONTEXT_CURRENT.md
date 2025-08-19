@@ -9,12 +9,13 @@
 - **Threads**: Physics 1 kHz, Motion 100 Hz, Control 10 Hz, Visualization ~30 FPS.
 
 ### What Works Now
-- Single-robot task loop: external tasks → queue → bidding/assignment → execution → completion.
+- Single-robot task loop: external tasks → queue → bidding/assignment → execution → completion → automatic IDLE_PARK.
 - Passive MuJoCo visualization rendering the warehouse and robot pose live.
 - Path planning on a navigation graph (from CSV) with lane semantics.
 - Motion executor with differential-drive kinematics, atomic wheel commands.
 - Physics thread manager (1 kHz) updating `StateHolder` for consumers.
 - Database layer scaffolding with connection pooling and graph persistence.
+- Complete task lifecycle: PICK_AND_DELIVER tasks automatically chain to IDLE_PARK for idle zone navigation.
 
 ### Key Constraints and Demo Relaxations
 - Lane deviation tolerance set to 3.0 m in demo for robustness. This is too soft for production (target 0.1–0.3 m). Validator may still warn about >2.0 m.
@@ -212,6 +213,7 @@ Key params (illustrative):
 ## Running
 - Demo: `demo_robot_task_simulation.py`
   - Starts robot agent (spawns physics + control + motion), initializes visualization thread, positions robot, enqueues demo tasks.
+  - Demonstrates complete task lifecycle: SHELF → DROP-OFF → IDLE ZONE (3 tasks for faster testing).
   - Command (PowerShell):
     - Set DB password: `$env:WAREHOUSE_DB_PASSWORD="renaspolter"`
     - Run: `./venv311/Scripts/python.exe demo_robot_task_simulation.py`
@@ -287,7 +289,8 @@ Notes:
 - Motion: `robot/impl/motion_executor_impl.py`
 - Lane Following: `robot/impl/lane_follower_impl.py`
 - Path Planner: `robot/impl/path_planner_graph_impl.py`
-- Map: `warehouse/map.py`
+- Task Handler: `robot/impl/task_handler_impl.py` (includes IDLE_PARK task chaining)
+- Map: `warehouse/map.py` (coordinate-based shelf IDs: `shelf_x_y`)
 - Graph Generation/Persistence: `warehouse/impl/graph_generator_impl.py`, `warehouse/impl/graph_persistence_impl.py`
 - Jobs: `warehouse/impl/jobs_processor_impl.py`, `warehouse/impl/jobs_queue_impl.py`
 - DB Service: `simulation/simulation_data_service_impl.py`
@@ -471,45 +474,6 @@ Solution: Check SimpleMuJoCoPhysics implementation and warehouse map
 
 ---
 
-## Recent Improvements and Enhancements
 
-### IDLE_PARK Task Type Implementation
-- **New Task Type**: Added `IDLE_PARK` to `TaskType` enum for system-generated idle zone navigation
-- **Operational Status**: Added `MOVING_TO_IDLE` to `OperationalStatus` enum
-- **Task Phase**: Added `NAVIGATING_TO_IDLE` to `TaskPhase` enum
-- **Automatic Chaining**: PICK_AND_DELIVER tasks automatically chain to IDLE_PARK upon completion
-- **State Management**: Fixed "robot busy" error by ensuring proper state reset before IDLE_PARK initiation
-
-### Shelf ID Format Standardization
-- **Coordinate-Based Naming**: Changed from sequential IDs (`shelf_1`, `shelf_2`) to coordinate-based (`shelf_3_3`, `shelf_4_3`)
-- **Consistent Convention**: Both CSV-loaded and programmatically generated warehouses now use `shelf_x_y` format
-- **Human Readable**: Shelf IDs directly indicate grid position for easier debugging and mapping
-- **Future-Proof**: Added adapter pattern documentation for potential legacy format support
-
-### Task Lifecycle Enhancements
-- **Full Lifecycle Demo**: Robot now demonstrates complete workflow: SHELF → DROP-OFF → IDLE ZONE
-- **Progress Tracking**: Enhanced progress calculation including IDLE_PARK navigation phase
-- **Demo Optimization**: Reduced demo to 3 tasks for faster testing and demonstration
-- **Task Chaining**: Seamless transition between primary tasks and idle parking
-
-### Code Quality Improvements
-- **SOLID Principles**: Maintained throughout all changes
-- **Interface-Driven Design**: All enhancements follow existing architectural patterns
-- **Comprehensive Testing**: Updated all test files to use new shelf ID format
-- **Thread Safety**: Enhanced task state management with proper locking
-
-### Key Files Modified
-- **Core Logic**: `robot/impl/task_handler_impl.py`, `interfaces/task_handler_interface.py`
-- **Data Service**: `simulation/simulation_data_service_impl.py`, `interfaces/simulation_data_service_interface.py`
-- **Warehouse Map**: `warehouse/map.py` with coordinate-based shelf generation
-- **Demo Script**: `demo_robot_task_simulation.py` with 3-task lifecycle demonstration
-- **Test Suite**: Updated all test files for new shelf ID format consistency
-
-### Benefits of Recent Changes
-1. **Realistic Workflow**: Robots now demonstrate complete warehouse task lifecycle
-2. **Better Debugging**: Coordinate-based shelf IDs provide immediate spatial context
-3. **Improved Reliability**: Fixed task chaining issues for smoother operation
-4. **Enhanced Testing**: Faster demo execution with comprehensive coverage
-5. **Future Maintainability**: Cleaner architecture and better documentation
 
 
