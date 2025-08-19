@@ -16,7 +16,7 @@ class WarehouseMap:
             Tuple of (width, height) or (0, 0) if file can't be read
         """
         try:
-            with open(csv_file, 'r', newline='') as file:
+            with open(csv_file, 'r', newline='', encoding='utf-8-sig') as file:
                 reader = csv.reader(file)
                 rows = list(reader)
             
@@ -114,7 +114,7 @@ class WarehouseMap:
         ```
         """
         try:
-            with open(csv_file, 'r', newline='') as file:
+            with open(csv_file, 'r', newline='', encoding='utf-8-sig') as file:
                 reader = csv.reader(file)
                 rows = list(reader)
             
@@ -140,8 +140,10 @@ class WarehouseMap:
                     if x >= self.width:
                         break
                     
-                    # Clean and normalize cell value
+                    # Clean and normalize cell value, handle BOM and other encoding issues
                     cell_value = str(cell_value).strip().lower()
+                    # Remove BOM and other invisible characters
+                    cell_value = ''.join(char for char in cell_value if ord(char) >= 32)
                     
                     if cell_value in value_map:
                         self.grid[y, x] = value_map[cell_value]

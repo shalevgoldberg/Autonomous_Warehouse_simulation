@@ -313,14 +313,8 @@ class SimulationDataServiceImpl(ISimulationDataService):
         Returns:
             List[Tuple[float, float]]: List of dropoff positions
         """
-        # TODO: Make this configurable from database
-        # For now, return hardcoded positions based on warehouse map
-        dropoff_cells = [(9, 9), (10, 9)]
-        return [
-            (cell[0] * self.warehouse_map.grid_size + self.warehouse_map.grid_size/2,
-             cell[1] * self.warehouse_map.grid_size + self.warehouse_map.grid_size/2)
-            for cell in dropoff_cells
-        ]
+        # Get drop-off stations from warehouse map (which reads from CSV)
+        return self.warehouse_map._get_dropoff_stations()
     
     def get_idle_zones(self) -> List[Tuple[float, float]]:
         """
