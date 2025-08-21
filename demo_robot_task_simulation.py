@@ -22,6 +22,7 @@ import time
 import threading
 from typing import List, Optional
 from unittest.mock import MagicMock
+import logging
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -186,6 +187,22 @@ class TaskSimulationManager:
     def start_simulation(self) -> None:
         """Start complete simulation."""
         print("\n🎬 Starting Robot Task Simulation")
+
+        # Ensure LaneFollower direct lock acquisition/release logs are visible
+        # Configure only the LaneFollower logger to avoid impacting other components (e.g., MuJoCo viewer)
+        try:
+            # Configure the specific robot's LaneFollower logger to avoid global side-effects
+            lane_logger = logging.getLogger(f"LaneFollower.{self.robot.robot_id}")
+            lane_logger.setLevel(logging.INFO)
+            # Attach a console handler once (avoid duplicates on reruns)
+            if not any(isinstance(h, logging.StreamHandler) for h in lane_logger.handlers):
+                handler = logging.StreamHandler()
+                handler.setLevel(logging.INFO)
+                handler.setFormatter(logging.Formatter("[%(levelname)s] [%(name)s] %(message)s"))
+                lane_logger.addHandler(handler)
+        except Exception:
+            # Never fail demo due to logging setup
+            pass
         
         # Start robot agent (starts physics + control threads)
         self.robot.start()

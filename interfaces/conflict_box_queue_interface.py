@@ -49,9 +49,15 @@ class QueueStatus:
     box_id: str
     current_owner: Optional[str]
     queue_length: int
+    is_locked: bool
     next_robot: Optional[str]
     average_wait_time: float  # Average wait time in seconds
     lock_duration_stats: Dict[str, float]  # Min, max, avg lock duration
+    entries: List[Dict[str, Any]] = None  # List of queue entries for detailed access
+    
+    def __post_init__(self):
+        if self.entries is None:
+            self.entries = []
 
 
 @dataclass
