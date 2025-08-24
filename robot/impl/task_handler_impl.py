@@ -241,6 +241,10 @@ class TaskHandlerImpl(ITaskHandler):
         
         # Shelf locking state (for cleanup on errors)
         self._locked_shelf_id: Optional[str] = None
+        # Bay locking state
+        self._locked_bay_id: Optional[str] = None
+        self._bay_lock_last_heartbeat: float = 0.0
+        self._bay_lock_heartbeat_interval: float = 5.0
     
     def update_config_from_robot(self, robot_config) -> None:
         """Update task parameters with robot-specific configuration."""
@@ -519,7 +523,7 @@ class TaskHandlerImpl(ITaskHandler):
         if self._planned_route is not None:
             # Route planning succeeded
             try:
-                print(f"[TaskHandler] Starting lane following with {len(self._planned_route.segments)} segments")
+                print(f"[TaskHandler] Starting lane following with {len(self._planned_route.segments)} segments (robot={self.robot_id})")
                 self.lane_follower.follow_route(self._planned_route, self.robot_id)
                 
                 # Advance to next phase
@@ -545,6 +549,7 @@ class TaskHandlerImpl(ITaskHandler):
             error_msg = self._planning_error
             self._planning_error = None
             self._planning_target = None
+            print(f"[TaskHandler] Path planning failed (robot={self.robot_id}): {error_msg}")
             self._handle_task_error(f"Path planning failed: {error_msg}")
             return
         
@@ -557,9 +562,9 @@ class TaskHandlerImpl(ITaskHandler):
                 # --- DEBUG LOGGING: initial robot position ---
                 try:
                     start_cell_dbg = self.coordinate_system.world_to_cell(current_position[:2])
-                    print(f"[TaskHandler] Initial robot position: World{current_position[:2]} Cell({start_cell_dbg.x}, {start_cell_dbg.y})")
+                    print(f"[TaskHandler] Initial robot position (robot={self.robot_id}): World{current_position[:2]} Cell({start_cell_dbg.x}, {start_cell_dbg.y})")
                 except Exception as dbg_e:
-                    print(f"[TaskHandler] Initial position conversion error: {dbg_e}")
+                    print(f"[TaskHandler] Initial position conversion error (robot={self.robot_id}): {dbg_e}")
                 
                 # Determine target based on task type
                 if self._current_task.task_type == TaskType.PICK_AND_DELIVER:
@@ -577,22 +582,22 @@ class TaskHandlerImpl(ITaskHandler):
                     # --- DEBUG LOGGING: target cell ---
                     try:
                         target_cell_dbg = self.coordinate_system.world_to_cell(target_position[:2])
-                        print(f"[TaskHandler] Target cell: ({target_cell_dbg.x}, {target_cell_dbg.y})")
+                        print(f"[TaskHandler] Target cell (robot={self.robot_id}): ({target_cell_dbg.x}, {target_cell_dbg.y})")
                     except Exception as dbg_e:
-                        print(f"[TaskHandler] Target position conversion error: {dbg_e}")
+                        print(f"[TaskHandler] Target position conversion error (robot={self.robot_id}): {dbg_e}")
                 
                 elif self._current_task.task_type == TaskType.MOVE_TO_CHARGING:
                     target_position = self._get_charging_station_position()
                 
                 elif self._current_task.task_type == TaskType.IDLE_PARK:
-                    target_position = self._get_idle_zone_position()
+                    target_position = self._request_and_wait_for_idle_bay()
                 
                 else:
                     raise TaskHandlingError(f"Unsupported task type: {self._current_task.task_type}")
                 
                 # Start asynchronous path planning
                 self._planning_target = target_position[:2]
-                print(f"[TaskHandler] Starting path planning: {current_position[:2]} -> {target_position[:2]}")
+                print(f"[TaskHandler] Starting path planning (robot={self.robot_id}): {current_position[:2]} -> {target_position[:2]}")
                 self._planning_thread = threading.Thread(
                     target=self._async_path_planning,
                     args=(current_position[:2], target_position[:2]),
@@ -603,6 +608,7 @@ class TaskHandlerImpl(ITaskHandler):
                 self.logger.debug(f"Started asynchronous path planning to {target_position[:2]}")
                 
             except Exception as e:
+                print(f"[TaskHandler] Planning initialization failed (robot={self.robot_id}): {e}")
                 self._handle_task_error(f"Planning initialization failed: {e}")
     
     def _handle_navigation_phase(self, expected_status: OperationalStatus) -> None:
@@ -959,6 +965,20 @@ class TaskHandlerImpl(ITaskHandler):
         
         # Clean up shelf locks
         self._unlock_current_shelf()
+        # Release bay lock if held
+        if self._locked_bay_id:
+            try:
+                released = self.simulation_data_service.release_bay_lock(self._locked_bay_id, self.robot_id)
+                if released:
+                    self.logger.info(f"Released bay lock {self._locked_bay_id}")
+                    try:
+                        print(f"[BayLock][{self.robot_id}] Released idle bay {self._locked_bay_id}")
+                    except Exception:
+                        pass
+            except SimulationDataServiceError as e:
+                self.logger.error(f"Failed to release bay lock {self._locked_bay_id}: {e}")
+            finally:
+                self._locked_bay_id = None
         
         self._current_task = None
         self._operational_status = OperationalStatus.IDLE
@@ -1157,6 +1177,69 @@ class TaskHandlerImpl(ITaskHandler):
             self.logger.error(f"Failed to get idle zone position: {e}")
             # Return a safe fallback position
             return (10.0, 10.0)
+
+    def _request_and_wait_for_idle_bay(self) -> Tuple[float, float]:
+        """Request nearest available idle bay with periodic retry; returns bay position.
+
+        Non-blocking: if no bay is available, returns current position so the planner
+        doesn't move, and the next planning cycle will retry.
+        """
+        # Heartbeat held bay lock
+        now = time.time()
+        if self._locked_bay_id and now - self._bay_lock_last_heartbeat > self._bay_lock_heartbeat_interval:
+            try:
+                if self.simulation_data_service.heartbeat_bay_lock(self._locked_bay_id, self.robot_id):
+                    self._bay_lock_last_heartbeat = now
+                    try:
+                        print(f"[BayLock][{self.robot_id}] Heartbeat idle bay {self._locked_bay_id}")
+                    except Exception:
+                        pass
+            except SimulationDataServiceError:
+                pass
+
+        # If already locked, return that bay's position
+        if self._locked_bay_id:
+            try:
+                parts = self._locked_bay_id.split('_')
+                row = int(parts[1]); col = int(parts[2])
+                world = self.coordinate_system.cell_to_world(Cell(x=col, y=row))
+                return (world.x, world.y) if hasattr(world, 'x') else world
+            except Exception:
+                idle_bays = self.simulation_data_service.list_idle_bays()
+                for bid, pos in idle_bays:
+                    if bid == self._locked_bay_id:
+                        return pos
+                return self.state_holder.get_robot_state().position[:2]
+
+        # Acquire nearest available idle bay
+        try:
+            state = self.state_holder.get_robot_state()
+            current_xy = state.position[:2]
+            candidates = self.simulation_data_service.list_idle_bays()
+            if not candidates:
+                return current_xy
+            candidates.sort(key=lambda item: (item[1][0]-current_xy[0])**2 + (item[1][1]-current_xy[1])**2)
+            for bay_id, pos in candidates:
+                try:
+                    print(f"[BayLock][{self.robot_id}] Trying idle bay {bay_id} at {pos}")
+                except Exception:
+                    pass
+                if self.simulation_data_service.try_acquire_bay_lock(bay_id, self.robot_id):
+                    self._locked_bay_id = bay_id
+                    self._bay_lock_last_heartbeat = time.time()
+                    try:
+                        print(f"[BayLock][{self.robot_id}] Acquired idle bay {bay_id} at {pos}")
+                    except Exception:
+                        pass
+                    return pos
+            try:
+                print(f"[BayLock][{self.robot_id}] No idle bay available; waiting")
+            except Exception:
+                pass
+            return current_xy
+        except SimulationDataServiceError as e:
+            self.logger.error(f"Idle bay acquisition failed: {e}")
+            return self.state_holder.get_robot_state().position[:2]
     
     def _unlock_current_shelf(self) -> None:
         """Internal: Unlock currently locked shelf if any."""

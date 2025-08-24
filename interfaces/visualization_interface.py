@@ -67,3 +67,11 @@ class IVisualization(ABC):
             bool: True if active, False otherwise
         """
         pass 
+
+    # Non-abstract, optional helper for lifecycle management
+    def __enter__(self):
+        self.initialize()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.shutdown()

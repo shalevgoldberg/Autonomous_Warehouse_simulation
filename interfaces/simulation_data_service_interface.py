@@ -365,6 +365,51 @@ class ISimulationDataService(ABC):
             SimulationDataServiceError: If cleanup operation fails
         """
         pass
+
+    # Bay (Idle/Charging) Lock Operations
+    @abstractmethod
+    def list_idle_bays(self) -> List[Tuple[str, Tuple[float, float]]]:
+        """
+        List idle bay ids with positions. Bay ids should correspond to graph node ids (e.g., idle_r_c).
+        Returns: List of (bay_id, position) tuples
+        """
+        pass
+
+    @abstractmethod
+    def list_charging_bays(self) -> List[Tuple[str, Tuple[float, float]]]:
+        """
+        List charging bay ids with positions. Bay ids should correspond to graph node ids (e.g., charge_r_c).
+        Returns: List of (bay_id, position) tuples
+        """
+        pass
+
+    @abstractmethod
+    def try_acquire_bay_lock(self, bay_id: str, robot_id: str, timeout_seconds: int = 600) -> bool:
+        """
+        Try to acquire an exclusive lock on a bay.
+        """
+        pass
+
+    @abstractmethod
+    def release_bay_lock(self, bay_id: str, robot_id: str) -> bool:
+        """
+        Release a bay lock if owned by the robot.
+        """
+        pass
+
+    @abstractmethod
+    def heartbeat_bay_lock(self, bay_id: str, robot_id: str) -> bool:
+        """
+        Heartbeat an existing bay lock to keep it alive.
+        """
+        pass
+
+    @abstractmethod
+    def cleanup_expired_bay_locks(self) -> int:
+        """
+        Cleanup expired bay locks.
+        """
+        pass
     
     # Shelf Operations
     @abstractmethod

@@ -32,6 +32,9 @@ class MockRobotAgent:
         self._is_idle = is_idle
         self._operational_status = OperationalStatus.IDLE if is_idle else OperationalStatus.MOVING_TO_SHELF
         
+        # Add robot_id attribute for lane-based robot agents
+        self.robot_id = robot_id
+        
         # Mock task handler interface
         self.task_handler_interface = Mock()
         self.task_handler_interface.is_idle.return_value = is_idle
@@ -374,10 +377,20 @@ class TestTransparentBiddingSystem:
     
     def test_error_handling_collection_failure(self):
         """Test error handling when bid collection fails."""
-        robot_with_error = Mock()
-        robot_with_error.get_robot_id.side_effect = Exception("Robot ID error")
+        # Create a custom class that doesn't have the expected robot_id attributes
+        class RobotWithoutId:
+            def get_status(self):
+                return {
+                    'task_active': False,  # Robot is idle
+                    'battery': 80.0,       # Sufficient battery
+                    'operational_status': 'idle'  # Not in error state
+                }
         
-        with pytest.raises(BiddingSystemError, match="Failed to collect bids"):
+        robot_with_error = RobotWithoutId()
+        # This robot has no config attribute and no robot_id attribute
+        
+        # This should raise an error when trying to get robot_id for bidding
+        with pytest.raises(BiddingSystemError, match="Robot agent has no robot_id attribute"):
             self.bidding_system.collect_bids([self.task1], [robot_with_error])
     
     def test_error_handling_selection_failure(self):

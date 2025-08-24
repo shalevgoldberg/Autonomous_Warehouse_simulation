@@ -47,7 +47,26 @@ class MotionExecutorImpl(IMotionExecutor):
     - emergency_stop(): ANY THREAD (emergency use)
     
     Uses atomic wheel command writing to prevent race conditions with physics thread.
+    
+    Logging Configuration:
+    - Set VERBOSE_MOTION_LOGGING = True to enable detailed motion logs
+    - Set VERBOSE_MOTION_LOGGING = False to disable verbose motion logs (default)
+    - Use MotionExecutorImpl.set_verbose_logging(True/False) to change at runtime
     """
+    
+    # Class-level logging configuration
+    VERBOSE_MOTION_LOGGING = False  # Set to True to enable verbose motion logs
+    
+    @classmethod
+    def set_verbose_logging(cls, enabled: bool) -> None:
+        """Enable or disable verbose motion logging for all instances."""
+        cls.VERBOSE_MOTION_LOGGING = enabled
+        print(f"[MotionExecutor] Verbose logging {'enabled' if enabled else 'disabled'}")
+    
+    @classmethod
+    def is_verbose_logging_enabled(cls) -> bool:
+        """Check if verbose motion logging is enabled."""
+        return cls.VERBOSE_MOTION_LOGGING
     
     def __init__(self, coordinate_system: ICoordinateSystem, 
                  model=None, data=None, robot_id: str = "robot_1", physics_engine=None,
@@ -105,6 +124,8 @@ class MotionExecutorImpl(IMotionExecutor):
         self._snap_start_time = None
         self._snap_duration = 0.5  # seconds for snap motion
         self._angular_tolerance = 0.1  # rad
+        # Heading gate: when heading error is too large, rotate-in-place before translating
+        self._heading_gate_threshold = 0.65  # rad (~37 degrees)
         
         # Thread safety
         self._status_lock = threading.RLock()
@@ -354,6 +375,9 @@ class MotionExecutorImpl(IMotionExecutor):
             if self.physics_engine is not None:
                 try:
                     self.physics_engine.set_wheel_velocities(left_vel, right_vel)
+                    # Diagnostics: robot_2-focused log of commands
+                    if self.robot_id == "warehouse_robot_2" and self.VERBOSE_MOTION_LOGGING:
+                        print(f"[MotionDiag] robot_2 cmd L={left_vel:.3f} R={right_vel:.3f}")
                 except Exception as e:
                     print(f"[MotionExecutor] Error writing to physics engine: {e}")
             
@@ -502,13 +526,15 @@ class MotionExecutorImpl(IMotionExecutor):
         dy = target_y - current_y
         distance = (dx**2 + dy**2)**0.5
         
-        print(f"[MotionExecutor] Motion calc: pos=({current_x:.3f},{current_y:.3f},{current_theta:.3f}), "
-              f"target=({target_x:.3f},{target_y:.3f}), dist={distance:.3f}")
+        if self.VERBOSE_MOTION_LOGGING:
+            print(f"[MotionExecutor] Motion calc: pos=({current_x:.3f},{current_y:.3f},{current_theta:.3f}), "
+                  f"target=({target_x:.3f},{target_y:.3f}), dist={distance:.3f}")
         
         if distance < self._position_tolerance:
             # Reached target
             left_vel, right_vel = 0.0, 0.0
-            print(f"[MotionExecutor] At target, stopping")
+            if self.VERBOSE_MOTION_LOGGING:
+                print(f"[MotionExecutor] At target, stopping")
         else:
             # Calculate desired heading
             desired_theta = np.arctan2(dy, dx)
@@ -525,7 +551,8 @@ class MotionExecutorImpl(IMotionExecutor):
             if distance < self._position_tolerance and not self._snap_triggered:
                 self._snap_triggered = True
                 self._snap_start_time = time.time()
-                print(f"[MotionExecutor] 🎯 Snap triggered at distance {distance:.3f}m")
+                if self.VERBOSE_MOTION_LOGGING:
+                    print(f"[MotionExecutor] 🎯 Snap triggered at distance {distance:.3f}m")
             
             # Physics-aware snap: use high velocity for final approach
             if self._snap_triggered and self._snap_start_time is not None:
@@ -536,23 +563,34 @@ class MotionExecutorImpl(IMotionExecutor):
                     snap_velocity = min(3.0, distance * 10.0)  # Up to 3 m/s
                     linear_vel = snap_velocity * (1.0 - snap_progress)  # Decelerate toward end
                     angular_vel = 2.0 * theta_error  # Keep steering toward target
-                    print(f"[MotionExecutor] 🚀 Snap motion: vel={linear_vel:.2f}m/s, progress={snap_progress:.1%}")
+                    if self.VERBOSE_MOTION_LOGGING:
+                        print(f"[MotionExecutor] 🚀 Snap motion: vel={linear_vel:.2f}m/s, progress={snap_progress:.1%}")
                 else:
                     # Snap complete - stop motion
                     linear_vel = 0.0
                     angular_vel = 0.0
-                    print(f"[MotionExecutor] ✅ Snap complete - target reached!")
+                    if self.VERBOSE_MOTION_LOGGING:
+                        print(f"[MotionExecutor] ✅ Snap complete - target reached!")
             else:
-                # Normal proportional control with gradual speed reduction
-                linear_vel = self._movement_speed * max(0.2, 1 - abs(theta_error))  # Never less than 20% of speed
-                angular_vel = 0.8 * theta_error  # Reduced from 2.0 to 0.8 for less aggressive steering
+                # Normal proportional control with heading gate to prevent orbiting
+                if abs(theta_error) > self._heading_gate_threshold:
+                    # Rotate-in-place until sufficiently aligned
+                    linear_vel = 0.0
+                    angular_vel = 0.8 * theta_error
+                    if self.VERBOSE_MOTION_LOGGING:
+                        print(f"[MotionExecutor] Heading gate active | theta_err={theta_error:.3f} > {self._heading_gate_threshold:.3f}")
+                else:
+                    # Gradual speed reduction as heading error grows
+                    linear_vel = self._movement_speed * max(0.2, 1 - abs(theta_error))  # Never less than 20% of speed
+                    angular_vel = 0.8 * theta_error  # Reduced from 2.0 to 0.8 for less aggressive steering
             
             # Clamp angular velocity
             angular_vel = max(-self._max_angular_velocity, min(self._max_angular_velocity, angular_vel))
             
             left_vel, right_vel = self._angular_to_wheel_velocities(linear_vel, angular_vel)
-            print(f"[MotionExecutor] Calculated: linear={linear_vel:.3f}, angular={angular_vel:.3f}, "
-                  f"wheels=L{left_vel:.3f}/R{right_vel:.3f}")
+            if self.VERBOSE_MOTION_LOGGING:
+                print(f"[MotionExecutor] Calculated: linear={linear_vel:.3f}, angular={angular_vel:.3f}, "
+                      f"wheels=L{left_vel:.3f}/R{right_vel:.3f}")
         
         self.set_wheel_commands_atomic(left_vel, right_vel)
     
@@ -571,23 +609,28 @@ class MotionExecutorImpl(IMotionExecutor):
     
     def _write_to_mujoco_atomic(self, left_vel: float, right_vel: float) -> None:
         """Write wheel commands to physics engine."""
-        print(f"[MotionExecutor] _write_to_mujoco_atomic called: L={left_vel:.3f}, R={right_vel:.3f}")
+        if self.VERBOSE_MOTION_LOGGING:
+            print(f"[MotionExecutor] _write_to_mujoco_atomic called: L={left_vel:.3f}, R={right_vel:.3f}")
         
         # First try to write to physics engine (preferred method)
         if self.physics_engine is not None:
             try:
-                print(f"[MotionExecutor] Calling physics_engine.set_wheel_velocities")
+                if self.VERBOSE_MOTION_LOGGING:
+                    print(f"[MotionExecutor] Calling physics_engine.set_wheel_velocities")
                 self.physics_engine.set_wheel_velocities(left_vel, right_vel)
-                print(f"[MotionExecutor] Successfully sent to physics engine")
+                if self.VERBOSE_MOTION_LOGGING:
+                    print(f"[MotionExecutor] Successfully sent to physics engine")
                 return  # Success - no need to try MuJoCo direct access
             except Exception as e:
                 print(f"[MotionExecutor] Error writing to physics engine: {e}")
         else:
-            print(f"[MotionExecutor] No physics engine available")
+            if self.VERBOSE_MOTION_LOGGING:
+                print(f"[MotionExecutor] No physics engine available")
         
         # Fallback to direct MuJoCo access (legacy)
         if self.model is None or self.data is None:
-            print(f"[MotionExecutor] No MuJoCo model/data available")
+            if self.VERBOSE_MOTION_LOGGING:
+                print(f"[MotionExecutor] No MuJoCo model/data available")
             return
         
         try:
@@ -604,10 +647,12 @@ class MotionExecutorImpl(IMotionExecutor):
             # Write commands atomically
                 self.data.ctrl[self._left_wheel_actuator_id] = left_vel
                 self.data.ctrl[self._right_wheel_actuator_id] = right_vel
-                print(f"[MotionExecutor] Successfully sent to MuJoCo")
+                if self.VERBOSE_MOTION_LOGGING:
+                    print(f"[MotionExecutor] Successfully sent to MuJoCo")
             else:
                 # Actuators not available - this is expected for simple physics mode
-                print(f"[MotionExecutor] MuJoCo actuators not available (expected)")
+                if self.VERBOSE_MOTION_LOGGING:
+                    print(f"[MotionExecutor] MuJoCo actuators not available (expected)")
                 
         except Exception as e:
             print(f"[MotionExecutor] Error writing to MuJoCo: {e}")

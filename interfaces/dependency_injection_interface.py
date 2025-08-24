@@ -118,3 +118,5 @@ class ServiceResolutionError(Exception):
 class ServiceLifetimeError(Exception):
     """Raised when there's an issue with service lifetime management."""
     pass
+
+

@@ -69,6 +69,11 @@ class SimpleMuJoCoPhysics:
         self.model = None
         self.data = None
         self._initialize_mujoco()
+
+        # Diagnostics: rate-limited logging (robot_2-focused) for wheel commands and pose
+        self._diagnostics_enabled = False
+        self._last_block_log_time = 0.0
+        self._block_log_count = 0
     
     def _initialize_mujoco(self) -> None:
         """
@@ -187,6 +192,12 @@ class SimpleMuJoCoPhysics:
             self._right_wheel_vel = right_vel
             # Store for debugging
             self._last_wheel_commands = (left_vel, right_vel, time.time())
+            # Diagnostics: robot_2 only to reduce noise
+            try:
+                if self._diagnostics_enabled and getattr(self, 'robot_id', None) == 'warehouse_robot_2':
+                    print(f"[PhysicsDiag] cmd L={left_vel:.3f} R={right_vel:.3f}")
+            except Exception:
+                pass
     
     def step_physics(self) -> None:
         """
@@ -209,19 +220,41 @@ class SimpleMuJoCoPhysics:
             
             # Simple Euler integration
             new_theta = theta + angular_vel * self._physics_dt
-            new_x = x + linear_vel * np.cos(new_theta) * self._physics_dt
-            new_y = y + linear_vel * np.sin(new_theta) * self._physics_dt
+            attempted_x = x + linear_vel * np.cos(new_theta) * self._physics_dt
+            attempted_y = y + linear_vel * np.sin(new_theta) * self._physics_dt
+            new_x = attempted_x
+            new_y = attempted_y
             
             # Basic collision detection (stay within warehouse bounds)
-            new_x = max(0.2, min(new_x, self.warehouse_map.width * self.warehouse_map.grid_size - 0.2))
-            new_y = max(0.2, min(new_y, self.warehouse_map.height * self.warehouse_map.grid_size - 0.2))
+            clamped_x = max(0.2, min(new_x, self.warehouse_map.width * self.warehouse_map.grid_size - 0.2))
+            clamped_y = max(0.2, min(new_y, self.warehouse_map.height * self.warehouse_map.grid_size - 0.2))
+            bounds_clamped = (abs(clamped_x - new_x) > 1e-9) or (abs(clamped_y - new_y) > 1e-9)
+            new_x, new_y = clamped_x, clamped_y
             
             # Check collision with walls and shelves
-            if not self.warehouse_map.is_walkable(new_x, new_y):
+            walkable = self.warehouse_map.is_walkable(new_x, new_y)
+            if not walkable:
                 # Collision detected, don't update position
                 new_x, new_y = x, y
                 linear_vel = 0.0
                 angular_vel = 0.0
+                # Diagnostics: rate-limited logging
+                if self._diagnostics_enabled:
+                    import time as _t
+                    now = _t.time()
+                    if (now - self._last_block_log_time) > 0.5 and self._block_log_count < 100:
+                        self._last_block_log_time = now
+                        self._block_log_count += 1
+                        print(f"[PhysicsDiag] Blocked by obstacle: pos=({x:.3f},{y:.3f},{theta:.3f}) -> attempted=({attempted_x:.3f},{attempted_y:.3f}) walkable=False")
+            elif bounds_clamped:
+                # Diagnostics: rate-limited logging for bounds clamp
+                if self._diagnostics_enabled:
+                    import time as _t
+                    now = _t.time()
+                    if (now - self._last_block_log_time) > 0.5 and self._block_log_count < 100:
+                        self._last_block_log_time = now
+                        self._block_log_count += 1
+                        print(f"[PhysicsDiag] Clamped to bounds: pos=({x:.3f},{y:.3f},{theta:.3f}) -> attempted=({attempted_x:.3f},{attempted_y:.3f}) clamped=({new_x:.3f},{new_y:.3f})")
             
             # Update state
             self._current_state = PhysicsState(
@@ -229,6 +262,12 @@ class SimpleMuJoCoPhysics:
                 velocity=(linear_vel * np.cos(new_theta), linear_vel * np.sin(new_theta), angular_vel),
                 timestamp=time.time()
             )
+            # Diagnostics: robot_2 only pose trace
+            try:
+                if self._diagnostics_enabled and getattr(self, 'robot_id', None) == 'warehouse_robot_2':
+                    print(f"[PhysicsDiag] pose ({new_x:.3f},{new_y:.3f},{new_theta:.3f}) vel lin={linear_vel:.3f} ang={angular_vel:.3f}")
+            except Exception:
+                pass
             
             # Update MuJoCo visualization if available
             if self.model is not None and self.data is not None:

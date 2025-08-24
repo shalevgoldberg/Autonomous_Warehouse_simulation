@@ -168,6 +168,25 @@ class SimulationDataServiceImpl(ISimulationDataService):
                     
                     conn.commit()
                     logger.info("Database schema verified and shelf_locks table ensured")
+
+                    # Ensure bay_locks table exists (simple exclusive occupancy for bays)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS bay_locks (
+                            bay_id VARCHAR(64) PRIMARY KEY,
+                            robot_id VARCHAR(36) NOT NULL,
+                            locked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            heartbeat_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            lock_timeout_seconds INTEGER DEFAULT 600
+                        )
+                    """)
+                    cur.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_bay_locks_robot_id ON bay_locks(robot_id)
+                    """)
+                    cur.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_bay_locks_heartbeat ON bay_locks(heartbeat_at)
+                    """)
+                    conn.commit()
+                    logger.info("Database schema ensured for bay_locks")
                     
         except psycopg2.Error as e:
             raise SimulationDataServiceError(f"Database initialization failed: {e}")
@@ -205,6 +224,38 @@ class SimulationDataServiceImpl(ISimulationDataService):
                 with self._pool_lock:
                     if self._connection_pool:
                         self._connection_pool.putconn(conn)
+
+    # Internal helpers
+    def _scalar(self, row, default=None):
+        """Extract a scalar value from a fetchone() row that may be a tuple or dict.
+
+        Returns default if row is None or cannot be parsed.
+        """
+        if row is None:
+            return default
+        try:
+            # Dict row from RealDictCursor
+            if isinstance(row, dict):
+                if len(row) == 1:
+                    return next(iter(row.values()))
+                # Attempt known function keys
+                for key in (
+                    'try_acquire_conflict_box_lock',
+                    'release_conflict_box_lock',
+                    'heartbeat_conflict_box_lock',
+                    'cleanup_expired_blocked_cells',
+                ):
+                    if key in row:
+                        return row[key]
+                # Fallback to first value
+                return next(iter(row.values()))
+            # Tuple/list row
+            if isinstance(row, (list, tuple)):
+                return row[0] if row else default
+            # Already scalar
+            return row
+        except Exception:
+            return default
     
     # Map Operations
     def get_map_data(self) -> MapData:
@@ -325,6 +376,27 @@ class SimulationDataServiceImpl(ISimulationDataService):
         """
         # Get idle zones from warehouse map
         return self.warehouse_map._get_idle_zones()
+
+    # ---- Bay (Idle/Charging) Listing ----
+    def list_idle_bays(self) -> List[Tuple[str, Tuple[float, float]]]:
+        """List idle bays as (bay_id, position). Uses map grid positions to synthesize ids."""
+        bays: List[Tuple[str, Tuple[float, float]]] = []
+        for y in range(self.warehouse_map.height):
+            for x in range(self.warehouse_map.width):
+                if self.warehouse_map.grid[y, x] == 4:
+                    bay_id = f"idle_{y}_{x}"
+                    bays.append((bay_id, self.warehouse_map.grid_to_world(x, y)))
+        return bays
+
+    def list_charging_bays(self) -> List[Tuple[str, Tuple[float, float]]]:
+        """List charging bays as (bay_id, position). Uses map grid positions to synthesize ids."""
+        bays: List[Tuple[str, Tuple[float, float]]] = []
+        for y in range(self.warehouse_map.height):
+            for x in range(self.warehouse_map.width):
+                if self.warehouse_map.grid[y, x] == 3:
+                    bay_id = f"charge_{y}_{x}"
+                    bays.append((bay_id, self.warehouse_map.grid_to_world(x, y)))
+        return bays
     
     def get_optimal_idle_zone(self, robot_position: Tuple[float, float], 
                              robot_id: str) -> Optional[Tuple[float, float]]:
@@ -361,6 +433,78 @@ class SimulationDataServiceImpl(ISimulationDataService):
         logger.debug(f"Selected idle zone {closest_zone} for robot {robot_id} "
                     f"(distance: {min_distance:.2f})")
         return closest_zone
+
+    # ---- Bay Lock Operations ----
+    def try_acquire_bay_lock(self, bay_id: str, robot_id: str, timeout_seconds: int = 600) -> bool:
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Attempt insert; if exists, fail
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO bay_locks (bay_id, robot_id, locked_at, heartbeat_at, lock_timeout_seconds)
+                            VALUES (%s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, %s)
+                            """,
+                            (bay_id, robot_id, int(timeout_seconds))
+                        )
+                        conn.commit()
+                        logger.debug("Acquired bay lock %s by %s", bay_id, robot_id)
+                        return True
+                    except psycopg2.IntegrityError:
+                        conn.rollback()
+                        return False
+        except Exception as e:
+            logger.error("Failed to acquire bay lock %s by %s: %s", bay_id, robot_id, e)
+            raise SimulationDataServiceError(f"Failed to acquire bay lock: {e}")
+
+    def release_bay_lock(self, bay_id: str, robot_id: str) -> bool:
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        DELETE FROM bay_locks WHERE bay_id = %s AND robot_id = %s
+                        """,
+                        (bay_id, robot_id)
+                    )
+                    released = cur.rowcount > 0
+                    conn.commit()
+                    return released
+        except Exception as e:
+            logger.error("Failed to release bay lock %s by %s: %s", bay_id, robot_id, e)
+            raise SimulationDataServiceError(f"Failed to release bay lock: {e}")
+
+    def heartbeat_bay_lock(self, bay_id: str, robot_id: str) -> bool:
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE bay_locks SET heartbeat_at = CURRENT_TIMESTAMP WHERE bay_id = %s AND robot_id = %s
+                        """,
+                        (bay_id, robot_id)
+                    )
+                    updated = cur.rowcount > 0
+                    conn.commit()
+                    return updated
+        except Exception as e:
+            logger.error("Failed to heartbeat bay lock %s by %s: %s", bay_id, robot_id, e)
+            raise SimulationDataServiceError(f"Failed to heartbeat bay lock: {e}")
+
+    def cleanup_expired_bay_locks(self) -> int:
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM bay_locks WHERE CURRENT_TIMESTAMP > (heartbeat_at + INTERVAL '1 second' * lock_timeout_seconds)")
+                    # Purge expired
+                    cur.execute("DELETE FROM bay_locks WHERE CURRENT_TIMESTAMP > (heartbeat_at + INTERVAL '1 second' * lock_timeout_seconds)")
+                    deleted = cur.rowcount
+                    conn.commit()
+                    return int(deleted)
+        except Exception as e:
+            logger.error("Failed to cleanup expired bay locks: %s", e)
+            raise SimulationDataServiceError(f"Failed to cleanup expired bay locks: {e}")
     
     # Shelf Operations
     def lock_shelf(self, shelf_id: str, robot_id: str) -> bool:
@@ -1245,7 +1389,7 @@ class SimulationDataServiceImpl(ISimulationDataService):
                     # Use the database function we created
                     cur.execute("SELECT cleanup_expired_blocked_cells()")
                     result = cur.fetchone()
-                    deleted_count = result[0] if result else 0
+                    deleted_count = self._scalar(result, 0)
                     
                     conn.commit()
                     logger.debug(f"Cleaned up {deleted_count} expired blocked cells")
@@ -1278,7 +1422,7 @@ class SimulationDataServiceImpl(ISimulationDataService):
                     cur.execute("SELECT try_acquire_conflict_box_lock(%s, %s, %s)", 
                                (box_id, robot_id, priority))
                     result = cur.fetchone()
-                    success = result[0] if result else False
+                    success = bool(self._scalar(result, False))
                     
                     conn.commit()
                     
@@ -1314,7 +1458,7 @@ class SimulationDataServiceImpl(ISimulationDataService):
                     cur.execute("SELECT release_conflict_box_lock(%s, %s)", 
                                (box_id, robot_id))
                     result = cur.fetchone()
-                    success = result[0] if result else False
+                    success = bool(self._scalar(result, False))
                     
                     conn.commit()
                     
@@ -1350,7 +1494,7 @@ class SimulationDataServiceImpl(ISimulationDataService):
                     cur.execute("SELECT heartbeat_conflict_box_lock(%s, %s)", 
                                (box_id, robot_id))
                     result = cur.fetchone()
-                    success = result[0] if result else False
+                    success = bool(self._scalar(result, False))
                     
                     conn.commit()
                     

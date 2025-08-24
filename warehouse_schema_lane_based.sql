@@ -79,6 +79,17 @@ CREATE TABLE IF NOT EXISTS shelf_locks (
     lock_timeout_seconds INTEGER DEFAULT 300 -- 5 minutes default timeout
 );
 
+-- 7. Bay Locks Table - Manage exclusive occupancy of idle/charging bays
+-- bay_id references navigation_graph_nodes.node_id where node ids follow
+-- the convention idle_r_c or charge_r_c for idle/charging zone nodes
+CREATE TABLE IF NOT EXISTS bay_locks (
+    bay_id VARCHAR(64) PRIMARY KEY REFERENCES navigation_graph_nodes(node_id),
+    locked_by_robot VARCHAR(36) NOT NULL REFERENCES robots(robot_id),
+    lock_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    heartbeat_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    lock_timeout_seconds INTEGER DEFAULT 600 -- default 10 minutes
+);
+
 -- Performance Indexes
 CREATE INDEX IF NOT EXISTS idx_lanes_direction ON lanes(direction);
 CREATE INDEX IF NOT EXISTS idx_lanes_bay_id ON lanes(bay_id) WHERE bay_id IS NOT NULL;
@@ -94,6 +105,8 @@ CREATE INDEX IF NOT EXISTS idx_shelf_locks_heartbeat ON shelf_locks(heartbeat_ti
 CREATE INDEX IF NOT EXISTS idx_conflict_box_locks_robot ON conflict_box_locks(locked_by_robot);
 CREATE INDEX IF NOT EXISTS idx_conflict_box_locks_heartbeat ON conflict_box_locks(heartbeat_timestamp);
 CREATE INDEX IF NOT EXISTS idx_conflict_box_locks_priority ON conflict_box_locks(lock_priority);
+CREATE INDEX IF NOT EXISTS idx_bay_locks_robot ON bay_locks(locked_by_robot);
+CREATE INDEX IF NOT EXISTS idx_bay_locks_heartbeat ON bay_locks(heartbeat_timestamp);
 
 -- Triggers for updating timestamps
 CREATE TRIGGER IF NOT EXISTS update_lanes_updated_at BEFORE UPDATE ON lanes
@@ -227,6 +240,65 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Function to try acquiring a conflict box lock
+-- Function to cleanup expired bay locks
+CREATE OR REPLACE FUNCTION cleanup_expired_bay_locks()
+RETURNS INTEGER AS $$
+DECLARE
+    deleted_count INTEGER;
+BEGIN
+    DELETE FROM bay_locks 
+    WHERE CURRENT_TIMESTAMP > (heartbeat_timestamp + INTERVAL '1 second' * lock_timeout_seconds);
+    GET DIAGNOSTICS deleted_count = ROW_COUNT;
+    RETURN deleted_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Functions to acquire/release/heartbeat bay locks (simple, shelf-like semantics)
+CREATE OR REPLACE FUNCTION try_acquire_bay_lock(
+    p_bay_id VARCHAR,
+    p_robot_id VARCHAR,
+    p_timeout_seconds INTEGER DEFAULT 600
+)
+RETURNS BOOLEAN AS $$
+BEGIN
+    -- Try to insert a new lock; if exists, fail
+    INSERT INTO bay_locks (bay_id, locked_by_robot, lock_timestamp, heartbeat_timestamp, lock_timeout_seconds)
+    VALUES (p_bay_id, p_robot_id, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, COALESCE(p_timeout_seconds, 600));
+    RETURN TRUE;
+EXCEPTION WHEN unique_violation THEN
+    RETURN FALSE;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION release_bay_lock(
+    p_bay_id VARCHAR,
+    p_robot_id VARCHAR
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    v_count INTEGER;
+BEGIN
+    DELETE FROM bay_locks WHERE bay_id = p_bay_id AND locked_by_robot = p_robot_id;
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+    RETURN v_count > 0;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION heartbeat_bay_lock(
+    p_bay_id VARCHAR,
+    p_robot_id VARCHAR
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    v_count INTEGER;
+BEGIN
+    UPDATE bay_locks 
+       SET heartbeat_timestamp = CURRENT_TIMESTAMP
+     WHERE bay_id = p_bay_id AND locked_by_robot = p_robot_id;
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+    RETURN v_count > 0;
+END;
+$$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION try_acquire_conflict_box_lock(
     p_box_id VARCHAR(36),
     p_robot_id VARCHAR(36),

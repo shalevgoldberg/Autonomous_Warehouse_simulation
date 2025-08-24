@@ -5,6 +5,7 @@ Shows robot moving across warehouse without MuJoCo visualization conflicts.
 """
 import time
 import threading
+from unittest.mock import MagicMock
 from warehouse.map import WarehouseMap
 from simulation.mujoco_env import SimpleMuJoCoPhysics
 from robot.robot_agent_lane_based import RobotAgent

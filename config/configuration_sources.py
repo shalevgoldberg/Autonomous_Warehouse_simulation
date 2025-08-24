@@ -303,7 +303,7 @@ class DefaultConfigurationSource(IConfigurationSource):
             "robot.position_tolerance": 0.1,
             "robot.control_frequency": 10.0,
             "robot.motion_frequency": 100.0,
-            "robot.lane_tolerance": 0.1,
+            "robot.lane_tolerance": 0.2,  # Should be 0.1-0.3m for production use
             "robot.corner_speed": 0.3,
             "robot.bay_approach_speed": 0.2,
             "robot.conflict_box_lock_timeout": 30.0,
@@ -338,7 +338,7 @@ class DefaultConfigurationSource(IConfigurationSource):
             "navigation.conflict_box_priority_levels": 10,
             "navigation.blocked_cell_timeout": 300.0,
             "navigation.blocked_cell_cleanup_interval": 60.0,
-            "navigation.lane_tolerance": 0.1,
+            "navigation.lane_tolerance": 0.2,  # Should be 0.1-0.3m for production use
             "navigation.velocity_smoothing_factor": 0.1,
             "navigation.max_deviation": 2.0,
             "navigation.max_consecutive_deviations": 3,

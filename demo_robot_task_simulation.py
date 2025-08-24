@@ -39,6 +39,7 @@ from simulation.visualization_thread import VisualizationThread
 from interfaces.lane_follower_interface import LaneFollowingConfig
 from config.configuration_provider import ConfigurationProvider
 from simulation.simulation_data_service_impl import SimulationDataServiceImpl
+from pathlib import Path
 
 
 class TaskSimulationManager:
@@ -69,6 +70,16 @@ class TaskSimulationManager:
         self.simulation_data_service = SimulationDataServiceImpl(self.warehouse_map)
         print("   ✅ Simulation data service initialized")
         
+        # Persist grouped navigation graph (from CSV) into DB to ensure up-to-date conflict boxes
+        try:
+            result = self.simulation_data_service.persist_navigation_graph_from_csv(
+                Path(warehouse_csv), clear_existing=True
+            )
+            print(f"   ✅ Navigation graph persisted: boxes={result.boxes_persisted}, "
+                  f"nodes={result.nodes_persisted}, edges={result.edges_persisted}")
+        except Exception as e:
+            print(f"   ⚠️  Warning: Could not persist navigation graph: {e}")
+        
         # Populate inventory for demo
         self._populate_demo_inventory()
         
@@ -97,6 +108,18 @@ class TaskSimulationManager:
             stall_recovery_timeout=10.0
         )
         
+        # Ensure robot id exists in DB for FK constraints used by conflict box locks
+        try:
+            with self.simulation_data_service._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO robots (robot_id, name) VALUES (%s, %s) ON CONFLICT (robot_id) DO NOTHING",
+                        ("robot_1", "Robot 1"),
+                    )
+                    conn.commit()
+        except Exception:
+            pass
+
         # Create robot agent with real simulation data service
         self.robot = RobotAgent(
             physics=self.physics,
@@ -338,8 +361,8 @@ def demo_automated_tasks():
         print("\n⏳ Running automated PICK_AND_DELIVER task sequence...")
         print("   Robot will automatically execute: SHELF → DROP-OFF → IDLE ZONE")
         
-        # Run for exactly 3 tasks
-        max_tasks = 3
+        # Run for more tasks to observe longer behavior
+        max_tasks = 6
         task_cycle = 1
         while task_cycle <= max_tasks:
             print(f"\n--- Task Cycle {task_cycle}/{max_tasks} ---")

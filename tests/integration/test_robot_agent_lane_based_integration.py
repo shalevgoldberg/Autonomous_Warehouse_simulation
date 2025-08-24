@@ -3,7 +3,8 @@ from unittest.mock import MagicMock, patch
 import threading
 import time
 
-from robot.robot_agent_lane_based import RobotAgent, RobotConfiguration
+from robot.robot_agent_lane_based import RobotAgent
+from interfaces.configuration_interface import RobotConfig
 from interfaces.task_handler_interface import Task, TaskType
 from interfaces.lane_follower_interface import LaneFollowingStatus
 from interfaces.motion_executor_interface import MotionStatus
@@ -43,32 +44,93 @@ def simulation_data_service():
     mock.lock_shelf.return_value = True
     mock.unlock_shelf.return_value = True
     mock.log_event.return_value = None
+    
+    # Create a proper mock object for map data
+    map_data_mock = MagicMock()
+    map_data_mock.width = 10
+    map_data_mock.height = 10
+    map_data_mock.cell_size = 1.0
+    map_data_mock.obstacles = []
+    map_data_mock.shelves = {}
+    mock.get_map_data.return_value = map_data_mock
     return mock
 
 @pytest.fixture
 def robot_config():
-    return RobotConfiguration(
+    return RobotConfig(
         robot_id="lane_robot_001",
         max_speed=2.0,
         position_tolerance=0.1,
         control_frequency=10.0,
         motion_frequency=100.0,
-        start_position=(0.0, 0.0)
+        cell_size=1.0,
+        lane_tolerance=0.2,
+        corner_speed=1.0,
+        bay_approach_speed=0.5,
+        conflict_box_lock_timeout=5.0,
+        conflict_box_heartbeat_interval=1.0,
+        max_linear_velocity=2.0,
+        max_angular_velocity=2.0,
+        movement_speed=2.0,
+        wheel_base=0.5,
+        wheel_radius=0.1,
+        picking_duration=2.0,
+        dropping_duration=2.0,
+        charging_threshold=0.2,
+        emergency_stop_distance=0.5,
+        stall_recovery_timeout=10.0
     )
 
 @pytest.fixture
-def robot_agent(warehouse_map, physics, robot_config, simulation_data_service):
+def config_provider(robot_config):
+    mock_provider = MagicMock()
+    mock_provider.get_robot_config.return_value = robot_config
+    mock_provider.get_value.return_value = MagicMock(value=(0.0, 0.0))
+    mock_provider.errors = []
+    mock_provider.get_database_config.return_value = MagicMock()
+    
+    # Create bid configuration
+    bid_config = MagicMock()
+    bid_config.distance_weight = 0.3
+    bid_config.battery_weight = 0.2
+    bid_config.workload_weight = 0.2
+    bid_config.task_type_compatibility_weight = 0.1
+    bid_config.robot_capabilities_weight = 0.1
+    bid_config.time_urgency_weight = 0.05
+    bid_config.conflict_box_availability_weight = 0.03
+    bid_config.shelf_accessibility_weight = 0.02
+    bid_config.enable_distance_factor = True
+    bid_config.enable_battery_factor = True
+    bid_config.enable_workload_factor = True
+    bid_config.enable_task_type_compatibility_factor = True
+    bid_config.enable_robot_capabilities_factor = True
+    bid_config.enable_time_urgency_factor = True
+    bid_config.enable_conflict_box_availability_factor = True
+    bid_config.enable_shelf_accessibility_factor = True
+    bid_config.battery_threshold = 0.2
+    bid_config.calculation_timeout = 1.0
+    bid_config.max_distance_normalization = 100.0
+    bid_config.enable_parallel_calculation = True
+    bid_config.enable_calculation_statistics = True
+    bid_config.enable_factor_breakdown = True
+    bid_config.max_parallel_workers = 4
+    
+    mock_provider.get_bid_config.return_value = bid_config
+    return mock_provider
+
+@pytest.fixture
+def robot_agent(physics, config_provider, simulation_data_service):
     with patch('robot.robot_agent_lane_based.SimulationDataServiceImpl', return_value=simulation_data_service):
         return RobotAgent(
-            warehouse_map=warehouse_map,
             physics=physics,
-            config=robot_config,
+            config_provider=config_provider,
+            robot_id="lane_robot_001",
             simulation_data_service=simulation_data_service
         )
 
 def test_lane_based_robot_initialization(robot_agent, robot_config):
-    assert robot_agent.config.robot_id == robot_config.robot_id
-    assert robot_agent.config.max_speed == robot_config.max_speed
+    assert robot_agent.robot_config.robot_id == robot_config.robot_id
+    assert robot_agent.robot_config.max_speed == robot_config.max_speed
     assert robot_agent.simulation_data_service is not None
     assert robot_agent.lane_follower is not None
     assert robot_agent.path_planner is not None
@@ -91,7 +153,7 @@ def test_lane_based_task_assignment_and_status(robot_agent):
     assert 'robot_id' in status
     assert 'lane_following_status' in status
     assert 'motion_status' in status
-    assert status['robot_id'] == robot_agent.config.robot_id
+    assert status['robot_id'] == robot_agent.robot_config.robot_id
 
 def test_lane_based_path_planning(robot_agent):
     start = (0.0, 0.0)

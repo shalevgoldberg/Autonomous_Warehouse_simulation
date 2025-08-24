@@ -1,0 +1,18 @@
+Mon Aug 18 21:01:18 2025
+WARNING: mixed solref format, replacing with default
+
+Mon Aug 18 21:01:18 2025
+WARNING: mixed solref format, replacing with default
+
+Mon Aug 18 21:01:18 2025
+WARNING: mixed solref format, replacing with default
+
+Mon Aug 18 21:01:18 2025
+WARNING: mixed solref format, replacing with default
+
+Mon Aug 18 21:01:18 2025
+WARNING: mixed solref format, replacing with default
+
+Mon Aug 18 21:01:23 2025
+ERROR: could not create window
+

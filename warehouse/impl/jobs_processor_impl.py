@@ -28,7 +28,7 @@ from interfaces.jobs_processor_interface import (
     ProcessingResult, ProcessingStats, JobsProcessorError
 )
 from interfaces.order_source_interface import IOrderSource
-from interfaces.simulation_data_service_interface import ISimulationDataService
+from interfaces.simulation_data_service_interface import ISimulationDataService, ItemShelfLocation
 from interfaces.jobs_queue_interface import IJobsQueue
 from interfaces.task_handler_interface import Task, TaskType
 from interfaces.configuration_interface import IConfigurationProvider
@@ -198,12 +198,12 @@ class JobsProcessorImpl(IJobsProcessor):
             )
             
             if not due_orders:
-                            return ProcessingResult(
-                success=True,
-                order_id="",
-                tasks_created=[],
-                processing_time=time.time() - start_time
-            )
+                return ProcessingResult(
+                    success=True,
+                    order_id="",
+                    tasks_created=[],
+                    processing_time=time.time() - start_time
+                )
             
             # Process each order
             total_tasks_created = 0
@@ -387,7 +387,7 @@ class JobsProcessorImpl(IJobsProcessor):
                 
                 if not shelf_id:
                     raise JobsProcessorError(
-                        f"No inventory found for item {order_item.item_id}"
+                        f"No shelf locations found for item {order_item.item_id}"
                     )
                 
                 # Get shelf info to check inventory
@@ -693,4 +693,20 @@ class JobsProcessorImpl(IJobsProcessor):
                 "last_error_time": self._stats.last_processing_time,
                 "message": "Processing errors occurred (detailed logging available in logs)"
             }
-        ] if self._stats.failed_orders > 0 else [] 
+        ] if self._stats.failed_orders > 0 else []
+    
+    def get_item_shelf_locations(self, item_id: str) -> List['ItemShelfLocation']:
+        """
+        Get all shelf locations where a specific item is stored.
+        
+        Args:
+            item_id: Item identifier
+            
+        Returns:
+            List[ItemShelfLocation]: List of shelf locations containing the item
+        """
+        try:
+            return self._simulation_data_service.get_item_shelf_locations(item_id)
+        except Exception as e:
+            self._logger.error(f"Failed to get shelf locations for item {item_id}: {e}")
+            return [] 

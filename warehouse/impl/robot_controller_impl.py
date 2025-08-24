@@ -241,7 +241,7 @@ class RobotController:
                     )
                     
                     robot_statuses.append({
-                        'robot_id': robot.config.robot_id,
+                        'robot_id': self._get_robot_id(robot),
                         'status': status,
                         'available_for_bidding': available_for_bidding,
                         'bid_calculation_stats': bid_stats
@@ -249,7 +249,7 @@ class RobotController:
                 except Exception as e:
                     print(f"[RobotController] Error getting status for robot: {e}")
                     robot_statuses.append({
-                        'robot_id': 'unknown',
+                        'robot_id': self._get_robot_id(robot),
                         'status': {'error': str(e)},
                         'available_for_bidding': False,
                         'bid_calculation_stats': {}
@@ -267,7 +267,7 @@ class RobotController:
         with self._lock:
             if robot not in self.robot_pool:
                 self.robot_pool.append(robot)
-                print(f"[RobotController] Added robot {robot.config.robot_id} to pool")
+                print(f"[RobotController] Added robot {self._get_robot_id(robot)} to pool")
     
     def remove_robot(self, robot: Any) -> None:
         """
@@ -279,7 +279,7 @@ class RobotController:
         with self._lock:
             if robot in self.robot_pool:
                 self.robot_pool.remove(robot)
-                print(f"[RobotController] Removed robot {robot.config.robot_id} from pool")
+                print(f"[RobotController] Removed robot {self._get_robot_id(robot)} from pool")
     
     def process_single_round(self) -> Optional[ParallelBiddingResult]:
         """
@@ -313,9 +313,12 @@ class RobotController:
                 round_data = self._process_parallel_bidding_round()
                 
                 if round_data:
+                    # Support both internal and external round structures
+                    bids_count = len(getattr(round_data, 'all_bids', []) or getattr(round_data, 'submitted_bids', []) or [])
+                    duration = getattr(round_data, 'round_duration', 0.0) or 0.0
                     print(f"[RobotController] Processed round {round_data.round_id} with "
                           f"{len(round_data.winning_assignments)} assignments from "
-                          f"{len(round_data.all_bids)} bids in {round_data.round_duration:.3f}s")
+                          f"{bids_count} bids in {duration:.3f}s")
                 
                 # Wait for next polling interval
                 time.sleep(self.polling_interval)
@@ -326,7 +329,7 @@ class RobotController:
         
         print("[RobotController] Control loop stopped")
     
-    def _process_parallel_bidding_round(self) -> Optional[ParallelBiddingResult]:
+    def _process_parallel_bidding_round(self) -> Optional[Any]:
         """
         Process a complete parallel bidding round.
         
@@ -341,8 +344,8 @@ class RobotController:
         Returns:
             Optional[ParallelBiddingResult]: Bidding round results, or None if no tasks/robots
         """
-        # Get available tasks from jobs queue
-        available_tasks = self._get_available_tasks()
+        # Get exactly ONE task from the jobs queue (queue semantics: FIFO, per-task bidding)
+        available_tasks = self._get_next_task_for_bidding()
         if not available_tasks:
             return None
         
@@ -360,23 +363,51 @@ class RobotController:
         
         # Process parallel bidding round
         try:
-            round_data = self._collect_parallel_bids(available_tasks, available_robots)
-            
-            # Select winning bids
-            winning_assignments = self._select_winning_bids(round_data.all_bids)
-            round_data.winning_assignments = winning_assignments
-            
-            # Assign tasks to robots
-            self._assign_tasks_to_robots(winning_assignments)
-            
-            # Update statistics
-            self._update_statistics(round_data)
-            
-            return round_data
-            
+            # If a bidding system is provided, delegate to it for SOLID compliance
+            if self.bidding_system is not None:
+                bidding_round = self.bidding_system.process_bidding_round(available_tasks, available_robots)
+                # Assign tasks per bidding results
+                self._assign_tasks_to_robots(bidding_round.winning_assignments)
+                # Update statistics
+                self._update_statistics(bidding_round)
+                return bidding_round
+            else:
+                # Fallback to internal parallel bidding
+                round_data = self._collect_parallel_bids(available_tasks, available_robots)
+                # Select winning bids
+                winning_assignments = self._select_winning_bids(round_data.all_bids)
+                round_data.winning_assignments = winning_assignments
+                # Assign tasks to robots and update the queue accordingly
+                self._assign_tasks_to_robots(winning_assignments)
+                # Update statistics
+                self._update_statistics(round_data)
+                return round_data
         except Exception as e:
             print(f"[RobotController] Error processing parallel bidding round: {e}")
             return None
+
+    def _get_next_task_for_bidding(self) -> List[Task]:
+        """
+        Retrieve the next task for bidding, preserving strict queue semantics.
+
+        Returns:
+            List[Task]: A single-element list containing the next task, or empty if none.
+        """
+        try:
+            next_task = None
+            # Prefer peek to avoid losing task if assignment fails
+            if hasattr(self.jobs_queue, 'peek_next_task'):
+                next_task = self.jobs_queue.peek_next_task()
+            else:
+                # Fallback: get all pending and take the first (if interface lacks peek)
+                pending = self.jobs_queue.get_pending_tasks()
+                next_task = pending[0] if pending else None
+            if next_task is not None:
+                return [next_task]
+            return []
+        except Exception as e:
+            print(f"[RobotController] Error peeking next task from queue: {e}")
+            return []
     
     def _collect_parallel_bids(self, tasks: List[Task], robots: List[Any]) -> ParallelBiddingResult:
         """
@@ -407,7 +438,7 @@ class RobotController:
         try:
             for future in as_completed(future_to_robot, timeout=self.round_timeout):
                 robot = future_to_robot[future]
-                robot_id = robot.config.robot_id
+                robot_id = self._get_robot_id(robot)
                 
                 try:
                     robot_bids, bid_time = future.result(timeout=self.bidding_timeout)
@@ -428,7 +459,7 @@ class RobotController:
             for future in future_to_robot:
                 if not future.done():
                     robot = future_to_robot[future]
-                    robot_id = robot.config.robot_id
+                    robot_id = self._get_robot_id(robot)
                     if robot_id not in robot_bid_times:
                         failed_robots += 1
                         robot_bid_times[robot_id] = -1.0
@@ -440,7 +471,7 @@ class RobotController:
         for future in future_to_robot:
             if not future.done():
                 robot = future_to_robot[future]
-                robot_id = robot.config.robot_id
+                robot_id = self._get_robot_id(robot)
                 if robot_id not in robot_bid_times:
                     failed_robots += 1
                     robot_bid_times[robot_id] = -1.0
@@ -490,7 +521,7 @@ class RobotController:
             
         except Exception as e:
             calculation_time = time.time() - start_time
-            print(f"[RobotController] Error getting bids from robot {robot.config.robot_id}: {e}")
+            print(f"[RobotController] Error getting bids from robot {self._get_robot_id(robot)}: {e}")
             return [], calculation_time
     
     def _select_winning_bids(self, bids: List[RobotBid]) -> List[TaskAssignment]:
@@ -552,23 +583,10 @@ class RobotController:
     
     def _get_available_tasks(self) -> List[Task]:
         """
-        Get available tasks from the jobs queue.
-        
-        Returns:
-            List[Task]: Available tasks for bidding
+        Deprecated in favor of _get_next_task_for_bidding().
+        Kept for backward compatibility; returns a single next task when possible.
         """
-        try:
-            # Get all pending tasks from the queue
-            tasks = self.jobs_queue.get_pending_tasks()
-            
-            if tasks:
-                print(f"[RobotController] Retrieved {len(tasks)} tasks from queue")
-            
-            return tasks
-            
-        except Exception as e:
-            print(f"[RobotController] Error getting tasks from queue: {e}")
-            return []
+        return self._get_next_task_for_bidding()
     
     def _get_available_robots(self) -> List[Any]:
         """
@@ -642,6 +660,12 @@ class RobotController:
                 if robot.assign_task(assignment.task):
                     successful_assignments += 1
                     print(f"[RobotController] Assigned task {assignment.task.task_id} to robot {assignment.robot_id}")
+                    # Remove task from the queue now that it has been successfully assigned
+                    try:
+                        if hasattr(self.jobs_queue, 'remove_task'):
+                            self.jobs_queue.remove_task(assignment.task.task_id)
+                    except Exception as e:
+                        print(f"[RobotController] Warning: failed to remove task {assignment.task.task_id} from queue: {e}")
                 else:
                     print(f"[RobotController] Failed to assign task {assignment.task.task_id} to robot {assignment.robot_id}")
                 
@@ -662,14 +686,14 @@ class RobotController:
         """
         for robot in self.robot_pool:
             try:
-                if robot.config.robot_id == robot_id:
+                if self._get_robot_id(robot) == robot_id:
                     return robot
             except Exception:
                 continue
         
         return None
     
-    def _update_statistics(self, round_data: ParallelBiddingResult) -> None:
+    def _update_statistics(self, round_data: Any) -> None:
         """
         Update controller statistics with bidding round data.
         
@@ -677,15 +701,45 @@ class RobotController:
             round_data: Bidding round data
         """
         self._total_rounds_processed += 1
-        self._total_tasks_assigned += len(round_data.winning_assignments)
-        self._total_bids_collected += len(round_data.all_bids)
+        # Count assignments regardless of structure
+        assignments = getattr(round_data, 'winning_assignments', []) or []
+        self._total_tasks_assigned += len(assignments)
+        # Count bids depending on structure
+        if hasattr(round_data, 'all_bids') and getattr(round_data, 'all_bids') is not None:
+            self._total_bids_collected += len(round_data.all_bids)
+        elif hasattr(round_data, 'submitted_bids') and getattr(round_data, 'submitted_bids') is not None:
+            self._total_bids_collected += len(round_data.submitted_bids)
         self._last_round_timestamp = datetime.now()
         
-        # Update average bid time
-        successful_times = [t for t in round_data.robot_bid_times.values() if t > 0]
-        if successful_times:
-            if self._average_bid_time == 0:
-                self._average_bid_time = sum(successful_times) / len(successful_times)
+        # Update average bid time when available (internal-only metric)
+        robot_bid_times = getattr(round_data, 'robot_bid_times', None)
+        if isinstance(robot_bid_times, dict):
+            successful_times = [t for t in robot_bid_times.values() if t > 0]
+            if successful_times:
+                if self._average_bid_time == 0:
+                    self._average_bid_time = sum(successful_times) / len(successful_times)
+                else:
+                    self._average_bid_time = 0.9 * self._average_bid_time + 0.1 * (sum(successful_times) / len(successful_times))
+
+    def _get_robot_id(self, robot: Any) -> str:
+        """
+        Get robot ID safely, handling both mock and real robot implementations.
+        
+        Args:
+            robot: Robot agent (mock or real)
+            
+        Returns:
+            str: Robot identifier
+        """
+        try:
+            # Try to get robot ID from config attribute (mock robots)
+            if hasattr(robot, 'config') and hasattr(robot.config, 'robot_id'):
+                return robot.config.robot_id
+            # Try to get robot ID directly (real robots)
+            elif hasattr(robot, 'robot_id'):
+                return robot.robot_id
+            # Fallback to string representation
             else:
-                # Exponential moving average
-                self._average_bid_time = 0.9 * self._average_bid_time + 0.1 * (sum(successful_times) / len(successful_times)) 
+                return str(robot)
+        except Exception:
+            return str(robot) 

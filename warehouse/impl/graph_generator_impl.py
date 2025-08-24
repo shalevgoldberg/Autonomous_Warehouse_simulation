@@ -67,12 +67,85 @@ class GraphGeneratorImpl(IGraphGenerator):
                 if row:
                     grid.append(row)
         
-        # Process each cell
-        conflict_box_counter = 0
+        # Preprocess: identify auto-detected junctions (l* cells with multiple inbound sides, excluding parking)
+        parking_adjacent_lanes: Set[Tuple[int, int]] = set()
+        parking_cells: Set[Tuple[int, int]] = set()
+        auto_junctions: Set[Tuple[int, int]] = set()
+        if grid:
+            # Collect parking cells (idle/charging)
+            for r_idx, row in enumerate(grid):
+                for c_idx, val in enumerate(row):
+                    if val in ['i', '4', 'c', '3']:
+                        parking_cells.add((r_idx, c_idx))
+
+            # Helper: in-bounds check per row
+            def in_bounds(rr: int, cc: int) -> bool:
+                return 0 <= rr < len(grid) and 0 <= cc < len(grid[rr])
+
+            # Helper: parse directions from a cell token (after prefix)
+            def parse_dir_set(token: str) -> Set[LaneDirection]:
+                return set(self._parse_directions(token))
+
+            # Auto-detect junctions: l* cells with >=2 inbound neighbors (ignoring parking neighbors)
+            for r_idx, row in enumerate(grid):
+                for c_idx, val in enumerate(row):
+                    if not val.startswith('l'):
+                        continue
+                    inbound = 0
+                    # From NORTH neighbor into this cell: neighbor must have SOUTH
+                    nr, nc = r_idx - 1, c_idx
+                    if in_bounds(nr, nc):
+                        nval = grid[nr][nc]
+                        if (nr, nc) not in parking_cells and (nval.startswith('l') or nval.startswith('j')):
+                            dirs = parse_dir_set(nval[1:])
+                            if LaneDirection.SOUTH in dirs:
+                                inbound += 1
+                    # From SOUTH neighbor
+                    nr, nc = r_idx + 1, c_idx
+                    if in_bounds(nr, nc):
+                        nval = grid[nr][nc]
+                        if (nr, nc) not in parking_cells and (nval.startswith('l') or nval.startswith('j')):
+                            dirs = parse_dir_set(nval[1:])
+                            if LaneDirection.NORTH in dirs:
+                                inbound += 1
+                    # From WEST neighbor
+                    nr, nc = r_idx, c_idx - 1
+                    if in_bounds(nr, nc):
+                        nval = grid[nr][nc]
+                        if (nr, nc) not in parking_cells and (nval.startswith('l') or nval.startswith('j')):
+                            dirs = parse_dir_set(nval[1:])
+                            if LaneDirection.EAST in dirs:
+                                inbound += 1
+                    # From EAST neighbor
+                    nr, nc = r_idx, c_idx + 1
+                    if in_bounds(nr, nc):
+                        nval = grid[nr][nc]
+                        if (nr, nc) not in parking_cells and (nval.startswith('l') or nval.startswith('j')):
+                            dirs = parse_dir_set(nval[1:])
+                            if LaneDirection.WEST in dirs:
+                                inbound += 1
+                    if inbound >= 2:
+                        auto_junctions.add((r_idx, c_idx))
+
+            # Mark lane cells that are 4-neighbor adjacent to any parking cell (parking-adjacent lanes)
+            for r_idx, row in enumerate(grid):
+                for c_idx, val in enumerate(row):
+                    if not val.startswith('l'):
+                        continue
+                    neighbors = [(r_idx-1, c_idx), (r_idx+1, c_idx), (r_idx, c_idx-1), (r_idx, c_idx+1)]
+                    for nr, nc in neighbors:
+                        if in_bounds(nr, nc) and (nr, nc) in parking_cells:
+                            parking_adjacent_lanes.add((r_idx, c_idx))
+                            break
+
+        # Process each cell - first collect nodes, then group conflict boxes by connectivity
+        # Temporary storage for junction (j*) cells to compute connected components
+        j_cells: Dict[Tuple[int, int], Dict[str, any]] = {}
+        box_node_counter = 0
         for row_idx, row in enumerate(grid):
             for col_idx, cell_value in enumerate(row):
-                # Treat idle ('i'/'4') and charging ('c'/'3') as graph nodes; skip 'w' (walls) and 'd' (drop-off) for now
-                if cell_value in ['w', 'd']:  # walls, dock
+                # Treat idle ('i'/'4') and charging ('c'/'3') as graph nodes; skip 'w' (walls)
+                if cell_value in ['w']:
                     continue
                 
                 # Calculate world position at the CENTER of the cell (matches WarehouseMap)
@@ -81,45 +154,74 @@ class GraphGeneratorImpl(IGraphGenerator):
                 pos = (x, y)
                 
                 # Parse cell value
-                if cell_value.startswith('j'):  # Conflict box
-                    directions = self._parse_directions(cell_value[1:])  # Remove 'j' prefix
-                    node_id = f"box_{conflict_box_counter}"
-                    
-                    # Create conflict box node
+                if cell_value.startswith('j'):  # Junction cell (part of a conflict box)
+                    directions = self._parse_directions(cell_value[1:])
+                    node_id = f"box_{box_node_counter}"
+                    box_node_counter += 1
+                    # Create node now; assign final conflict_box_id after grouping
                     node = GraphNode(
                         node_id=node_id,
                         position=Point(x, y),
                         directions=directions,
                         is_conflict_box=True,
-                        conflict_box_id=str(conflict_box_counter)
+                        conflict_box_id=None
                     )
                     nodes[node_id] = node
                     position_to_node[pos] = node_id
-                    
-                    # Create conflict box record
-                    conflict_box = ConflictBox(
-                        box_id=str(conflict_box_counter),
-                        position=Point(x, y),
-                        size=self.cell_size,
-                        participating_nodes={node_id},
-                        directions=directions
-                    )
-                    conflict_boxes[str(conflict_box_counter)] = conflict_box
-                    conflict_box_counter += 1
-                    
+                    # Track for grouping (use grid indices for adjacency)
+                    j_cells[(row_idx, col_idx)] = {
+                        'node_id': node_id,
+                        'row': row_idx,
+                        'col': col_idx,
+                        'position': Point(x, y),
+                        'directions': directions,
+                    }
                 elif cell_value.startswith('l'):  # Lane cell
                     directions = self._parse_directions(cell_value[1:])  # Remove 'l' prefix
-                    node_id = f"lane_{row_idx}_{col_idx}"
-                    
-                    # Create lane node
-                    node = GraphNode(
-                        node_id=node_id,
-                        position=Point(x, y),
-                        directions=directions,
-                        is_conflict_box=False
-                    )
-                    nodes[node_id] = node
-                    position_to_node[pos] = node_id
+                    is_parking_adjacent = (row_idx, col_idx) in parking_adjacent_lanes
+
+                    # If auto-detected as a junction and NOT parking-adjacent -> treat as junction cell
+                    if (row_idx, col_idx) in auto_junctions and not is_parking_adjacent:
+                        node_id = f"box_{box_node_counter}"
+                        box_node_counter += 1
+                        node = GraphNode(
+                            node_id=node_id,
+                            position=Point(x, y),
+                            directions=directions,
+                            is_conflict_box=True,
+                            conflict_box_id=None
+                        )
+                        nodes[node_id] = node
+                        position_to_node[pos] = node_id
+                        # Track for grouping as junction
+                        j_cells[(row_idx, col_idx)] = {
+                            'node_id': node_id,
+                            'row': row_idx,
+                            'col': col_idx,
+                            'position': Point(x, y),
+                            'directions': directions,
+                        }
+                    else:
+                        # Regular lane node (with optional single-cell conflict box if parking-adjacent)
+                        node_id = f"lane_{row_idx}_{col_idx}"
+                        node = GraphNode(
+                            node_id=node_id,
+                            position=Point(x, y),
+                            directions=directions,
+                            is_conflict_box=is_parking_adjacent,
+                            conflict_box_id=(f"cb_p_{row_idx}_{col_idx}" if is_parking_adjacent else None)
+                        )
+                        nodes[node_id] = node
+                        position_to_node[pos] = node_id
+                        if is_parking_adjacent:
+                            conflict_box_id = f"cb_p_{row_idx}_{col_idx}"
+                            conflict_boxes[conflict_box_id] = ConflictBox(
+                                box_id=conflict_box_id,
+                                position=Point(x, y),
+                                size=self.cell_size,
+                                participating_nodes={node_id},
+                                directions=directions
+                            )
                 elif cell_value in ['i', '4']:  # Idle zone as a graph node (non-through)
                     # Idle nodes have no encoded directions; we connect them to adjacent lanes/junctions later
                     node_id = f"idle_{row_idx}_{col_idx}"
@@ -141,6 +243,73 @@ class GraphGeneratorImpl(IGraphGenerator):
                     )
                     nodes[node_id] = node
                     position_to_node[pos] = node_id
+                elif cell_value == 'd':  # Drop-off zone as a graph node (restricted routing)
+                    node_id = f"dropoff_{row_idx}_{col_idx}"
+                    node = GraphNode(
+                        node_id=node_id,
+                        position=Point(x, y),
+                        directions=[],
+                        is_conflict_box=False
+                    )
+                    nodes[node_id] = node
+                    position_to_node[pos] = node_id
+
+        # Group adjacent j* cells (4-neighbor connectivity) into single conflict boxes
+        if j_cells:
+            visited: Set[Tuple[int, int]] = set()
+            group_index = 0
+            for key in list(j_cells.keys()):
+                if key in visited:
+                    continue
+                # BFS/DFS to collect a connected component
+                stack = [key]
+                component: List[Tuple[int, int]] = []
+                min_row = min_col = float('inf')
+                max_row = max_col = float('-inf')
+                dir_union: Set[LaneDirection] = set()
+                node_ids_in_component: Set[str] = set()
+                while stack:
+                    r, c = stack.pop()
+                    if (r, c) in visited or (r, c) not in j_cells:
+                        continue
+                    visited.add((r, c))
+                    component.append((r, c))
+                    data = j_cells[(r, c)]
+                    min_row = min(min_row, r)
+                    min_col = min(min_col, c)
+                    max_row = max(max_row, r)
+                    max_col = max(max_col, c)
+                    dir_union.update(data['directions'])
+                    node_ids_in_component.add(data['node_id'])
+                    # 4-neighbor adjacency: N, S, E, W
+                    neighbors = [(r-1, c), (r+1, c), (r, c-1), (r, c+1)]
+                    for nr, nc in neighbors:
+                        if (nr, nc) in j_cells and (nr, nc) not in visited:
+                            stack.append((nr, nc))
+                if not component:
+                    continue
+                # Compute group box parameters (AABB-based square)
+                width_m = (max_col - min_col + 1) * self.cell_size
+                height_m = (max_row - min_row + 1) * self.cell_size
+                size_m = max(width_m, height_m)
+                # Center of the AABB in world coordinates (cell centers are at +0.5)
+                center_x = (min_col + max_col + 1) * 0.5 * self.cell_size
+                center_y = (min_row + max_row + 1) * 0.5 * self.cell_size
+                group_id = f"cb_{group_index}"
+                group_index += 1
+                # Assign group id to all nodes in this component
+                for r, c in component:
+                    node_id = j_cells[(r, c)]['node_id']
+                    node_ref = nodes[node_id]
+                    node_ref.conflict_box_id = group_id
+                # Create one conflict box record for the whole component
+                conflict_boxes[group_id] = ConflictBox(
+                    box_id=group_id,
+                    position=Point(center_x, center_y),
+                    size=size_m,
+                    participating_nodes=node_ids_in_component,
+                    directions=list(dir_union)
+                )
     
     def _parse_directions(self, direction_str: str) -> List[LaneDirection]:
         """Parse direction string into LaneDirection set."""
@@ -194,6 +363,44 @@ class GraphGeneratorImpl(IGraphGenerator):
                             edges[neighbor_id] = []
                         if node_id not in edges[neighbor_id]:
                             edges[neighbor_id].append(node_id)
+
+        # Connect drop-off nodes to adjacent lane/junction nodes (unidirectional out of dropoff
+        # to neighbors that DO NOT have an exit direction pointing back to the dropoff). This
+        # preserves reachability to dropoffs via lane directions while preventing bidirectional
+        # pairs on the same adjacency.
+        for node_id, node in nodes.items():
+            if not node_id.startswith('dropoff_'):
+                continue
+            x, y = node.position.x, node.position.y
+            neighbor_positions = [
+                (x, y - self.cell_size),  # N
+                (x, y + self.cell_size),  # S
+                (x + self.cell_size, y),  # E
+                (x - self.cell_size, y),  # W
+            ]
+            for nx, ny in neighbor_positions:
+                neighbor_id = position_to_node.get((nx, ny))
+                if not neighbor_id:
+                    continue
+                if not (neighbor_id.startswith('lane_') or neighbor_id.startswith('box_')):
+                    continue
+                neighbor_node = nodes[neighbor_id]
+
+                # Determine the cardinal direction from neighbor -> dropoff
+                if abs(x - neighbor_node.position.x) > abs(y - neighbor_node.position.y):
+                    # Horizontal neighbor
+                    dir_to_drop = LaneDirection.EAST if x > neighbor_node.position.x else LaneDirection.WEST
+                else:
+                    # Vertical neighbor
+                    dir_to_drop = LaneDirection.SOUTH if y > neighbor_node.position.y else LaneDirection.NORTH
+
+                # If the neighbor has an exit direction back to dropoff, skip creating dropoff -> neighbor edge
+                if dir_to_drop in (neighbor_node.directions or []):
+                    continue
+
+                # Otherwise, allow one-way exit from dropoff to this neighbor
+                if neighbor_id not in edges[node_id]:
+                    edges[node_id].append(neighbor_id)
     
     def _get_exit_position(self, position: Point, direction: LaneDirection) -> Point:
         """Calculate the position where the exit direction leads to."""

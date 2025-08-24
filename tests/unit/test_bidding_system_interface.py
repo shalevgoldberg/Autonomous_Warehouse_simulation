@@ -109,7 +109,7 @@ class TestRobotBid:
     
     def test_robot_bid_creation(self):
         """Test basic RobotBid creation."""
-        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_1", "item_1")
+        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_3_3", "item_1")
         bid = RobotBid(robot_id="robot_1", task=task, bid_value=15.5)
         
         assert bid.robot_id == "robot_1"
@@ -121,7 +121,7 @@ class TestRobotBid:
     
     def test_robot_bid_with_metadata(self):
         """Test RobotBid creation with metadata."""
-        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_1", "item_1")
+        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_3_3", "item_1")
         metadata = {"distance": 10.5, "battery_cost": 5.2}
         bid = RobotBid(
             robot_id="robot_1", 
@@ -134,14 +134,14 @@ class TestRobotBid:
     
     def test_robot_bid_validation_negative_value(self):
         """Test that negative bid values are rejected."""
-        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_1", "item_1")
+        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_3_3", "item_1")
         
         with pytest.raises(ValueError, match="Bid value must be non-negative"):
             RobotBid(robot_id="robot_1", task=task, bid_value=-5.0)
     
     def test_robot_bid_validation_missing_robot_id(self):
         """Test that missing robot_id is rejected."""
-        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_1", "item_1")
+        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_3_3", "item_1")
         
         with pytest.raises(ValueError, match="Robot ID and task must be provided"):
             RobotBid(robot_id="", task=task, bid_value=10.0)
@@ -153,7 +153,7 @@ class TestRobotBid:
     
     def test_robot_bid_equality(self):
         """Test RobotBid equality comparison."""
-        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_1", "item_1")
+        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_3_3", "item_1")
         
         bid1 = RobotBid(robot_id="robot_1", task=task, bid_value=10.0)
         bid2 = RobotBid(robot_id="robot_1", task=task, bid_value=10.0)
@@ -168,7 +168,7 @@ class TestTaskAssignment:
     
     def test_task_assignment_creation(self):
         """Test basic TaskAssignment creation."""
-        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_1", "item_1")
+        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_3_3", "item_1")
         assignment = TaskAssignment(robot_id="robot_1", task=task)
         
         assert assignment.robot_id == "robot_1"
@@ -179,7 +179,7 @@ class TestTaskAssignment:
     
     def test_task_assignment_with_metadata(self):
         """Test TaskAssignment creation with metadata."""
-        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_1", "item_1")
+        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_3_3", "item_1")
         metadata = {"strategy": "distance_based", "round_id": "round_1"}
         assignment = TaskAssignment(
             robot_id="robot_1", 
@@ -193,7 +193,7 @@ class TestTaskAssignment:
     
     def test_task_assignment_validation_missing_robot_id(self):
         """Test that missing robot_id is rejected."""
-        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_1", "item_1")
+        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_3_3", "item_1")
         
         with pytest.raises(ValueError, match="Robot ID and task must be provided"):
             TaskAssignment(robot_id="", task=task)
@@ -209,7 +209,7 @@ class TestBiddingRound:
     
     def test_bidding_round_creation(self):
         """Test basic BiddingRound creation."""
-        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_1", "item_1")
+        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_3_3", "item_1")
         bid = RobotBid(robot_id="robot_1", task=task, bid_value=10.0)
         assignment = TaskAssignment(robot_id="robot_1", task=task)
         
@@ -230,7 +230,7 @@ class TestBiddingRound:
     
     def test_bidding_round_with_metadata(self):
         """Test BiddingRound creation with metadata."""
-        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_1", "item_1")
+        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_3_3", "item_1")
         bid = RobotBid(robot_id="robot_1", task=task, bid_value=10.0)
         assignment = TaskAssignment(robot_id="robot_1", task=task)
         metadata = {"strategy": "transparent", "robot_count": 1}
@@ -377,7 +377,7 @@ class TestMockRobotAgent:
     def test_mock_robot_agent_task_execution(self):
         """Test MockRobotAgent task execution."""
         robot = MockRobotAgent("robot_1")
-        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_1", "item_1")
+        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_3_3", "item_1")
         
         assert robot.is_available_for_bidding() is True
         assert robot.calculate_task_cost(task) == 10.0
@@ -387,7 +387,7 @@ class TestMockRobotAgent:
     def test_mock_robot_agent_busy_status(self):
         """Test MockRobotAgent when busy."""
         robot = MockRobotAgent("robot_1", is_idle=False)
-        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_1", "item_1")
+        task = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_3_3", "item_1")
         
         assert robot.is_available_for_bidding() is False
         assert robot.assign_task(task) is False

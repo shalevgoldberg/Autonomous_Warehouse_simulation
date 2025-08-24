@@ -242,3 +242,5 @@ class CircuitBreakerTimeoutError(CircuitBreakerError):
 class CircuitBreakerConfigurationError(CircuitBreakerError):
     """Raised when circuit breaker configuration is invalid."""
     pass
+
+

@@ -207,3 +207,5 @@ class IConflictBoxIntegrationService(ABC):
         4. No data loss occurs
         """
         pass
+
+

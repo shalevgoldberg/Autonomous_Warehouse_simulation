@@ -114,8 +114,8 @@ class TransparentBiddingSystem(IBiddingSystem):
                                     bid_value=bid_value,
                                     bid_metadata={
                                         "strategy": "transparent",
-                                        "robot_position": robot.get_status().get('position', (0, 0)),
-                                        "robot_battery": robot.get_status().get('battery', 0.0)
+                                        "robot_position": robot.get_status().get('position', (0.0, 0.0)),
+                                        "robot_battery": self._extract_battery_level(robot.get_status())
                                     }
                                 )
                                 bids.append(bid)
@@ -349,20 +349,38 @@ class TransparentBiddingSystem(IBiddingSystem):
             bool: True if robot can bid on the task
         """
         try:
+            # Prefer robot's own availability method if present
+            try:
+                if hasattr(robot, 'is_available_for_bidding'):
+                    if not robot.is_available_for_bidding():
+                        return False
+            except Exception:
+                # Fall back to status-based evaluation
+                pass
+
             # Get robot status
             status = robot.get_status()
-            
-            # Check if robot is idle
-            if status.get('task_active', True):  # Default to True for safety
+
+            # Determine if robot has an active task
+            task_active = status.get('task_active', None)
+            if task_active is None:
+                # Try task_status.has_active_task pattern
+                task_status = status.get('task_status', None)
+                try:
+                    task_active = bool(getattr(task_status, 'has_active_task', False))
+                except Exception:
+                    # Default to False if unknown
+                    task_active = False
+            if task_active:
                 return False
-            
-            # Check battery level (simple threshold)
-            battery_level = status.get('battery', 0.0)
-            if battery_level < 20.0:  # 20% battery threshold
+
+            # Check battery level (normalize to 0-100 if needed)
+            battery_level_pct = self._extract_battery_level(status)
+            if battery_level_pct < 20.0:
                 return False
-            
-            # Check operational status
-            operational_status = status.get('operational_status', 'error')
+
+            # Check operational status when present
+            operational_status = status.get('operational_status', 'idle')
             if operational_status in ['error', 'emergency_stop', 'stalled']:
                 return False
             
@@ -401,7 +419,7 @@ class TransparentBiddingSystem(IBiddingSystem):
             # Get robot status
             status = robot.get_status()
             robot_position = status.get('position', (0.0, 0.0))
-            battery_level = status.get('battery', 100.0)
+            battery_level = self._extract_battery_level(status)
             
             # Get robot ID for variation
             # Handle both legacy and lane-based robot agents
@@ -444,6 +462,24 @@ class TransparentBiddingSystem(IBiddingSystem):
             
         except Exception as e:
             raise BiddingSystemError(f"Failed to calculate bid value: {e}") from e
+
+    def _extract_battery_level(self, status: Dict[str, Any]) -> float:
+        """
+        Extract battery level as percent (0-100) from heterogeneous status schemas.
+
+        Supports keys:
+        - 'battery' (already percent)
+        - 'battery_level' (0.0-1.0 fractional) -> converted to percent
+        """
+        try:
+            if 'battery' in status and isinstance(status['battery'], (int, float)):
+                return float(status['battery'])
+            if 'battery_level' in status and isinstance(status['battery_level'], (int, float)):
+                val = float(status['battery_level'])
+                return val * 100.0 if val <= 1.0 else val
+        except Exception:
+            pass
+        return 0.0
     
     def _update_statistics(self, round_data: BiddingRound) -> None:
         """

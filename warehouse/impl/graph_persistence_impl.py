@@ -36,9 +36,22 @@ class GraphPersistenceImpl(IGraphPersistence):
         with self._sds._get_connection() as conn:  # relies on SDS transactional safety
             with conn.cursor() as cur:
                 if clear_existing:
-                    # Clear in FK-safe order
+                    # Clear existing graph-related data in FK-safe order
+                    # 1) Edges then nodes (nodes may be referenced by edges)
                     cur.execute("DELETE FROM navigation_graph_edges")
                     cur.execute("DELETE FROM navigation_graph_nodes")
+                    # 2) Dependent conflict box relations (locks/queues) before boxes
+                    try:
+                        cur.execute("DELETE FROM conflict_box_locks")
+                    except Exception:
+                        # Table may not exist in some schemas; ignore
+                        pass
+                    try:
+                        cur.execute("DELETE FROM conflict_box_queue")
+                    except Exception:
+                        # Table may not exist in some schemas; ignore
+                        pass
+                    # 3) Finally clear conflict boxes
                     cur.execute("DELETE FROM conflict_boxes")
 
                 # Insert conflict boxes first

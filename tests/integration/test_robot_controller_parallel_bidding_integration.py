@@ -248,6 +248,7 @@ class TestBiddingSystemIntegration:
         
         assert round_data is not None
         assert round_data.round_id is not None
+        # With the standalone bidding system, multiple tasks are allowed; keep original expectation
         assert len(round_data.available_tasks) == 3
         assert len(round_data.submitted_bids) > 0
         assert len(round_data.winning_assignments) > 0

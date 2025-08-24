@@ -57,8 +57,9 @@ class StateHolderImpl(IStateHolder):
         self._wheel_radius = 0.05  # meters
         self._wheel_base = 0.2     # meters between wheels
         
-        # Battery simulation
-        self._battery_drain_rate = 0.0001  # per simulation step
+        # Battery simulation (per physics step). Use a conservative default so
+        # robots remain available during demos unless explicitly discharged.
+        self._battery_drain_rate = 0.000001  # per simulation step (1e-6)
         
         # Initialize MuJoCo IDs if model is provided
         if self.model is not None:

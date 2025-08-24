@@ -198,9 +198,24 @@ class BidCalculatorImpl(IBidCalculator):
             if robot_state.battery_level < 0.2:  # 20% battery threshold
                 return False
             
-            # For now, we only check battery level
-            # Additional checks can be added when we have more state information
-            # such as operational status, current task status, etc.
+            # Check operational status via state_holder if available
+            task_status = None
+            try:
+                # Not part of interface, so guarded access
+                task_status = getattr(state_holder, 'task_handler', None)
+            except Exception:
+                task_status = None
+            
+            # If the integration exposes a task handler through state_holder,
+            # respect its idle status (defensive programming; primary check is in RobotAgent)
+            if task_status and hasattr(task_status, 'is_idle'):
+                try:
+                    if not task_status.is_idle():
+                        return False
+                except Exception:
+                    pass
+            
+            # For now, we only check battery and (if available) idle state
             
             return True
             

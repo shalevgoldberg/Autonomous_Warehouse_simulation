@@ -380,7 +380,13 @@ class RobotAgent:
     
     def assign_task(self, task: Task) -> bool:
         """Assign a task to the robot."""
-        return self.task_handler.start_task(task)
+        try:
+            accepted = self.task_handler.start_task(task)
+            print(f"[RobotAgent] assign_task robot={self.robot_id} task={task.task_id} accepted={accepted}")
+            return accepted
+        except Exception as e:
+            print(f"[RobotAgent] assign_task error robot={self.robot_id} task={getattr(task,'task_id',None)}: {e}")
+            return False
     
     # Bid calculation methods for parallel bidding
     
@@ -427,6 +433,11 @@ class RobotAgent:
             bool: True if robot can participate in bidding
         """
         try:
+            # Do not bid while executing a task
+            if hasattr(self, 'task_handler') and self.task_handler is not None:
+                if not self.task_handler.is_idle():
+                    return False
+            
             return self.bid_calculator.is_available_for_bidding(self.state_holder)
         except Exception as e:
             print(f"[RobotAgent] Error checking bidding availability: {e}")
@@ -463,6 +474,10 @@ class RobotAgent:
     def _control_loop(self) -> None:
         """Control loop for task management."""
         control_period = 1.0 / self.robot_config.control_frequency
+        try:
+            print(f"[RobotAgent] Control loop started for {self.robot_id}")
+        except Exception:
+            pass
         
         while self._running:
             try:

@@ -272,8 +272,10 @@ class PathPlannerGraphImpl(IPathPlanner):
                     dy = neighbor_node.position.y - current_node.position.y
                     edge_cost = (dx * dx + dy * dy) ** 0.5
                     
-                    # Forbid idle/charging nodes as intermediates: allow only if neighbor is goal
-                    if (neighbor_node_id.startswith('idle_') or neighbor_node_id.startswith('charge_')) \
+                    # Forbid idle/charging/dropoff nodes as intermediates: allow only if neighbor is goal
+                    if (neighbor_node_id.startswith('idle_') or 
+                        neighbor_node_id.startswith('charge_') or 
+                        neighbor_node_id.startswith('dropoff_')) \
                         and neighbor_node_id != goal_node_id and current_node_id != start_node_id:
                         continue
 
