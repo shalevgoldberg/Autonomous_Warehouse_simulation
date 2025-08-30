@@ -356,7 +356,21 @@ class DefaultConfigurationSource(IConfigurationSource):
             "task.max_bid_value": 1000.0,
             "task.distance_cost_factor": 10.0,
             "task.battery_cost_factor": 5.0,
-            
+
+            # Physics configuration
+            "physics.mode": "mujoco_authoritative",  # mujoco_authoritative (default) | kinematic_guard
+            "physics.gravity": 0.0,  # Zero gravity for deterministic behavior
+            "physics.time_step": 0.001,  # 1 kHz physics step
+            "physics.velocity_damping": 0.1,  # Optional velocity damping for mujoco_authoritative mode
+            # Robot physical parameters for differential drive kinematics
+            "robot.wheel_radius": 0.05,  # meters - radius of robot wheels
+            "robot.wheel_base": 0.3,     # meters - distance between left and right wheels
+
+            # Appearance configuration
+            "appearance.enabled": True,
+            "appearance.carry_color": [0.0, 1.0, 0.0, 1.0],  # Bright GREEN RGBA for carrying state
+            "appearance.normal_color": [0.8, 0.2, 0.2, 1.0],  # Default robot color (red)
+
             # Bid configuration
             "bid.max_parallel_workers": 4,
             "bid.distance_weight": 0.4,

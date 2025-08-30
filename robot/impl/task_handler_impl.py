@@ -34,6 +34,7 @@ from interfaces.simulation_data_service_interface import ISimulationDataService,
 from interfaces.lane_follower_interface import ILaneFollower, LaneFollowingStatus, LaneFollowingError
 from interfaces.navigation_types import Route
 from interfaces.configuration_interface import IConfigurationProvider
+from interfaces.appearance_service_interface import IAppearanceService
 
 
 class ReadWriteLock:
@@ -153,7 +154,7 @@ class TaskHandlerImpl(ITaskHandler):
     - Real-time position data from warehouse map
     """
     
-    def __init__(self, 
+    def __init__(self,
                  state_holder: IStateHolder,
                  path_planner: IPathPlanner,
                  lane_follower: ILaneFollower,
@@ -161,10 +162,11 @@ class TaskHandlerImpl(ITaskHandler):
                  coordinate_system: ICoordinateSystem,
                  simulation_data_service: ISimulationDataService,
                  robot_id: str = "robot_1",
-                 config_provider: Optional[IConfigurationProvider] = None):
+                 config_provider: Optional[IConfigurationProvider] = None,
+                 appearance_service: Optional[IAppearanceService] = None):
         """
         Initialize TaskHandler with required dependencies.
-        
+
         Args:
             state_holder: Robot state management
             path_planner: Route planning functionality
@@ -174,6 +176,7 @@ class TaskHandlerImpl(ITaskHandler):
             simulation_data_service: Warehouse data and shelf management
             robot_id: Unique identifier for this robot
             config_provider: Configuration provider for task parameters
+            appearance_service: Visual appearance service for carrying indication
         """
         self.state_holder = state_holder
         self.path_planner = path_planner
@@ -183,6 +186,7 @@ class TaskHandlerImpl(ITaskHandler):
         self.simulation_data_service = simulation_data_service
         self.robot_id = robot_id
         self.config_provider = config_provider
+        self.appearance_service = appearance_service
         
         # Setup logging with robot ID prefix
         self.logger = logging.getLogger(f"TaskHandler.{robot_id}")
@@ -193,6 +197,8 @@ class TaskHandlerImpl(ITaskHandler):
         # Task state
         self._current_task: Optional[Task] = None
         self._operational_status = OperationalStatus.IDLE
+        # Phase-specific initialization flags
+        self._picking_initialized: bool = False
         self._task_phase = TaskPhase.COMPLETED
         self._current_path: Optional[Path] = None
         self._task_start_time: Optional[float] = None
@@ -591,6 +597,10 @@ class TaskHandlerImpl(ITaskHandler):
                 
                 elif self._current_task.task_type == TaskType.IDLE_PARK:
                     target_position = self._request_and_wait_for_idle_bay()
+                    # Avoid degenerate plan to identical coordinate (nudge slightly)
+                    if tuple(target_position[:2]) == tuple(current_position[:2]):
+                        eps = 0.2
+                        target_position = (target_position[0] + eps, target_position[1])
                 
                 else:
                     raise TaskHandlingError(f"Unsupported task type: {self._current_task.task_type}")
@@ -619,6 +629,14 @@ class TaskHandlerImpl(ITaskHandler):
         # Check lane following status
         lane_status = self.lane_follower.get_lane_following_status()
         lane_result = self.lane_follower.get_lane_following_result()
+
+        # Debug logs for idle navigation
+        if expected_status == OperationalStatus.MOVING_TO_IDLE:
+            # print(f"[TaskHandler] DEBUG: IDLE navigation - lane_status={lane_status}, current_phase={self._task_phase}")
+            if lane_result:
+                # print(f"[TaskHandler] DEBUG: IDLE lane_result - success={lane_result.success}, error={lane_result.error_message}")
+                motion_status = self.motion_executor.get_motion_status()
+                # print(f"[TaskHandler] DEBUG: IDLE motion_status={motion_status}")
         
         if lane_status == LaneFollowingStatus.COMPLETED:
             # Navigation completed
@@ -662,12 +680,24 @@ class TaskHandlerImpl(ITaskHandler):
         if not self._current_task:
             return
             
-        # Initialize picking phase
-        if not self._phase_start_time:
-            self._phase_start_time = time.time()
+        # Initialize picking phase (use explicit flag instead of _phase_start_time)
+        if not getattr(self, "_picking_initialized", False):
+            if not self._phase_start_time:
+                self._phase_start_time = time.time()
+            self._picking_initialized = False
+            print("[TaskHandler] Picking phase entering init block")
             
             # Lock shelf for exclusive access
-            if self._current_task.shelf_id and not self._locked_shelf_id:
+            if self._current_task.shelf_id and not self._locked_shelf_id and not self._picking_initialized:
+                print(f"[TaskHandler] Picking init: shelf_id={self._current_task.shelf_id} locked={self._locked_shelf_id}")
+                # Phase 1: Physical attachment removed - using logical attachment only
+                # Keep appearance service for visual feedback (GREEN = carrying)
+                if self.appearance_service is not None:
+                    set_ok = self.appearance_service.set_carrying_appearance(self.robot_id, True)
+                    print(f"[TaskHandler] Logical carrying appearance set (GREEN) result: {set_ok}")
+                else:
+                    print("[TaskHandler] Carrying appearance service unavailable")
+                self._picking_initialized = True
                 try:
                     lock_success = self.simulation_data_service.lock_shelf(
                         self._current_task.shelf_id, 
@@ -677,7 +707,17 @@ class TaskHandlerImpl(ITaskHandler):
                     if lock_success:
                         self._locked_shelf_id = self._current_task.shelf_id
                         self.logger.info(f"Locked shelf {self._current_task.shelf_id} for picking")
-                        
+
+                        # Set carrying appearance (Phase 1: visual shelf carry)
+                        if self.appearance_service is not None:
+                            try:
+                                self.appearance_service.set_carrying_appearance(self.robot_id, True)
+                                self.logger.info(f"Set carrying appearance for robot {self.robot_id}")
+                            except Exception as e:
+                                self.logger.warning(f"Failed to set carrying appearance: {e}")
+
+                        # Phase 1: Physical attachment removed - shelf remains stationary
+
                         # Log shelf lock event
                         self._log_kpi_event("shelf_locked", {
                             "shelf_id": self._current_task.shelf_id,
@@ -692,8 +732,13 @@ class TaskHandlerImpl(ITaskHandler):
                     self._handle_task_error(f"Shelf locking failed: {e}")
                     return
         
+        # Ensure phase start time is set even if the guard above was skipped
+        if not self._phase_start_time:
+            self._phase_start_time = time.time()
         elapsed_time = time.time() - self._phase_start_time
-        
+
+        # Robot should remain stationary during picking duration
+
         if elapsed_time >= self._picking_duration:
             # Picking operation completed - update inventory
             if self._current_task.item_id and self._current_task.shelf_id:
@@ -733,8 +778,7 @@ class TaskHandlerImpl(ITaskHandler):
                     self._handle_task_error(f"Inventory update failed: {e}")
                     return
             
-            # Unlock shelf after picking
-            self._unlock_current_shelf()
+            # Keep shelf locked and attached for transport; will unlock at drop-off
             
             # Plan route to dropoff using lane-based navigation
             try:
@@ -769,10 +813,14 @@ class TaskHandlerImpl(ITaskHandler):
         # Simulate dropping operation
         if not self._phase_start_time:
             self._phase_start_time = time.time()
-        
+            # print(f"[TaskHandler] DEBUG: Dropping phase started, duration={self._dropping_duration}s")
+
         elapsed_time = time.time() - self._phase_start_time
+        # print(f"[TaskHandler] DEBUG: Dropping progress: {elapsed_time:.1f}s / {self._dropping_duration}s")
         
         if elapsed_time >= self._dropping_duration:
+            # Phase 1: Physical attachment tracking removed
+
             # Log drop operation event
             self._log_kpi_event("drop_operation", {
                 "order_id": self._current_task.order_id,
@@ -782,8 +830,28 @@ class TaskHandlerImpl(ITaskHandler):
                 "success": True
             })
             
+            # Reset carrying appearance (Phase 1: visual shelf carry)
+            if self.appearance_service is not None:
+                try:
+                    result = self.appearance_service.set_carrying_appearance(self.robot_id, False)
+                    if result:
+                        print(f"[TaskHandler] Robot {self.robot_id} VISUALLY CHANGED TO RED (normal - shelf released)")
+                        self.logger.info(f"Reset carrying appearance for robot {self.robot_id}")
+                    else:
+                        print(f"[TaskHandler] WARNING: Failed to reset carrying appearance for robot {self.robot_id}")
+                except Exception as e:
+                    print(f"[TaskHandler] ERROR: Exception resetting carrying appearance: {e}")
+                    self.logger.warning(f"Failed to reset carrying appearance: {e}")
+            else:
+                print(f"[TaskHandler] INFO: AppearanceService not available; skipping reset color for {self.robot_id}")
+
+            # Unlock shelf after dropping (also handles physical detachment and logging)
+            self._unlock_current_shelf()
+
+
             # Dropping completed, task finished
             self._complete_task()
+
     
     def _handle_charging_phase(self) -> None:
         """Internal: Handle battery charging phase."""
@@ -862,6 +930,28 @@ class TaskHandlerImpl(ITaskHandler):
         self._task_phase = new_phase
         self._operational_status = new_status
         self._phase_start_time = time.time()
+
+        # Stop motion when entering phases that require stopping
+        if new_phase in [TaskPhase.PICKING_ITEM, TaskPhase.DROPPING_ITEM]:
+            try:
+                self.motion_executor.stop_execution()
+                phase_name = "PICKING_ITEM" if new_phase == TaskPhase.PICKING_ITEM else "DROPPING_ITEM"
+                print(f"[TaskHandler] Motion stopped for {phase_name} phase")
+            except Exception as e:
+                print(f"[TaskHandler] Warning: Failed to stop motion for phase {new_phase}: {e}")
+
+        # Reset per-phase init flags on transition
+        if new_phase == TaskPhase.PICKING_ITEM:
+            try:
+                self._picking_initialized = False
+            except Exception:
+                pass
+        elif new_phase == TaskPhase.DROPPING_ITEM:
+            try:
+                self._dropping_initialized = False
+            except Exception:
+                pass
+
         print(f"[TaskHandler] Advanced to phase: {new_phase.value}")
     
     def _complete_task(self) -> None:
@@ -921,8 +1011,10 @@ class TaskHandlerImpl(ITaskHandler):
             print(f"[TaskHandler] Auto-creating IDLE_PARK task: {idle_task.task_id}")
             
             # Start the idle park task immediately
+            # print(f"[TaskHandler] DEBUG: About to start IDLE_PARK task {idle_task.task_id}")
             if self.start_task(idle_task):
                 print(f"[TaskHandler] Successfully started auto IDLE_PARK task")
+                # print(f"[TaskHandler] DEBUG: IDLE task started, phase={self._task_phase}, operational_status={self._operational_status}")
             else:
                 print(f"[TaskHandler] Failed to start auto IDLE_PARK task - robot busy")
                 
@@ -1184,6 +1276,8 @@ class TaskHandlerImpl(ITaskHandler):
         Non-blocking: if no bay is available, returns current position so the planner
         doesn't move, and the next planning cycle will retry.
         """
+        current_xy = self.state_holder.get_robot_state().position[:2]
+
         # Heartbeat held bay lock
         now = time.time()
         if self._locked_bay_id and now - self._bay_lock_last_heartbeat > self._bay_lock_heartbeat_interval:
@@ -1197,12 +1291,18 @@ class TaskHandlerImpl(ITaskHandler):
             except SimulationDataServiceError:
                 pass
 
-        # If already locked, return that bay's position
+        # If already locked, return that bay's position (and refresh heartbeat opportunistically)
         if self._locked_bay_id:
             try:
                 parts = self._locked_bay_id.split('_')
                 row = int(parts[1]); col = int(parts[2])
                 world = self.coordinate_system.cell_to_world(Cell(x=col, y=row))
+                # Opportunistic heartbeat to keep lock fresh
+                try:
+                    self.simulation_data_service.heartbeat_bay_lock(self._locked_bay_id, self.robot_id)
+                    self._bay_lock_last_heartbeat = time.time()
+                except Exception:
+                    pass
                 return (world.x, world.y) if hasattr(world, 'x') else world
             except Exception:
                 idle_bays = self.simulation_data_service.list_idle_bays()
@@ -1231,7 +1331,7 @@ class TaskHandlerImpl(ITaskHandler):
                         print(f"[BayLock][{self.robot_id}] Acquired idle bay {bay_id} at {pos}")
                     except Exception:
                         pass
-                    return pos
+            return pos
             try:
                 print(f"[BayLock][{self.robot_id}] No idle bay available; waiting")
             except Exception:
@@ -1243,6 +1343,7 @@ class TaskHandlerImpl(ITaskHandler):
     
     def _unlock_current_shelf(self) -> None:
         """Internal: Unlock currently locked shelf if any."""
+
         if self._locked_shelf_id:
             try:
                 unlock_success = self.simulation_data_service.unlock_shelf(
@@ -1252,17 +1353,18 @@ class TaskHandlerImpl(ITaskHandler):
                 
                 if unlock_success:
                     self.logger.info(f"Unlocked shelf {self._locked_shelf_id}")
-                    
+
                     # Log shelf unlock event
                     self._log_kpi_event("shelf_unlocked", {
                         "shelf_id": self._locked_shelf_id
                     })
                 else:
                     self.logger.warning(f"Failed to unlock shelf {self._locked_shelf_id} - not owned by this robot")
-                    
+
             except SimulationDataServiceError as e:
                 self.logger.error(f"Failed to unlock shelf {self._locked_shelf_id}: {e}")
             finally:
+                # Phase 1: Physical detachment removed - shelf was never physically attached
                 self._locked_shelf_id = None
     
     def _log_kpi_event(self, event_type: str, event_data: dict) -> None:

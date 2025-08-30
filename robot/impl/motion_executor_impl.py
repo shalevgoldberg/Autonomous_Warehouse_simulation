@@ -464,7 +464,7 @@ class MotionExecutorImpl(IMotionExecutor):
         if distance < self._position_tolerance and not self._snap_triggered:
             self._snap_triggered = True
             self._snap_start_time = time.time()
-            print(f"[MotionExecutor] 🎯 Snap triggered at distance {distance:.3f}m (single move)")
+            print(f"[MotionExecutor] Snap triggered at distance {distance:.3f}m (single move)")
         
         # Check if we reached the target
         if distance < self._position_tolerance:
@@ -552,7 +552,7 @@ class MotionExecutorImpl(IMotionExecutor):
                 self._snap_triggered = True
                 self._snap_start_time = time.time()
                 if self.VERBOSE_MOTION_LOGGING:
-                    print(f"[MotionExecutor] 🎯 Snap triggered at distance {distance:.3f}m")
+                    print(f"[MotionExecutor] Snap triggered at distance {distance:.3f}m")
             
             # Physics-aware snap: use high velocity for final approach
             if self._snap_triggered and self._snap_start_time is not None:
@@ -564,13 +564,13 @@ class MotionExecutorImpl(IMotionExecutor):
                     linear_vel = snap_velocity * (1.0 - snap_progress)  # Decelerate toward end
                     angular_vel = 2.0 * theta_error  # Keep steering toward target
                     if self.VERBOSE_MOTION_LOGGING:
-                        print(f"[MotionExecutor] 🚀 Snap motion: vel={linear_vel:.2f}m/s, progress={snap_progress:.1%}")
+                        print(f"[MotionExecutor] Snap motion: vel={linear_vel:.2f}m/s, progress={snap_progress:.1%}")
                 else:
                     # Snap complete - stop motion
                     linear_vel = 0.0
                     angular_vel = 0.0
                     if self.VERBOSE_MOTION_LOGGING:
-                        print(f"[MotionExecutor] ✅ Snap complete - target reached!")
+                        print(f"[MotionExecutor] Snap complete - target reached!")
             else:
                 # Normal proportional control with heading gate to prevent orbiting
                 if abs(theta_error) > self._heading_gate_threshold:

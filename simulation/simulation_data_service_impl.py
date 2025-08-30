@@ -187,6 +187,84 @@ class SimulationDataServiceImpl(ISimulationDataService):
                     """)
                     conn.commit()
                     logger.info("Database schema ensured for bay_locks")
+
+                    # Ensure conflict box lock helper functions exist.
+                    # Safe: CREATE OR REPLACE and no destructive operations.
+                    try:
+                        # try_acquire_conflict_box_lock
+                        cur.execute(
+                            """
+                            CREATE OR REPLACE FUNCTION try_acquire_conflict_box_lock(
+                                p_box_id VARCHAR(36),
+                                p_robot_id VARCHAR(36),
+                                p_priority INTEGER DEFAULT 0
+                            )
+                            RETURNS BOOLEAN AS $$
+                            DECLARE
+                                lock_acquired BOOLEAN := FALSE;
+                            BEGIN
+                                -- Attempt to insert lock row; if exists, do nothing
+                                INSERT INTO conflict_box_locks (box_id, locked_by_robot, lock_priority)
+                                VALUES (p_box_id, p_robot_id, COALESCE(p_priority, 0))
+                                ON CONFLICT (box_id) DO NOTHING;
+
+                                -- Check if this robot holds the lock
+                                SELECT (locked_by_robot = p_robot_id) INTO lock_acquired
+                                FROM conflict_box_locks
+                                WHERE box_id = p_box_id;
+
+                                RETURN COALESCE(lock_acquired, FALSE);
+                            END;
+                            $$ LANGUAGE plpgsql;
+                            """
+                        )
+
+                        # release_conflict_box_lock
+                        cur.execute(
+                            """
+                            CREATE OR REPLACE FUNCTION release_conflict_box_lock(
+                                p_box_id VARCHAR(36),
+                                p_robot_id VARCHAR(36)
+                            )
+                            RETURNS BOOLEAN AS $$
+                            DECLARE
+                                lock_released BOOLEAN := FALSE;
+                            BEGIN
+                                DELETE FROM conflict_box_locks
+                                WHERE box_id = p_box_id AND locked_by_robot = p_robot_id;
+                                GET DIAGNOSTICS lock_released = FOUND;
+                                RETURN lock_released;
+                            END;
+                            $$ LANGUAGE plpgsql;
+                            """
+                        )
+
+                        # heartbeat_conflict_box_lock
+                        cur.execute(
+                            """
+                            CREATE OR REPLACE FUNCTION heartbeat_conflict_box_lock(
+                                p_box_id VARCHAR(36),
+                                p_robot_id VARCHAR(36)
+                            )
+                            RETURNS BOOLEAN AS $$
+                            DECLARE
+                                heartbeat_updated BOOLEAN := FALSE;
+                            BEGIN
+                                UPDATE conflict_box_locks
+                                SET heartbeat_timestamp = CURRENT_TIMESTAMP
+                                WHERE box_id = p_box_id AND locked_by_robot = p_robot_id;
+                                GET DIAGNOSTICS heartbeat_updated = FOUND;
+                                RETURN heartbeat_updated;
+                            END;
+                            $$ LANGUAGE plpgsql;
+                            """
+                        )
+
+                        conn.commit()
+                        logger.info("Conflict box lock functions ensured")
+                    except Exception as e:
+                        conn.rollback()
+                        logger.warning(f"Could not ensure conflict box functions (continuing): {e}")
                     
         except psycopg2.Error as e:
             raise SimulationDataServiceError(f"Database initialization failed: {e}")
@@ -437,9 +515,14 @@ class SimulationDataServiceImpl(ISimulationDataService):
     # ---- Bay Lock Operations ----
     def try_acquire_bay_lock(self, bay_id: str, robot_id: str, timeout_seconds: int = 600) -> bool:
         try:
+            # Proactively clear expired locks to avoid stale occupancy
+            try:
+                self.cleanup_expired_bay_locks()
+            except Exception:
+                pass
             with self._get_connection() as conn:
                 with conn.cursor() as cur:
-                    # Attempt insert; if exists, fail
+                    # Attempt insert; if exists, check ownership and refresh heartbeat if owned by this robot
                     try:
                         cur.execute(
                             """
@@ -453,7 +536,22 @@ class SimulationDataServiceImpl(ISimulationDataService):
                         return True
                     except psycopg2.IntegrityError:
                         conn.rollback()
-                        return False
+                        # Lock exists; check if it's ours and refresh heartbeat
+                        try:
+                            cur.execute("SELECT robot_id FROM bay_locks WHERE bay_id = %s", (bay_id,))
+                            row = cur.fetchone()
+                            if row and row[0] == robot_id:
+                                cur.execute(
+                                    "UPDATE bay_locks SET heartbeat_at = CURRENT_TIMESTAMP, lock_timeout_seconds = %s WHERE bay_id = %s",
+                                    (int(timeout_seconds), bay_id)
+                                )
+                                conn.commit()
+                                logger.debug("Refreshed existing bay lock %s for %s", bay_id, robot_id)
+                                return True
+                            return False
+                        except Exception:
+                            conn.rollback()
+                            return False
         except Exception as e:
             logger.error("Failed to acquire bay lock %s by %s: %s", bay_id, robot_id, e)
             raise SimulationDataServiceError(f"Failed to acquire bay lock: {e}")

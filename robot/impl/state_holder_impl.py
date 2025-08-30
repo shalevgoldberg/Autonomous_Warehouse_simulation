@@ -101,17 +101,19 @@ class StateHolderImpl(IStateHolder):
         with self._state_lock:
             # Return copy of current state (immutable)
             return replace(self._current_state)
-    
+
     def get_position(self) -> Tuple[float, float, float]:
         """
         Get current robot position (x, y, theta).
         **Thread-safe**: Can be called from any thread.
-        
+
         Returns:
             Tuple[float, float, float]: Current position and orientation
         """
         with self._state_lock:
-            return self._current_state.position
+            pos = self._current_state.position
+            # print(f"[StateHolder] DIAGNOSTIC: get_position called for {self.robot_id}, returning: {pos}")
+            return pos
     
     def get_velocity(self) -> Tuple[float, float]:
         """
@@ -145,7 +147,7 @@ class StateHolderImpl(IStateHolder):
         position = self._read_position_from_mujoco()
         velocity = self._read_velocity_from_mujoco()
         battery_level = self._update_battery_level()
-        
+
         # Atomic update of complete state
         new_state = RobotPhysicsState(
             robot_id=self.robot_id,
@@ -154,18 +156,25 @@ class StateHolderImpl(IStateHolder):
             battery_level=battery_level,
             timestamp=time.time()
         )
-        
+
         with self._state_lock:
+            old_position = self._current_state.position
             self._current_state = new_state
+
+            # Only log significant position changes to avoid spam
+            if abs(position[0] - old_position[0]) > 0.1 or abs(position[1] - old_position[1]) > 0.1:
+                print(f"[StateHolder] Robot {self.robot_id} moved: {old_position} -> {position}")
     
     def _read_position_from_mujoco(self) -> Tuple[float, float, float]:
         """Read robot position from physics engine or MuJoCo."""
         # First try to get position from physics engine (preferred)
         if self.physics_engine is not None:
             try:
-                return self.physics_engine.get_robot_pose()
+                pose = self.physics_engine.get_robot_pose()
+                return pose
             except Exception as e:
-                print(f"[StateHolder] Error reading from physics engine: {e}")
+                print(f"[StateHolder] ERROR: Failed to read pose from physics engine for {self.robot_id}: {e}")
+                return self._current_state.position  # Return last known position
         
         # Fallback to MuJoCo if available
         if self.data is not None and self._robot_body_id is not None:

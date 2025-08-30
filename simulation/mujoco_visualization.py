@@ -34,6 +34,10 @@ class MujocoVisualization(IVisualization):
         self._data: Optional[mujoco.MjData] = None
         self._viewer = None
         self._viewer_launched = False  # Guard against multiple windows
+        # Cached ids and appearance state
+        self._robot_geom_id: Optional[int] = None
+        self._robot_dir_geom_id: Optional[int] = None
+        self._last_carrying_state: Optional[bool] = None
     
     def set_state_holder(self, state_holder: IStateHolder) -> None:
         """Switch the tracked robot without recreating the viewer."""
@@ -44,6 +48,13 @@ class MujocoVisualization(IVisualization):
             xml = self._build_world_xml()
             self._model = mujoco.MjModel.from_xml_string(xml)
             self._data = mujoco.MjData(self._model)
+            # Cache robot geom ids for fast color toggling
+            try:
+                self._robot_geom_id = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_GEOM, "robot_body")
+                self._robot_dir_geom_id = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_GEOM, "robot_direction")
+            except Exception:
+                self._robot_geom_id = None
+                self._robot_dir_geom_id = None
             # Set initial pose from current physics/state to avoid visual jump to MJCF default
             try:
                 x, y, theta = self.state_holder.get_position()
@@ -85,6 +96,23 @@ class MujocoVisualization(IVisualization):
             self._data.qpos[4] = 0.0
             self._data.qpos[5] = 0.0
             self._data.qpos[6] = math.sin(half)
+            # Apply appearance (bold color) based on carrying state without rebuilding model
+            try:
+                carrying = self._is_carrying_state()
+                if carrying != self._last_carrying_state:
+                    # Bright GREEN when carrying, RED when not
+                    carry_rgba = (0.0, 1.0, 0.0, 1.0)
+                    normal_rgba = (0.8, 0.2, 0.2, 1.0)
+                    rgba = carry_rgba if carrying else normal_rgba
+                    if self._robot_geom_id is not None and self._robot_geom_id >= 0:
+                        self._model.geom_rgba[self._robot_geom_id] = rgba
+                    if self._robot_dir_geom_id is not None and self._robot_dir_geom_id >= 0:
+                        self._model.geom_rgba[self._robot_dir_geom_id] = rgba
+                    self._last_carrying_state = carrying
+                    # Avoid duplicate color-change logs; engine/TaskHandler already log
+            except Exception:
+                # Never fail visualize due to appearance update
+                pass
             mujoco.mj_forward(self._model, self._data)
             # Ensure the passive viewer presents the updated frame
             if self._viewer is not None and hasattr(self._viewer, "sync"):
@@ -123,7 +151,7 @@ class MujocoVisualization(IVisualization):
   <worldbody>
     <geom name='floor' type='plane' size='{world_width/2} {world_height/2} 0.1' pos='{world_width/2} {world_height/2} 0' rgba='0.9 0.9 0.9 1'/>
     {cells_xml}
-    <body name='robot_base' pos='{self.warehouse_map.start_position[0]} {self.warehouse_map.start_position[1]} 0.1'>
+    <body name='robot_base' pos='{self.warehouse_map.grid_to_world(1, 1)[0]} {self.warehouse_map.grid_to_world(1, 1)[1]} 0.1'>
       <freejoint/>
       <geom name='robot_body' type='cylinder' size='0.1 0.05' rgba='0.8 0.2 0.2 1'/>
       <site name='robot_site' pos='0 0 0' size='0.01'/>
@@ -133,6 +161,39 @@ class MujocoVisualization(IVisualization):
   </worldbody>
 </mujoco>
 """
+
+    def _is_carrying_state(self) -> bool:
+        """Infer carrying state from the physics engine attached to the state holder.
+        Works for SimpleMuJoCoPhysics by checking attached shelf, and is safe when absent.
+        """
+        pe = getattr(self.state_holder, "physics_engine", None)
+        if pe is None:
+            return False
+        # SimpleMuJoCoPhysics path: attached shelf implies carrying
+        try:
+            attached = getattr(pe, "_attached_shelf_id", None)
+            if attached:
+                return True
+        except Exception:
+            pass
+        # SharedMuJoCoPhysics path: engine holds per-robot attached shelf ids
+        try:
+            engine = getattr(pe, "_engine", None)
+            if engine is not None:
+                rid = getattr(self.state_holder, "robot_id", None)
+                if rid is not None:
+                    # Prefer explicit appearance flag; fallback to attached shelf
+                    try:
+                        flag = engine._robot_carrying_appearance.get(rid, False)
+                        if flag:
+                            return True
+                    except Exception:
+                        pass
+                    shelf = engine._attached_shelf_id.get(rid)
+                    return shelf is not None
+        except Exception:
+            pass
+        return False
     
     def _generate_cells_xml(self) -> str:
         """Generate MuJoCo geoms for walls, shelves, charging, idle, drop-offs from grid."""
@@ -159,7 +220,7 @@ class MujocoVisualization(IVisualization):
                 elif cell_type == 4:  # Idle zone
                     xml_parts.append(self._geom_xml(f"idle_{x}_{y}", world_x, world_y, 0.25, 0.25, 0.05, "0.5 0.8 1.0 1"))
                 elif cell_type == 5:  # Drop-off station
-                    xml_parts.append(self._geom_xml(f"dropoff_{x}_{y}", world_x, world_y, 0.25, 0.25, 0.1, "1.0 0.4 0.4 1"))
+                    xml_parts.append(self._geom_xml(f"dropoff_{x}_{y}", world_x, world_y, 0.25, 0.25, 0.05, "1.0 0.4 0.4 1"))
         return "\n    ".join(xml_parts)
     
     def _geom_xml(self, name: str, x: float, y: float, sx: float, sy: float, sz: float, rgba: str) -> str:

@@ -35,6 +35,8 @@ from simulation.simulation_data_service_impl import SimulationDataServiceImpl
 
 from warehouse.map import WarehouseMap
 from simulation.mujoco_env import SimpleMuJoCoPhysics
+from simulation.shared_mujoco_engine import SharedMuJoCoPhysics
+from interfaces.appearance_service_interface import IAppearanceService
 from utils.geometry import mapdata_to_warehouse_map
 
 
@@ -109,6 +111,17 @@ class RobotAgent:
             frequency_hz=1000.0,
             db_sync_frequency_hz=10.0
         )
+
+        # Store reference to state_holder in physics for direct updates
+        print(f"[RobotAgent] DIAGNOSTIC: Setting _state_holder on physics object")
+        print(f"[RobotAgent] DIAGNOSTIC: physics type: {type(self.physics)}")
+        print(f"[RobotAgent] DIAGNOSTIC: physics has _state_holder before: {hasattr(self.physics, '_state_holder')}")
+
+        # Set the state holder reference for direct updates
+        self.physics._state_holder = self.state_holder
+
+        print(f"[RobotAgent] DIAGNOSTIC: physics has _state_holder after: {hasattr(self.physics, '_state_holder')}")
+        print(f"[RobotAgent] DIAGNOSTIC: _state_holder is not None: {self.physics._state_holder is not None}")
         
         # Control loop management
         self._running = False
@@ -221,6 +234,9 @@ class RobotAgent:
     
     def _create_task_handler(self) -> ITaskHandler:
         """Create task handler for task execution."""
+        # Get appearance service if available (for visual shelf carrying)
+        appearance_service = self._get_appearance_service()
+
         task_handler = TaskHandlerImpl(
             robot_id=self.robot_id,
             state_holder=self.state_holder,
@@ -229,14 +245,34 @@ class RobotAgent:
             motion_executor=self.motion_executor,
             coordinate_system=self.coordinate_system,
             simulation_data_service=self.simulation_data_service,
-            config_provider=self.config_provider
+            config_provider=self.config_provider,
+            appearance_service=appearance_service
         )
         
         # Update task handler configuration with robot-specific parameters
         task_handler.update_config_from_robot(self.robot_config)
         
         return task_handler
-    
+
+    def _get_appearance_service(self) -> Optional[IAppearanceService]:
+        """Get appearance service from physics engine if available."""
+        # Check if physics is SharedMuJoCoPhysics which has appearance service
+        if isinstance(self.physics, SharedMuJoCoPhysics):
+            try:
+                appearance_service = self.physics._engine.get_appearance_service()
+                if appearance_service is not None:
+                    print(f"[RobotAgent] Successfully obtained appearance service for robot {self.robot_id}")
+                    return appearance_service
+                else:
+                    print(f"[RobotAgent] WARNING: SharedMuJoCoEngine returned None appearance service for robot {self.robot_id}")
+                    return None
+            except Exception as e:
+                print(f"[RobotAgent] ERROR: Failed to get appearance service for robot {self.robot_id}: {e}")
+                return None
+        else:
+            print(f"[RobotAgent] WARNING: Robot {self.robot_id} is not using SharedMuJoCoPhysics - appearance service not available")
+            return None
+
     def _create_bid_calculator(self) -> IBidCalculator:
         """Create bid calculator for parallel bidding."""
         # Get bid configuration from provider
@@ -360,22 +396,32 @@ class RobotAgent:
         if not self._running:
             print(f"[RobotAgent] Not running")
             return
-        
+
         self._running = False
-        
+
+        # CRITICAL: Clean up TaskHandler resources BEFORE stopping dependent components
+        # This ensures proper release of bay locks and other resources held by active tasks
+        # The TaskHandler.emergency_stop() method is thread-safe and handles complete cleanup
+        try:
+            self.task_handler.emergency_stop()
+            print(f"[RobotAgent] TaskHandler cleanup completed for {self.robot_id}")
+        except Exception as e:
+            print(f"[RobotAgent] Warning: TaskHandler cleanup failed for {self.robot_id}: {e}")
+            # Continue with shutdown even if cleanup fails
+
         # Stop physics simulation
         self.physics_manager.stop()
         print(f"[RobotAgent] Stopped physics simulation for {self.robot_id}")
-        
+
         # Stop motion execution
         self.motion_executor.stop_execution()
-        
+
         # Wait for threads to finish
         if self._control_thread:
             self._control_thread.join(timeout=1.0)
         if self._motion_thread:
             self._motion_thread.join(timeout=1.0)
-        
+
         print(f"[RobotAgent] Stopped control and motion threads")
     
     def assign_task(self, task: Task) -> bool:

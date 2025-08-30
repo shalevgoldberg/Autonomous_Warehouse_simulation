@@ -44,6 +44,9 @@ class MultiRobotMujocoVisualization(IVisualization):
         self._robot_qpos_addr: Dict[str, int] = {}
         # Map robot_id -> z offset to avoid visual overlap/z-fighting
         self._robot_z_offset: Dict[str, float] = {}
+        # Appearance caches
+        self._robot_geom_ids: Dict[str, int] = {}
+        self._last_carrying_state: Dict[str, bool] = {}
 
     def initialize(self, config: Optional[Dict[str, Any]] = None) -> None:
         try:
@@ -74,6 +77,13 @@ class MultiRobotMujocoVisualization(IVisualization):
                 self._robot_qpos_addr[robot_id] = qpos_addr
                 # Assign a small per-robot z offset to ensure visibility separation
                 self._robot_z_offset[robot_id] = 0.10 + 0.01 * (idx % 5)
+                # Cache robot body geom id for appearance updates
+                try:
+                    gid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_GEOM, f"robot_body_{robot_id}")
+                    if int(gid) >= 0:
+                        self._robot_geom_ids[robot_id] = int(gid)
+                except Exception:
+                    pass
 
             # Initialize each robot pose from its state holder
             for robot_id, holder in self._state_holders.items():
@@ -125,6 +135,21 @@ class MultiRobotMujocoVisualization(IVisualization):
                 try:
                     x, y, theta = holder.get_position()
                     self._write_robot_qpos(robot_id, x, y, theta)
+                    # Appearance: bright GREEN when carrying, otherwise base color (no change)
+                    try:
+                        carrying = self._is_carrying_state(holder)
+                        last = self._last_carrying_state.get(robot_id)
+                        if last is None or last != carrying:
+                            gid = self._robot_geom_ids.get(robot_id)
+                            if gid is not None:
+                                carry_rgba = (0.0, 1.0, 0.0, 1.0)
+                                if carrying:
+                                    self._model.geom_rgba[gid] = carry_rgba
+                                # else: leave original per-robot color
+                            self._last_carrying_state[robot_id] = carrying
+                            # Avoid duplicate color-change logs; engine/TaskHandler already log
+                    except Exception:
+                        pass
                 except Exception:
                     # Keep rendering others even if one fails
                     pass
@@ -169,6 +194,44 @@ class MultiRobotMujocoVisualization(IVisualization):
         self._data.qpos[addr + 4] = 0.0
         self._data.qpos[addr + 5] = 0.0
         self._data.qpos[addr + 6] = math.sin(half)
+
+    def _is_carrying_state(self, state_holder: IStateHolder) -> bool:
+        """Infer carrying state by checking appearance service flag, with fallback to attached shelf."""
+        pe = getattr(state_holder, "physics_engine", None)
+        if pe is None:
+            return False
+
+        # SharedMuJoCoPhysics path: check appearance service flag first
+        try:
+            engine = getattr(pe, "_engine", None)
+            if engine is not None:
+                rid = getattr(state_holder, "robot_id", None)
+                if rid is not None:
+                    # Prefer explicit appearance flag; fallback to attached shelf (Phase 1 compatibility)
+                    try:
+                        flag = engine._robot_carrying_appearance.get(rid, False)
+                        if flag:
+                            return True
+                    except Exception:
+                        pass
+                    # Fallback to attached shelf for backward compatibility
+                    try:
+                        shelf = engine._attached_shelf_id.get(rid)
+                        return shelf is not None
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # SimpleMuJoCoPhysics path: attached shelf implies carrying
+        try:
+            attached = getattr(pe, "_attached_shelf_id", None)
+            if attached:
+                return True
+        except Exception:
+            pass
+
+        return False
 
     def _build_world_xml(self) -> str:
         """Build MuJoCo XML with floor, warehouse cells, and freejoint robot bodies."""

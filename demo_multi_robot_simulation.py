@@ -30,7 +30,19 @@ from dataclasses import dataclass
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from warehouse.map import WarehouseMap
-from simulation.mujoco_env import SimpleMuJoCoPhysics
+#from simulation.mujoco_env import SimpleMuJoCoPhysics
+from simulation.shared_mujoco_engine import SharedMuJoCoEngine, SharedMuJoCoPhysics
+import builtins as _bi
+
+# Safe print wrapper to avoid UnicodeEncodeError on Windows consoles
+def _safe_print(*args, **kwargs):
+    try:
+        _bi.print(*args, **kwargs)
+    except UnicodeEncodeError:
+        safe_args = tuple(str(a).encode('ascii', 'ignore').decode() for a in args)
+        _bi.print(*safe_args, **kwargs)
+
+print = _safe_print  # type: ignore
 from robot.robot_agent_lane_based import RobotAgent
 from interfaces.configuration_interface import RobotConfig
 from interfaces.task_handler_interface import Task, TaskType
@@ -81,12 +93,14 @@ class MultiRobotSimulationManager:
         # Load warehouse
         self.warehouse_map = WarehouseMap(csv_file=warehouse_csv)
         print(f"   ✅ Warehouse loaded: {self.warehouse_map.width}x{self.warehouse_map.height}")
-        
-        # Physics engines are created per robot instance (see _create_robot_agents)
-        
+
         # Create real configuration provider
         self.config_provider = ConfigurationProvider()
         print("   ✅ Configuration provider initialized")
+
+        # Shared MuJoCo engine for all robots
+        self.shared_engine = SharedMuJoCoEngine(self.warehouse_map, physics_dt=0.001, enable_time_gating=True,
+                                               config_provider=self.config_provider)
         
         # Create real simulation data service (increase pool for multi-robot)
         self.simulation_data_service = SimulationDataServiceImpl(self.warehouse_map, pool_size=max(10, 3 * robot_count))
@@ -104,14 +118,24 @@ class MultiRobotSimulationManager:
         
         # Populate inventory for demo
         self._populate_demo_inventory()
-        
+
+        # Register all robots with shared engine BEFORE initialization
+        self._register_robots_with_engine()
+
+        # Initialize shared engine (creates appearance service)
+        try:
+            self.shared_engine.initialize()
+            print("   ✅ Shared engine initialized with appearance service")
+        except Exception as e:
+            print(f"   ⚠️  Shared engine initialization failed: {e}")
+
         # Create robot controller components
         self.jobs_queue = JobsQueueImpl()
         self.bidding_system = TransparentBiddingSystem()
-        
-        # Create robots
+
+        # Create robots AFTER engine initialization
         self._create_robot_agents()
-        
+
         # Create robot controller
         self.robot_controller = RobotController(
             jobs_queue=self.jobs_queue,
@@ -132,14 +156,12 @@ class MultiRobotSimulationManager:
         
         print(f"   ✅ Found {len(self.available_shelves)} shelves for tasks")
         print("🎯 Simulation ready!")
-    
-    def _create_robot_agents(self) -> None:
-        """Create multiple robot agents with different starting positions."""
-        print("   🤖 Creating robot agents...")
-        
+
+    def _register_robots_with_engine(self) -> None:
+        """Register all robots with shared engine before initialization."""
+        print("   🤖 Registering robots with shared engine...")
+
         # Define starting positions for robots (avoid conflicts)
-        # Using only walkable cells: 'l' (lanes), 'c' (charging), 'i' (idle), 'd' (drop-off)
-        # CSV is 0-indexed, so position (x,y) refers to row y, column x
         start_positions = [
             (1, 1),   # Robot 1: Left lane (row 1, col 1 = 'l')
             (1, 2),   # Robot 2: Left lane (row 2, col 1 = 'l')
@@ -147,11 +169,34 @@ class MultiRobotSimulationManager:
             (1, 4),   # Robot 4: Left lane (row 4, col 1 = 'l')
             (1, 5),   # Robot 5: Left lane (row 5, col 1 = 'l')
         ]
-        
+
         for i in range(self.robot_count):
             robot_id = f"warehouse_robot_{i+1}"
             start_x, start_y = start_positions[i]
-            
+
+            # Register robot with shared engine
+            world_pos = self.warehouse_map.grid_to_world(start_x, start_y)
+            self.shared_engine.register_robot(robot_id, (world_pos[0], world_pos[1], 0.0))
+
+        print(f"   ✅ Registered {self.robot_count} robots with shared engine")
+
+    def _create_robot_agents(self) -> None:
+        """Create multiple robot agents with different starting positions."""
+        print("   🤖 Creating robot agents...")
+
+        # Define starting positions for robots (avoid conflicts)
+        start_positions = [
+            (1, 1),   # Robot 1: Left lane (row 1, col 1 = 'l')
+            (1, 2),   # Robot 2: Left lane (row 2, col 1 = 'l')
+            (1, 3),   # Robot 3: Left lane (row 3, col 1 = 'l')
+            (1, 4),   # Robot 4: Left lane (row 4, col 1 = 'l')
+            (1, 5),   # Robot 5: Left lane (row 5, col 1 = 'l')
+        ]
+
+        for i in range(self.robot_count):
+            robot_id = f"warehouse_robot_{i+1}"
+            start_x, start_y = start_positions[i]
+
             # Create robot configuration
             robot_config = RobotConfig(
                 robot_id=robot_id,
@@ -176,9 +221,9 @@ class MultiRobotSimulationManager:
                 emergency_stop_distance=0.5,
                 stall_recovery_timeout=10.0
             )
-            
-            # Create dedicated physics engine per robot
-            robot_physics = SimpleMuJoCoPhysics(self.warehouse_map)
+
+            # Create robot physics (shared engine already initialized)
+            robot_physics = SharedMuJoCoPhysics(self.shared_engine, robot_id=robot_id)
             # Diagnostics: tag physics with robot_id and enable for robot_2 only
             try:
                 robot_physics.robot_id = robot_id
@@ -227,7 +272,7 @@ class MultiRobotSimulationManager:
             
             self.robots.append(robot_instance)
             print(f"      ✅ Created {robot_id} at position ({start_x}, {start_y})")
-        
+
         print(f"   ✅ Created {len(self.robots)} robot agents")
     
     def _populate_demo_inventory(self) -> None:
@@ -299,12 +344,22 @@ class MultiRobotSimulationManager:
                 print(f"   ❌ Failed to start {robot_instance.robot_id}: {e}")
                 raise
         
-        # Position robots at their starting positions (per-robot physics)
+        # Position robots are already pre-registered in shared engine; ensure reset
         for robot_instance in self.robots:
             start_x, start_y = robot_instance.start_position
             world_pos = self.warehouse_map.grid_to_world(start_x, start_y)
-            robot_instance.robot.physics.reset_robot_position(world_pos[0], world_pos[1], 0.0)
-            print(f"   ✅ Positioned {robot_instance.robot_id} at ({start_x}, {start_y})")
+            try:
+                robot_instance.robot.physics.reset_robot_position(world_pos[0], world_pos[1], 0.0)
+                print(f"   ✅ Positioned {robot_instance.robot_id} at ({start_x}, {start_y})")
+
+                # Force StateHolder update after positioning
+                try:
+                    robot_instance.robot.state_holder.update_from_simulation()
+                    print(f"   ✅ StateHolder updated for {robot_instance.robot_id}")
+                except Exception as e:
+                    print(f"   ⚠️  Failed to update StateHolder for {robot_instance.robot_id}: {e}")
+            except Exception as e:
+                print(f"   ⚠️  Failed to position {robot_instance.robot_id}: {e}")
         
         # Start visualization (reads from state holders updated by robot physics threads)
         try:
@@ -645,11 +700,11 @@ def main():
     # Optional CLI arguments (e.g., --robots 5)
     try:
         parser = argparse.ArgumentParser(add_help=False)
-        parser.add_argument("--robots", type=int, default=2)
+        parser.add_argument("--robots", type=int, default=3)
         args, _ = parser.parse_known_args()
         robot_count = args.robots
     except Exception:
-        robot_count = 2
+        robot_count = 3
 
     try:
         # Run the demo with requested robot count

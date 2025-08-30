@@ -58,13 +58,26 @@ class TaskSimulationManager:
         self.warehouse_map = WarehouseMap(csv_file=warehouse_csv)
         print(f"   ✅ Warehouse loaded: {self.warehouse_map.width}x{self.warehouse_map.height}")
         
-        # Initialize physics
-        self.physics = SimpleMuJoCoPhysics(self.warehouse_map)
-        print("   ✅ Physics ready: {self.physics.is_simulation_ready()}")
-        
-        # Create real configuration provider
+        # Create real configuration provider (needed before shared engine)
         self.config_provider = ConfigurationProvider()
         print("   ✅ Configuration provider initialized")
+
+        # Initialize physics (prefer shared engine so appearance/contacts flow through)
+        try:
+            from simulation.shared_mujoco_engine import SharedMuJoCoEngine, SharedMuJoCoPhysics
+            shared_engine = SharedMuJoCoEngine(self.warehouse_map, physics_dt=0.001, enable_time_gating=True,
+                                              config_provider=self.config_provider)
+            # Use same starting position as multi-robot demo for consistency
+            world_pos = self.warehouse_map.grid_to_world(1, 1)
+            shared_engine.register_robot("robot_1", (world_pos[0], world_pos[1], 0.0))
+            shared_engine.initialize()
+            self.physics = SharedMuJoCoPhysics(shared_engine, robot_id="robot_1")
+        except Exception as e:
+            print(f"   ⚠️  SharedMuJoCoEngine not available ({e}); falling back to SimpleMuJoCoPhysics")
+            self.physics = SimpleMuJoCoPhysics(self.warehouse_map)
+        print(f"   ✅ Physics ready: {self.physics.is_simulation_ready()}")
+        
+        # Configuration provider already initialized above
         
         # Create real simulation data service
         self.simulation_data_service = SimulationDataServiceImpl(self.warehouse_map)
@@ -86,18 +99,18 @@ class TaskSimulationManager:
         # Create robot agent with real services
         self.robot_config = RobotConfig(
             robot_id="warehouse_robot_1",
-            max_speed=2.0,
+            max_speed=0.5,  # Reduced for stability with lower actuator gains
             control_frequency=10.0,
             motion_frequency=100.0,
             cell_size=1.0,
             lane_tolerance=0.2,
-            corner_speed=1.0,
-            bay_approach_speed=0.5,
+            corner_speed=0.3,  # Reduced for stability
+            bay_approach_speed=0.2,  # Reduced for stability
             conflict_box_lock_timeout=5.0,
             conflict_box_heartbeat_interval=1.0,
-            max_linear_velocity=2.0,
-            max_angular_velocity=2.0,
-            movement_speed=2.0,
+            max_linear_velocity=0.5,  # Reduced for stability with lower actuator gains
+            max_angular_velocity=0.5,  # Reduced for stability
+            movement_speed=0.5,  # Reduced for stability with lower actuator gains
             wheel_base=0.5,
             wheel_radius=0.1,
             picking_duration=2.0,
@@ -361,8 +374,8 @@ def demo_automated_tasks():
         print("\n⏳ Running automated PICK_AND_DELIVER task sequence...")
         print("   Robot will automatically execute: SHELF → DROP-OFF → IDLE ZONE")
         
-        # Run for more tasks to observe longer behavior
-        max_tasks = 6
+        # Run fewer tasks to keep the demo short
+        max_tasks = 2
         task_cycle = 1
         while task_cycle <= max_tasks:
             print(f"\n--- Task Cycle {task_cycle}/{max_tasks} ---")
@@ -451,6 +464,10 @@ def main():
     print("   📦 Drop Item")
     print("   🏠 Navigate to Idle Zone")
     print()
+    
+    # Enable motion executor verbose logging for debugging
+    from robot.impl.motion_executor_impl import MotionExecutorImpl
+    MotionExecutorImpl.set_verbose_logging(False)
     
     try:
         demo_automated_tasks()

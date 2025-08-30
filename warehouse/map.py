@@ -359,6 +359,24 @@ class WarehouseMap:
                     world_y = (y + 0.5) * self.grid_size
                     shelf_positions.append((world_x, world_y))
         return shelf_positions
+
+    def get_shelf_position(self, shelf_id: str) -> Optional[Tuple[float, float]]:
+        """
+        Get the world position of a specific shelf by its ID.
+
+        Args:
+            shelf_id: Shelf identifier in format "shelf_x_y"
+
+        Returns:
+            Optional[Tuple[float, float]]: Shelf world position or None if not found
+        """
+        if shelf_id in self.shelves:
+            grid_x, grid_y = self.shelves[shelf_id]
+            # Convert grid coordinates to world coordinates (center of cell)
+            world_x = (grid_x + 0.5) * self.grid_size
+            world_y = (grid_y + 0.5) * self.grid_size
+            return (world_x, world_y)
+        return None
     
     def is_walkable(self, x: float, y: float) -> bool:
         """Check if a position is walkable (not wall or shelf)."""

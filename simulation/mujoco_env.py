@@ -46,6 +46,7 @@ class SimpleMuJoCoPhysics:
             warehouse_map: Warehouse layout for collision detection
         """
         self.warehouse_map = warehouse_map
+        self.robot_id = robot_id
         
         # Physics parameters
         self._physics_dt = 0.001  # 1kHz physics timestep
@@ -65,10 +66,29 @@ class SimpleMuJoCoPhysics:
         self._left_wheel_vel = 0.0
         self._right_wheel_vel = 0.0
         
-        # MuJoCo model and data
+        # MuJoCo model and data (private scene used for collision-guard and shelf attach)
         self.model = None
         self.data = None
+        # Cached ids and maps for fast contact checks and pose writes
+        self._robot_geom_ids: set[int] = set()
+        self._shelf_geom_ids_by_id: Dict[str, set[int]] = {}
+        self._body_name_to_id: Dict[str, int] = {}
+        self._geom_name_to_id: Dict[str, int] = {}
+        self._robot_free_qpos_adr: Optional[int] = None
+        self._shelf_free_qpos_adr: Dict[str, int] = {}
+        # Attached shelf state
+        self._attached_shelf_id: Optional[str] = None
+        self._attached_shelf_offset: Tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._initialize_mujoco()
+
+        # Inter-robot collision guard via shared registry
+        self._collision_registry = collision_registry
+        self._min_inter_robot_distance = min_inter_robot_distance
+        if self._collision_registry is not None:
+            try:
+                self._collision_registry.register_robot(self.robot_id, self._current_state.position)
+            except Exception:
+                pass
 
         # Diagnostics: rate-limited logging (robot_2-focused) for wheel commands and pose
         self._diagnostics_enabled = False
@@ -77,27 +97,25 @@ class SimpleMuJoCoPhysics:
     
     def _initialize_mujoco(self) -> None:
         """
-        Initialize MuJoCo model for visualization.
-        **DISABLED**: MuJoCo visualization causes physics conflicts and stack overflow.
-        Our kinematic physics works perfectly without it.
+        Initialize private MuJoCo scene for collision-guard and shelf attach.
+        Physics remains kinematic; we only use MuJoCo for kinematics consistency,
+        contact queries, and keeping an attached shelf aligned to the robot.
         """
-        # DISABLED: MuJoCo visualization causes stack overflow and physics instability
-        # The kinematic physics simulation works perfectly without MuJoCo dynamics
-        self.model = None
-        self.data = None
-        print("[MuJoCo] Visualization disabled to prevent physics conflicts")
-        return
-        
-        # OLD CODE (commented out to prevent conflicts):
-        # try:
-        #     xml_content = self._generate_warehouse_xml()
-        #     self.model = mujoco.MjModel.from_xml_string(xml_content)
-        #     self.data = mujoco.MjData(self.model)
-        #     print(f"[MuJoCo] Initialized with {self.model.nq} DOF, {self.model.nbody} bodies")
-        # except Exception as e:
-        #     print(f"[MuJoCo] Failed to initialize: {e}")
-        #     self.model = None
-        #     self.data = None
+        try:
+            xml_content = self._generate_warehouse_xml()
+            self.model = mujoco.MjModel.from_xml_string(xml_content)
+            self.data = mujoco.MjData(self.model)
+            # Cache ids
+            self._cache_model_indices()
+            # Initialize robot pose to current state
+            x0, y0, th0 = self._current_state.position
+            self._set_body_pose("robot_base", x0, y0, th0)
+            mujoco.mj_forward(self.model, self.data)
+            print(f"[MuJoCo] Physics scene ready: bodies={self.model.nbody} geoms={self.model.ngeom}")
+        except Exception as e:
+            print(f"[MuJoCo] Failed to initialize physics scene: {e}")
+            self.model = None
+            self.data = None
     
     def _generate_warehouse_xml(self) -> str:
         """Generate MuJoCo XML from warehouse map."""
@@ -115,30 +133,30 @@ class SimpleMuJoCoPhysics:
   </default>
   
   <worldbody>
-    <!-- Floor -->
+    <!-- Floor centered at warehouse world coordinates so physics coords align with map -->
     <geom name="floor" type="plane" size="{world_width/2} {world_height/2} 0.1" 
           pos="{world_width/2} {world_height/2} 0" rgba="0.9 0.9 0.9 1"/>
     
-    <!-- Robot with differential drive -->
+    <!-- Robot with freejoint base (kinematic control writes qpos) -->
     <body name="robot_base" pos="{self.warehouse_map.start_position[0]} {self.warehouse_map.start_position[1]} 0.1">
-      <freejoint/>
-      <geom name="robot_body" type="cylinder" size="0.1 0.05" rgba="0.8 0.2 0.2 1"/>
+      <freejoint name="base_free"/>
+      <geom name="robot_body" type="cylinder" size="0.12 0.06" rgba="0.8 0.2 0.2 1"/>
       <site name="robot_site" pos="0 0 0" size="0.01"/>
       
-      <!-- Left wheel -->
+      <!-- Left wheel (visual-only; used for contact classification as robot geom) -->
       <body name="left_wheel_body" pos="-0.15 0 0">
         <joint name="left_wheel" type="hinge" axis="0 1 0" limited="false"/>
         <geom name="left_wheel_geom" type="cylinder" size="0.03 0.01" rgba="0.3 0.3 0.3 1"/>
       </body>
       
-      <!-- Right wheel -->
+      <!-- Right wheel (visual-only) -->
       <body name="right_wheel_body" pos="0.15 0 0">
         <joint name="right_wheel" type="hinge" axis="0 1 0" limited="false"/>
         <geom name="right_wheel_geom" type="cylinder" size="0.03 0.01" rgba="0.3 0.3 0.3 1"/>
       </body>
     </body>
     
-    <!-- Warehouse elements -->
+    <!-- Warehouse elements (walls, shelves as bodies with freejoints) -->
     {self._generate_warehouse_elements_xml()}
   </worldbody>
   
@@ -156,7 +174,9 @@ class SimpleMuJoCoPhysics:
         return xml
     
     def _generate_warehouse_elements_xml(self) -> str:
-        """Generate XML for all warehouse elements from the grid."""
+        """Generate XML for all warehouse elements from the grid.
+        Walls: static geoms; Shelves: bodies with freejoint so they can be attached/moved.
+        """
         elements_xml = ""
         
         for y in range(self.warehouse_map.height):
@@ -166,17 +186,173 @@ class SimpleMuJoCoPhysics:
                 world_y = (y + 0.5) * self.warehouse_map.grid_size
                 
                 if cell_type == 1:  # Wall
-                    elements_xml += f'<geom name="wall_{x}_{y}" pos="{world_x} {world_y} 0.25" size="0.25 0.25 0.25" rgba="0.5 0.5 0.5 1"/>\n'
-                elif cell_type == 2:  # Shelf
-                    elements_xml += f'<geom name="shelf_{x}_{y}" pos="{world_x} {world_y} 0.5" size="0.2 0.2 0.5" rgba="0.2 0.8 0.2 1"/>\n'
+                    elements_xml += (
+                        f'<geom name="wall_{x}_{y}" pos="{world_x} {world_y} 0.25" '
+                        f'size="0.25 0.25 0.25" rgba="0.5 0.5 0.5 1"/>\n'
+                    )
+                elif cell_type == 2:  # Shelf (as movable body with freejoint)
+                    elements_xml += (
+                        f'<body name="shelf_{x}_{y}" pos="{world_x} {world_y} 0.6">\n'
+                        f'  <freejoint name="free_shelf_{x}_{y}"/>\n'
+                        f'  <geom name="shelf_geom_{x}_{y}" type="box" size="0.22 0.22 0.6" rgba="0.2 0.8 0.2 1"/>\n'
+                        f'</body>\n'
+                    )
                 elif cell_type == 3:  # Charging zone
-                    elements_xml += f'<geom name="charge_{x}_{y}" pos="{world_x} {world_y} 0.05" size="0.25 0.25 0.05" rgba="1.0 0.8 0.0 1"/>\n'
+                    elements_xml += (
+                        f'<geom name="charge_{x}_{y}" pos="{world_x} {world_y} 0.05" '
+                        f'size="0.3 0.3 0.05" rgba="1.0 0.8 0.0 1"/>\n'
+                    )
                 elif cell_type == 4:  # Idle zone
-                    elements_xml += f'<geom name="idle_{x}_{y}" pos="{world_x} {world_y} 0.05" size="0.25 0.25 0.05" rgba="0.5 0.8 1.0 1"/>\n'
+                    elements_xml += (
+                        f'<geom name="idle_{x}_{y}" pos="{world_x} {world_y} 0.05" '
+                        f'size="0.3 0.3 0.05" rgba="0.5 0.8 1.0 1"/>\n'
+                    )
                 elif cell_type == 5:  # Drop-off station
-                    elements_xml += f'<geom name="dropoff_{x}_{y}" pos="{world_x} {world_y} 0.1" size="0.25 0.25 0.1" rgba="1.0 0.4 0.4 1"/>\n'
+                    elements_xml += (
+                        f'<geom name="dropoff_{x}_{y}" pos="{world_x} {world_y} 0.1" '
+                        f'size="0.3 0.3 0.1" rgba="1.0 0.4 0.4 1"/>\n'
+                    )
         
         return elements_xml
+
+    def _cache_model_indices(self) -> None:
+        """Cache frequently used ids and address pointers for fast operations."""
+        if self.model is None:
+            return
+        # Name maps
+        self._body_name_to_id = {}
+        self._geom_name_to_id = {}
+        for i in range(self.model.nbody):
+            try:
+                name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, i)
+                if name:
+                    self._body_name_to_id[name] = i
+            except Exception:
+                pass
+        for i in range(self.model.ngeom):
+            try:
+                name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, i)
+                if name:
+                    self._geom_name_to_id[name] = i
+            except Exception:
+                pass
+        # Robot geom ids
+        self._robot_geom_ids = set()
+        for geom_name in ("robot_body", "left_wheel_geom", "right_wheel_geom"):
+            gid = self._geom_name_to_id.get(geom_name)
+            if gid is not None:
+                self._robot_geom_ids.add(gid)
+        # Robot freejoint qpos address
+        try:
+            jnt_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "base_free")
+            if jnt_id >= 0:
+                self._robot_free_qpos_adr = self.model.jnt_qposadr[jnt_id]
+        except Exception:
+            self._robot_free_qpos_adr = None
+        # Shelf geom ids grouped by shelf id, and qpos address per shelf
+        self._shelf_geom_ids_by_id = {}
+        self._shelf_free_qpos_adr = {}
+        for name, bid in self._body_name_to_id.items():
+            if name.startswith("shelf_"):
+                shelf_id = name  # align shelf body name with grid-based id
+                # geom name is "shelf_geom_x_y"
+                parts = name.split("_")
+                if len(parts) == 3:
+                    gx, gy = parts[1], parts[2]
+                    gname = f"shelf_geom_{gx}_{gy}"
+                    gid = self._geom_name_to_id.get(gname)
+                    if gid is not None:
+                        self._shelf_geom_ids_by_id.setdefault(shelf_id, set()).add(gid)
+                try:
+                    jname = f"free_shelf_{parts[1]}_{parts[2]}"
+                    jnt_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+                    if jnt_id >= 0:
+                        self._shelf_free_qpos_adr[shelf_id] = self.model.jnt_qposadr[jnt_id]
+                except Exception:
+                    pass
+
+    def _set_body_pose(self, body_name: str, x: float, y: float, theta: float) -> None:
+        """Write pose (x,y,theta) to a body's freejoint qpos."""
+        if self.model is None or self.data is None:
+            return
+        try:
+            if body_name == "robot_base" and self._robot_free_qpos_adr is not None:
+                adr = self._robot_free_qpos_adr
+            else:
+                adr = self._shelf_free_qpos_adr.get(body_name)
+            if adr is None:
+                return
+            # qpos layout for freejoint: [x y z qw qx qy qz]
+            import math as _m
+            self.data.qpos[adr + 0] = x
+            self.data.qpos[adr + 1] = y
+            self.data.qpos[adr + 2] = 0.1
+            half = theta / 2.0
+            self.data.qpos[adr + 3] = _m.cos(half)
+            self.data.qpos[adr + 4] = 0.0
+            self.data.qpos[adr + 5] = 0.0
+            self.data.qpos[adr + 6] = _m.sin(half)
+        except Exception:
+            pass
+
+    def _would_collide(self, x: float, y: float, theta: float) -> bool:
+        """Check if placing robot at pose (x,y,theta) produces contact with walls/shelves.
+        Ignores self-collisions and collisions with an attached shelf.
+        """
+        if self.model is None or self.data is None:
+            return False
+        # Write candidate pose
+        self._set_body_pose("robot_base", x, y, theta)
+        mujoco.mj_forward(self.model, self.data)
+        # Scan contacts
+        try:
+            ncon = int(self.data.ncon)
+            for i in range(ncon):
+                c = self.data.contact[i]
+                g1 = int(c.geom1)
+                g2 = int(c.geom2)
+                # Determine if either geom belongs to robot
+                g_robot = g1 if g1 in self._robot_geom_ids else (g2 if g2 in self._robot_geom_ids else None)
+                if g_robot is None:
+                    continue
+                # Identify the other geom id
+                g_other = g2 if g1 == g_robot else g1
+                # Skip attached shelf geoms if any
+                if self._attached_shelf_id:
+                    shelf_geom_ids = self._shelf_geom_ids_by_id.get(self._attached_shelf_id, set())
+                    if g_other in shelf_geom_ids:
+                        continue
+                # Get other geom name and classify
+                try:
+                    other_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, g_other)
+                except Exception:
+                    other_name = None
+                if not other_name:
+                    # Unknown geom, be conservative
+                    return True
+                if other_name.startswith("wall_") or other_name.startswith("shelf_") or other_name.startswith("shelf_geom_"):
+                    return True
+            return False
+        except Exception:
+            # On error, be safe and report collision
+            return True
+
+    def _would_violate_inter_robot_distance(self, x: float, y: float) -> bool:
+        """Check simple circular separation with other robots via registry."""
+        reg = getattr(self, "_collision_registry", None)
+        if reg is None:
+            return False
+        try:
+            others = reg.get_other_poses(self.robot_id)
+            min_d2 = self._min_inter_robot_distance * self._min_inter_robot_distance
+            for ox, oy, _ in others:
+                dx = x - ox
+                dy = y - oy
+                if (dx * dx + dy * dy) < min_d2:
+                    return True
+            return False
+        except Exception:
+            return False
     
     def set_wheel_velocities(self, left_vel: float, right_vel: float) -> None:
         """
@@ -225,16 +401,20 @@ class SimpleMuJoCoPhysics:
             new_x = attempted_x
             new_y = attempted_y
             
-            # Basic collision detection (stay within warehouse bounds)
+            # Basic bounds clamp
             clamped_x = max(0.2, min(new_x, self.warehouse_map.width * self.warehouse_map.grid_size - 0.2))
             clamped_y = max(0.2, min(new_y, self.warehouse_map.height * self.warehouse_map.grid_size - 0.2))
             bounds_clamped = (abs(clamped_x - new_x) > 1e-9) or (abs(clamped_y - new_y) > 1e-9)
             new_x, new_y = clamped_x, clamped_y
             
-            # Check collision with walls and shelves
+            # Map-based walkability check (fast logical obstacles)
             walkable = self.warehouse_map.is_walkable(new_x, new_y)
-            if not walkable:
-                # Collision detected, don't update position
+            blocked_by_map = not walkable
+            # MuJoCo-based contact guard (physical non-penetration with walls/shelves)
+            blocked_by_contact = self._would_collide(new_x, new_y, new_theta)
+            blocked_by_peer = self._would_violate_inter_robot_distance(new_x, new_y)
+            if blocked_by_map or blocked_by_contact or blocked_by_peer:
+                # Collision detected, don't update position (stop for this tick)
                 new_x, new_y = x, y
                 linear_vel = 0.0
                 angular_vel = 0.0
@@ -245,7 +425,8 @@ class SimpleMuJoCoPhysics:
                     if (now - self._last_block_log_time) > 0.5 and self._block_log_count < 100:
                         self._last_block_log_time = now
                         self._block_log_count += 1
-                        print(f"[PhysicsDiag] Blocked by obstacle: pos=({x:.3f},{y:.3f},{theta:.3f}) -> attempted=({attempted_x:.3f},{attempted_y:.3f}) walkable=False")
+                        reason = "map" if blocked_by_map else ("contact" if blocked_by_contact else "peer")
+                        print(f"[PhysicsDiag] Blocked by {reason}: pos=({x:.3f},{y:.3f},{theta:.3f}) -> attempted=({attempted_x:.3f},{attempted_y:.3f})")
             elif bounds_clamped:
                 # Diagnostics: rate-limited logging for bounds clamp
                 if self._diagnostics_enabled:
@@ -256,12 +437,30 @@ class SimpleMuJoCoPhysics:
                         self._block_log_count += 1
                         print(f"[PhysicsDiag] Clamped to bounds: pos=({x:.3f},{y:.3f},{theta:.3f}) -> attempted=({attempted_x:.3f},{attempted_y:.3f}) clamped=({new_x:.3f},{new_y:.3f})")
             
+            # Update internal MuJoCo scene to accepted pose
+            if self.model is not None and self.data is not None:
+                self._set_body_pose("robot_base", new_x, new_y, new_theta)
+                # If carrying a shelf, keep it aligned using fixed offset
+                if self._attached_shelf_id and self._attached_shelf_id in self._shelf_free_qpos_adr:
+                    try:
+                        offx, offy, offt = self._attached_shelf_offset
+                        self._set_body_pose(self._attached_shelf_id, new_x + offx, new_y + offy, new_theta + offt)
+                    except Exception:
+                        pass
+                mujoco.mj_forward(self.model, self.data)
+
             # Update state
             self._current_state = PhysicsState(
                 position=(new_x, new_y, new_theta),
                 velocity=(linear_vel * np.cos(new_theta), linear_vel * np.sin(new_theta), angular_vel),
                 timestamp=time.time()
             )
+            # Update shared registry
+            if self._collision_registry is not None:
+                try:
+                    self._collision_registry.update_pose(self.robot_id, (new_x, new_y, new_theta))
+                except Exception:
+                    pass
             # Diagnostics: robot_2 only pose trace
             try:
                 if self._diagnostics_enabled and getattr(self, 'robot_id', None) == 'warehouse_robot_2':
@@ -269,40 +468,27 @@ class SimpleMuJoCoPhysics:
             except Exception:
                 pass
             
-            # Update MuJoCo visualization if available
-            if self.model is not None and self.data is not None:
-                self._update_mujoco_visualization(new_x, new_y, new_theta)
+            # Done
     
-    def _update_mujoco_visualization(self, x: float, y: float, theta: float) -> None:
+    # --- Shelf attach/detach (Option A) ---
+    def attach_shelf_to_robot(self, shelf_id: str, rel_offset: Tuple[float, float, float] = (0.3, 0.0, 0.0)) -> bool:
+        """Attach shelf to robot by keeping shelf body aligned with a fixed offset.
+        rel_offset: (dx, dy, dtheta) in robot frame.
+        Returns True if attached, False if shelf not found.
         """
-        Update MuJoCo model for visualization (internal use only).
-        **DISABLED**: MuJoCo visualization disabled to prevent physics conflicts.
-        """
-        # DISABLED: No MuJoCo model to update
-        return
-        
-        # OLD CODE (commented out):
-        # try:
-        #     # Update robot position in MuJoCo
-        #     self.data.qpos[0] = x
-        #     self.data.qpos[1] = y
-        #     self.data.qpos[2] = 0.1  # Fixed height
-        #     
-        #     # Convert angle to quaternion (rotation around z-axis)
-        #     self.data.qpos[3] = np.cos(theta / 2)  # w
-        #     self.data.qpos[4] = 0.0                # x
-        #     self.data.qpos[5] = 0.0                # y
-        #     self.data.qpos[6] = np.sin(theta / 2)  # z
-        #     
-        #     # Zero velocities (we control position directly)
-        #     self.data.qvel[:] = 0.0
-        #     
-        #     # Forward kinematics for visualization
-        #     mujoco.mj_forward(self.model, self.data)
-        #     
-        # except Exception as e:
-        #     # Fail silently for visualization issues
-        #     pass
+        if self.model is None or self.data is None:
+            self._attached_shelf_id = None
+            return False
+        if shelf_id not in self._shelf_free_qpos_adr:
+            return False
+        self._attached_shelf_id = shelf_id
+        self._attached_shelf_offset = rel_offset
+        return True
+
+    def detach_shelf(self) -> None:
+        """Detach currently attached shelf (if any)."""
+        self._attached_shelf_id = None
+        self._attached_shelf_offset = (0.0, 0.0, 0.0)
     
     def get_physics_state(self) -> PhysicsState:
         """
@@ -342,9 +528,17 @@ class SimpleMuJoCoPhysics:
                 timestamp=time.time()
             )
             
-            # Update MuJoCo if available
+            # Update internal MuJoCo scene if available
             if self.model is not None and self.data is not None:
-                self._update_mujoco_visualization(x, y, theta)
+                try:
+                    self._set_body_pose("robot_base", x, y, theta)
+                    # If carrying a shelf, keep it aligned using fixed offset
+                    if self._attached_shelf_id and self._attached_shelf_id in self._shelf_free_qpos_adr:
+                        offx, offy, offt = self._attached_shelf_offset
+                        self._set_body_pose(self._attached_shelf_id, x + offx, y + offy, theta + offt)
+                    mujoco.mj_forward(self.model, self.data)
+                except Exception:
+                    pass
 
 
 class MuJoCoWarehouseEnv:
