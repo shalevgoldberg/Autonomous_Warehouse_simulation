@@ -19,9 +19,14 @@ from interfaces.state_holder_interface import IStateHolder
 from interfaces.coordinate_system_interface import ICoordinateSystem
 from interfaces.lane_follower_interface import ILaneFollower
 from interfaces.simulation_data_service_interface import ISimulationDataService
-from interfaces.configuration_interface import IConfigurationProvider, BidConfig
+from interfaces.configuration_interface import IBusinessConfigurationProvider, BidConfig
 from interfaces.bid_calculator_interface import IBidCalculator
 from interfaces.bidding_system_interface import RobotBid
+from interfaces.lidar_interface import ILiDARService, LiDARConfig, LiDARScan  # Phase 2.2
+from warehouse.impl.lidar_service_impl import LiDARServiceImpl  # Phase 2.2
+from interfaces.collision_avoidance_interface import ICollisionAvoidanceService  # Phase 4
+from interfaces.motion_command_filter_interface import IMotionCommandFilter  # Phase 4
+from warehouse.impl.dependency_injection_container import DependencyInjectionContainer  # Phase 4
 
 from robot.impl.task_handler_impl import TaskHandlerImpl
 from robot.impl.path_planner_graph_impl import PathPlannerGraphImpl
@@ -37,6 +42,10 @@ from warehouse.map import WarehouseMap
 from simulation.mujoco_env import SimpleMuJoCoPhysics
 from simulation.shared_mujoco_engine import SharedMuJoCoPhysics
 from interfaces.appearance_service_interface import IAppearanceService
+from interfaces.battery_manager_interface import IBatteryManager
+from interfaces.charging_station_manager_interface import IChargingStationManager
+from warehouse.impl.battery_manager_impl import BatteryManagerImpl
+from warehouse.impl.charging_station_manager_impl import ChargingStationManagerImpl
 from utils.geometry import mapdata_to_warehouse_map
 
 
@@ -62,7 +71,7 @@ class RobotAgent:
     
     def __init__(self, 
                  physics: SimpleMuJoCoPhysics,
-                 config_provider: IConfigurationProvider,
+                 config_provider: IBusinessConfigurationProvider,
                  robot_id: str = "robot_1",
                  simulation_data_service: Optional[ISimulationDataService] = None):
         """
@@ -91,7 +100,13 @@ class RobotAgent:
         
         # Initialize coordinate system (simplified for lane-based navigation)
         self.coordinate_system = self._create_coordinate_system()
-        
+
+        # Create battery manager first (needed for state holder)
+        self.battery_manager = self._create_battery_manager()
+
+        # Create charging station manager (needed for task handler)
+        self.charging_station_manager = self._create_charging_station_manager()
+
         # Initialize robot components via dependency injection
         # Order matters: motion_executor must be created before lane_follower
         self.state_holder = self._create_state_holder()
@@ -102,14 +117,24 @@ class RobotAgent:
         
         # Initialize bid calculator for parallel bidding
         self.bid_calculator = self._create_bid_calculator()
-        
+
+        # Initialize collision avoidance system (Phase 4)
+        self.collision_avoidance_service = self._create_collision_avoidance_service()
+        self.motion_command_filter = self._create_motion_command_filter()
+
+        # Initialize LiDAR service (Phase 2.2) - only for authoritative physics
+        self.lidar_service: Optional[ILiDARService] = None
+        self._initialize_lidar_service()
+
         # Initialize physics thread manager with state holder for 1kHz synchronization
         from robot.impl.physics_integration import create_physics_thread_manager
         self.physics_manager = create_physics_thread_manager(
             physics=self.physics,
             state_holder=self.state_holder,
             frequency_hz=1000.0,
-            db_sync_frequency_hz=10.0
+            db_sync_frequency_hz=10.0,
+            lidar_service=self.lidar_service,  # Phase 2.2 - pass LiDAR service
+            robot_id=self.robot_id  # Phase 2.2 - pass robot ID
         )
 
         # Store reference to state_holder in physics for direct updates
@@ -122,6 +147,10 @@ class RobotAgent:
 
         print(f"[RobotAgent] DIAGNOSTIC: physics has _state_holder after: {hasattr(self.physics, '_state_holder')}")
         print(f"[RobotAgent] DIAGNOSTIC: _state_holder is not None: {self.physics._state_holder is not None}")
+
+        # Set motion command filter on motion executor for safety integration (Phase 4)
+        if hasattr(self.motion_executor, 'set_motion_command_filter'):
+            self.motion_executor.set_motion_command_filter(self.motion_command_filter)
         
         # Control loop management
         self._running = False
@@ -130,8 +159,50 @@ class RobotAgent:
         
         print(f"[RobotAgent] Initialized {self.robot_id} with lane-based navigation")
         print(f"[RobotAgent] Components: PathPlanner, LaneFollower, MotionExecutor, TaskHandler, BidCalculator")
+        if self.lidar_service is not None:
+            print(f"[RobotAgent] LiDAR Service: {type(self.lidar_service).__name__} (Active)")
+        else:
+            print(f"[RobotAgent] LiDAR Service: Disabled (Non-authoritative physics mode)")
+        if self.charging_station_manager is not None:
+            print(f"[RobotAgent] Charging Station Manager: {type(self.charging_station_manager).__name__} (Active)")
+        else:
+            print(f"[RobotAgent] Charging Station Manager: Disabled (Not available)")
         print(f"[RobotAgent] Database: {type(self.simulation_data_service).__name__}")
         print(f"[RobotAgent] Configuration: {len(self.config_provider.errors)} validation errors")
+
+    # LiDAR access methods (Phase 2.2)
+    def get_lidar_scan(self) -> Optional['LiDARScan']:
+        """
+        Get the latest LiDAR scan data for this robot.
+
+        Returns:
+            LiDARScan: Latest scan data, or None if LiDAR is not available
+        """
+        if self.lidar_service is not None:
+            return self.lidar_service.get_scan_data(self.robot_id)
+        return None
+
+    def get_lidar_config(self) -> Optional['LiDARConfig']:
+        """
+        Get the current LiDAR configuration for this robot.
+
+        Returns:
+            LiDARConfig: Current LiDAR configuration, or None if LiDAR is not available
+        """
+        if self.lidar_service is not None:
+            return self.lidar_service.get_config(self.robot_id)
+        return None
+
+    def is_lidar_operational(self) -> bool:
+        """
+        Check if LiDAR is operational for this robot.
+
+        Returns:
+            bool: True if LiDAR is available and operational
+        """
+        if self.lidar_service is not None:
+            return self.lidar_service.is_operational(self.robot_id)
+        return False
     
     def _validate_configuration(self) -> None:
         """Validate robot configuration against warehouse constraints."""
@@ -192,7 +263,8 @@ class RobotAgent:
             robot_id=self.robot_id,
             model=self.physics.model,
             data=self.physics.data,
-            physics_engine=self.physics
+            physics_engine=self.physics,
+            battery_manager=self.battery_manager
         )
     
     def _create_path_planner(self) -> IPathPlanner:
@@ -231,7 +303,7 @@ class RobotAgent:
         motion_executor.update_config_from_robot(self.robot_config)
         
         return motion_executor
-    
+
     def _create_task_handler(self) -> ITaskHandler:
         """Create task handler for task execution."""
         # Get appearance service if available (for visual shelf carrying)
@@ -246,12 +318,14 @@ class RobotAgent:
             coordinate_system=self.coordinate_system,
             simulation_data_service=self.simulation_data_service,
             config_provider=self.config_provider,
-            appearance_service=appearance_service
+            appearance_service=appearance_service,
+            battery_manager=self.battery_manager,
+            charging_station_manager=self.charging_station_manager
         )
-        
+
         # Update task handler configuration with robot-specific parameters
         task_handler.update_config_from_robot(self.robot_config)
-        
+
         return task_handler
 
     def _get_appearance_service(self) -> Optional[IAppearanceService]:
@@ -273,6 +347,41 @@ class RobotAgent:
             print(f"[RobotAgent] WARNING: Robot {self.robot_id} is not using SharedMuJoCoPhysics - appearance service not available")
             return None
 
+    def _create_battery_manager(self) -> Optional[IBatteryManager]:
+        """Create battery manager for emergency stop functionality."""
+        try:
+            if self.config_provider is not None:
+                battery_manager = BatteryManagerImpl(
+                    config_provider=self.config_provider,
+                    robot_id=self.robot_id
+                )
+                print(f"[RobotAgent] Successfully created battery manager for robot {self.robot_id}")
+                return battery_manager
+            else:
+                print(f"[RobotAgent] WARNING: No config provider available - battery manager not created for robot {self.robot_id}")
+                return None
+        except Exception as e:
+            print(f"[RobotAgent] ERROR: Failed to create battery manager for robot {self.robot_id}: {e}")
+            return None
+
+    def _create_charging_station_manager(self) -> Optional[IChargingStationManager]:
+        """Create charging station manager for charging station allocation and locking."""
+        try:
+            if self.config_provider is not None and self.simulation_data_service is not None and self.warehouse_map is not None:
+                charging_station_manager = ChargingStationManagerImpl(
+                    config_provider=self.config_provider,
+                    simulation_data_service=self.simulation_data_service,
+                    warehouse_map=self.warehouse_map
+                )
+                print(f"[RobotAgent] Successfully created charging station manager for robot {self.robot_id}")
+                return charging_station_manager
+            else:
+                print(f"[RobotAgent] WARNING: Missing dependencies for charging station manager - not created for robot {self.robot_id}")
+                return None
+        except Exception as e:
+            print(f"[RobotAgent] ERROR: Failed to create charging station manager for robot {self.robot_id}: {e}")
+            return None
+
     def _create_bid_calculator(self) -> IBidCalculator:
         """Create bid calculator for parallel bidding."""
         # Get bid configuration from provider
@@ -288,7 +397,27 @@ class RobotAgent:
         self._configure_bid_calculator(bid_calculator, bid_config)
         
         return bid_calculator
-    
+
+    def _create_collision_avoidance_service(self) -> ICollisionAvoidanceService:
+        """
+        Create collision avoidance service for this robot.
+        """
+        container = DependencyInjectionContainer()
+        return container.create_collision_avoidance_service(
+            robot_id=self.robot_id,
+            config_provider=self.config_provider
+        )
+
+    def _create_motion_command_filter(self) -> IMotionCommandFilter:
+        """
+        Create motion command filter for this robot.
+        """
+        container = DependencyInjectionContainer()
+        return container.create_motion_command_filter(
+            robot_id=self.robot_id,
+            config_provider=self.config_provider
+        )
+
     def _configure_bid_calculator(self, bid_calculator: IBidCalculator, bid_config: BidConfig) -> None:
         """Configure bid calculator with robot-specific settings."""
         from interfaces.bid_calculator_interface import BidFactor, BidFactorWeight
@@ -348,7 +477,47 @@ class RobotAgent:
         
         if not bid_config.enable_shelf_accessibility_factor:
             bid_calculator.enable_factor(BidFactor.SHELF_ACCESSIBILITY, False)
-    
+
+    def _initialize_lidar_service(self) -> None:
+        """
+        Initialize LiDAR service for collision avoidance (Phase 2.2).
+
+        LiDAR service is only activated when using mujoco_authoritative physics mode,
+        as it requires physics-based collision detection for accurate sensor simulation.
+        """
+        # Check if we're using authoritative physics mode
+        physics_mode = self.config_provider.get_value("physics.mode", "kinematic_guard").value
+
+        if physics_mode != "mujoco_authoritative":
+            print(f"[RobotAgent] LiDAR service disabled - requires mujoco_authoritative physics mode")
+            self.lidar_service = None
+            return
+
+        # Verify physics engine supports LiDAR
+        if not hasattr(self.physics, 'get_raycast_service'):
+            print(f"[RobotAgent] LiDAR service disabled - physics engine does not support raycasting")
+            self.lidar_service = None
+            return
+
+        try:
+            # Get LiDAR configuration from provider
+            lidar_config = self.robot_config.lidar_config
+
+            # Create LiDAR service instance
+            self.lidar_service = LiDARServiceImpl(
+                shared_engine=self.physics,  # Use physics engine for raycasting
+                robot_id=self.robot_id,
+                config=lidar_config
+            )
+
+            print(f"[RobotAgent] LiDAR service initialized for robot {self.robot_id}")
+            print(f"[RobotAgent] LiDAR config: {lidar_config.num_rays} rays, {lidar_config.max_range}m range, {lidar_config.scan_frequency}Hz")
+
+        except Exception as e:
+            print(f"[RobotAgent] Failed to initialize LiDAR service: {e}")
+            print(f"[RobotAgent] LiDAR functionality will be disabled")
+            self.lidar_service = None
+
     def initialize_position(self) -> None:
         """Initialize robot position in physics simulation."""
         # Get start position from configuration or warehouse default
@@ -529,14 +698,86 @@ class RobotAgent:
             try:
                 # Update task handler
                 self.task_handler.update_task_execution()
-                
+
+                # Evaluate collision avoidance (Phase 4)
+                self._evaluate_collision_avoidance()
+
                 # Sleep for control period
                 time.sleep(control_period)
                 
             except Exception as e:
                 print(f"[RobotAgent] Control loop error: {e}")
                 time.sleep(control_period)
-    
+
+    def _evaluate_collision_avoidance(self) -> None:
+        """
+        Evaluate collision avoidance and apply safety actions.
+
+        This method runs at 10Hz in the control loop to:
+        1. Get LiDAR scan data
+        2. Evaluate collision avoidance for safety actions
+        3. Apply safety filtering to motion commands (Phase 4)
+
+        Note: Full command filtering integration pending - currently evaluates and logs.
+        """
+        try:
+            # Check if collision avoidance is enabled
+            ca_enabled = self.config_provider.get_value("collision_avoidance.enabled", True).value
+            if not ca_enabled:
+                print(f"[RobotAgent] WARNING: Collision avoidance disabled for {self.robot_id}")
+                return
+
+            # Check if we're using authoritative physics mode (required for collision avoidance)
+            physics_mode = self.config_provider.get_value("physics.mode", "kinematic_guard").value
+            if physics_mode != "mujoco_authoritative":
+                print(f"[RobotAgent] WARNING: Collision avoidance requires mujoco_authoritative physics mode, "
+                      f"current mode: {physics_mode}")
+                return
+
+            # Get LiDAR scan if available
+            lidar_scan = None
+            if self.lidar_service and self.lidar_service.is_operational(self.robot_id):
+                lidar_scan = self.lidar_service.get_scan_data(self.robot_id)
+
+            if lidar_scan is None:
+                print(f"[RobotAgent] WARNING: No LiDAR data available for collision avoidance evaluation on {self.robot_id}")
+                return  # No LiDAR data available
+
+            # Get current desired speed (from motion executor or task handler)
+            # For now, use a reasonable default - this needs refinement
+            desired_speed = self.motion_executor.get_movement_speed()
+
+            # Evaluate collision avoidance
+            safety_action = self.collision_avoidance_service.evaluate(
+                robot_id=self.robot_id,
+                desired_speed=desired_speed,
+                lidar_scan=lidar_scan
+            )
+
+            # Apply safety action to motion executor
+            if hasattr(self.motion_executor, 'set_safety_action'):
+                self.motion_executor.set_safety_action(safety_action)
+
+                # Log safety actions for monitoring
+                if safety_action.action_type.value != "clear":
+                    # Diagnostics: include counts by category for visibility
+                    categories = getattr(lidar_scan, 'hit_category', None)
+                    cat_counts = {}
+                    try:
+                        if categories is not None:
+                            import numpy as np  # local import to avoid top-level dependency change
+                            unique, counts = np.unique(categories, return_counts=True)
+                            cat_counts = {str(k): int(v) for k, v in zip(unique.tolist(), counts.tolist())}
+                    except Exception:
+                        pass
+                    print(f"[RobotAgent.{self.robot_id}] Safety action: {safety_action.action_type.value} (reason: {safety_action.reason or 'none'}) categories={cat_counts}")
+            else:
+                print(f"[RobotAgent] WARNING: Motion executor does not support safety actions")
+
+        except Exception as e:
+            # Log error but don't crash the control loop
+            print(f"[RobotAgent] Collision avoidance evaluation error: {e}")
+
     def _motion_loop(self) -> None:
         """Motion loop for physics integration."""
         motion_period = 1.0 / self.robot_config.motion_frequency
@@ -545,10 +786,10 @@ class RobotAgent:
             try:
                 # Update motion executor
                 self.motion_executor.update_control_loop()
-                
+
                 # Sleep for motion period
                 time.sleep(motion_period)
-                
+
             except Exception as e:
                 print(f"[RobotAgent] Motion loop error: {e}")
                 time.sleep(motion_period)

@@ -15,7 +15,7 @@ from enum import Enum
 from interfaces.motion_executor_interface import IMotionExecutor, MotionCommand, MotionStatus, MotionExecutionError
 from interfaces.path_planner_interface import Path, Cell
 from interfaces.coordinate_system_interface import ICoordinateSystem
-from interfaces.configuration_interface import IConfigurationProvider
+from interfaces.configuration_interface import IBusinessConfigurationProvider
 from interfaces.navigation_types import Point
 
 
@@ -70,7 +70,7 @@ class MotionExecutorImpl(IMotionExecutor):
     
     def __init__(self, coordinate_system: ICoordinateSystem, 
                  model=None, data=None, robot_id: str = "robot_1", physics_engine=None,
-                 config_provider: Optional[IConfigurationProvider] = None):
+                 config_provider: Optional[IBusinessConfigurationProvider] = None):
         """
         Initialize MotionExecutor.
         
@@ -97,6 +97,10 @@ class MotionExecutorImpl(IMotionExecutor):
         self._current_mode = MotionMode.STOPPED
         self._current_path = None
         self._current_target = None
+
+        # Safety system integration (Phase 4)
+        self._safety_action = None  # Current active safety action
+        self._motion_command_filter = None  # Will be set by robot agent
         self._path_index = 0
         self._iteration_counter = 0  # Track control loop iterations
         self._motion_start_time = 0.0  # Initialize to 0.0 instead of None
@@ -235,23 +239,25 @@ class MotionExecutorImpl(IMotionExecutor):
         """Stop current motion execution immediately."""
         with self._status_lock:
             self._stop_motion_internal()
-            print(f"[MotionExecutor] Execution stopped")
-    
+
     def get_motion_status(self) -> MotionStatus:
         """Get current motion execution status."""
         with self._status_lock:
+            status = None
             if self._current_mode == MotionMode.EMERGENCY_STOP:
-                return MotionStatus.ERROR
+                status = MotionStatus.ERROR
             elif self._reached_target_flag:
                 # Keep the flag for a few iterations to ensure TaskHandler can read it
                 # Don't clear it immediately
-                return MotionStatus.REACHED_TARGET
+                status = MotionStatus.REACHED_TARGET
             elif self._current_mode == MotionMode.STOPPED:
-                return MotionStatus.IDLE
+                status = MotionStatus.IDLE
             elif self._current_mode in [MotionMode.FOLLOWING_PATH, MotionMode.SINGLE_MOVE, MotionMode.ROTATING]:
-                return MotionStatus.EXECUTING
+                status = MotionStatus.EXECUTING
             else:
-                return MotionStatus.IDLE
+                status = MotionStatus.IDLE
+
+            return status
     
     def is_at_target(self, target) -> bool:
         """
@@ -319,17 +325,17 @@ class MotionExecutorImpl(IMotionExecutor):
         """
         Update the control loop - should be called at 100Hz.
         Handles PID control and sends commands to MuJoCo.
-        
+
         **Atomicity**: All wheel commands must be written atomically to prevent
         race conditions with physics thread.
         """
         with self._status_lock:
             if self._current_mode == MotionMode.STOPPED or self._current_mode == MotionMode.EMERGENCY_STOP:
                 return
-            
+
             # Simulate motion control (in real implementation, would get current position from StateHolder)
             # For now, use simple simulation
-            
+
             if self._current_mode == MotionMode.FOLLOWING_PATH:
                 self._update_path_following()
             elif self._current_mode == MotionMode.SINGLE_MOVE:
@@ -350,7 +356,8 @@ class MotionExecutorImpl(IMotionExecutor):
             self._motion_start_time = time.time()
             # Clear any leftover reached flag from previous segment
             self._reached_target_flag = False
-            print(f"[MotionExecutor] Rotating to heading {target_heading_rad:.3f} rad (cap {self._rotation_speed_cap:.2f} rad/s)")
+            # 🔍 CRITICAL: Rotation configured - keep this for debugging
+            print(f"[MotionExecutor] Rotating to {target_heading_rad:.3f}rad")
     
     def set_wheel_commands_atomic(self, left_vel: float, right_vel: float) -> None:
         """
@@ -380,7 +387,7 @@ class MotionExecutorImpl(IMotionExecutor):
                         print(f"[MotionDiag] robot_2 cmd L={left_vel:.3f} R={right_vel:.3f}")
                 except Exception as e:
                     print(f"[MotionExecutor] Error writing to physics engine: {e}")
-            
+
             # Fallback: Write to MuJoCo if available (legacy support)
             if self.model is not None and self.data is not None:
                 self._write_to_mujoco_atomic(left_vel, right_vel)
@@ -504,6 +511,7 @@ class MotionExecutorImpl(IMotionExecutor):
         k_p = 1.2
         angular_vel = max(-self._rotation_speed_cap, min(self._rotation_speed_cap, k_p * theta_error))
         left_vel, right_vel = self._angular_to_wheel_velocities(0.0, angular_vel)
+
         self.set_wheel_commands_atomic(left_vel, right_vel)
     
     def _calculate_motion_to_target(self) -> None:
@@ -591,7 +599,25 @@ class MotionExecutorImpl(IMotionExecutor):
             if self.VERBOSE_MOTION_LOGGING:
                 print(f"[MotionExecutor] Calculated: linear={linear_vel:.3f}, angular={angular_vel:.3f}, "
                       f"wheels=L{left_vel:.3f}/R{right_vel:.3f}")
-        
+
+        # Apply safety filtering if active (Phase 4)
+        if self._safety_action and self._motion_command_filter:
+            try:
+                filtered_command = self._motion_command_filter.apply(
+                    safety_action=self._safety_action,
+                    desired_left_velocity=left_vel,
+                    desired_right_velocity=right_vel
+                )
+                left_vel = filtered_command.left_wheel_velocity
+                right_vel = filtered_command.right_wheel_velocity
+
+                # Safety logging disabled
+                # if self.VERBOSE_MOTION_LOGGING or self._safety_action.action_type.value != "clear":
+                #     print(f"[MotionExecutor] Safety applied: {self._safety_action.action_type.value}, "
+                #           f"filtered wheels=L{left_vel:.3f}/R{right_vel:.3f}")
+            except Exception as e:
+                print(f"[MotionExecutor] Safety filter error: {e}, using original commands")
+
         self.set_wheel_commands_atomic(left_vel, right_vel)
     
     def _angular_to_wheel_velocities(self, linear_vel: float, angular_vel: float) -> Tuple[float, float]:
@@ -691,33 +717,33 @@ class MotionExecutorImpl(IMotionExecutor):
     def follow_route(self, route) -> None:
         """
         Follow a lane-based route (new interface method) using world targets.
-        
+
         Motion layer does not reason about lanes. It receives a segment and
         drives to the segment's end point in world coordinates with the
         single-move controller.
         """
         # Defensive import for type hints without circular deps at module import
         from interfaces.navigation_types import Route
-        
+
         if route is None or not getattr(route, 'segments', None):
             # Nothing to follow
             with self._status_lock:
                 self._stop_motion_internal()
             return
-        
+
         # Use the first (or only) segment's end point as the target.
         segment = route.segments[0]
         end_point = getattr(segment, 'end_point', None)
         if end_point is None:
             # If end point missing, fall back to start point
             end_point = getattr(segment, 'start_point', None)
-        
+
         if end_point is None:
             # No valid target - stop
             with self._status_lock:
                 self._stop_motion_internal()
             return
-        
+
         # Configure single-move toward the world target
         with self._status_lock:
             # Stop any current motion
@@ -732,7 +758,8 @@ class MotionExecutorImpl(IMotionExecutor):
             # Reset snap state for new segment
             self._snap_triggered = False
             self._snap_start_time = None
-            print(f"[MotionExecutor] Following segment to world target ({end_point.x:.3f}, {end_point.y:.3f})")
+            # 🔍 CRITICAL: Motion configured - keep this for debugging
+            print(f"[MotionExecutor] Motion to ({end_point.x:.1f}, {end_point.y:.1f})")
     
     def set_corner_speed(self, speed: float) -> None:
         """Set corner speed for conflict boxes and bay navigation."""
@@ -752,4 +779,18 @@ class MotionExecutorImpl(IMotionExecutor):
             self._movement_speed = robot_config.movement_speed
             self._position_tolerance = robot_config.position_tolerance
             self._wheel_base = robot_config.wheel_base
-            self._wheel_radius = robot_config.wheel_radius 
+            self._wheel_radius = robot_config.wheel_radius
+
+    def set_motion_command_filter(self, motion_command_filter) -> None:
+        """Set the motion command filter for safety constraints."""
+        self._motion_command_filter = motion_command_filter
+
+    def set_safety_action(self, safety_action) -> None:
+        """Set the current safety action for collision avoidance."""
+        with self._status_lock:
+            self._safety_action = safety_action
+
+    def get_safety_action(self):
+        """Get the currently active safety action."""
+        with self._status_lock:
+            return self._safety_action 
