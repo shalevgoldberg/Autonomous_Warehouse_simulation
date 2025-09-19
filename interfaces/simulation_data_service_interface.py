@@ -24,21 +24,23 @@ class ShelfInfo:
 
 @dataclass
 class ItemInventoryInfo:
-    """Information about an inventory item."""
+    """Information about an inventory item (pending-aware)."""
     item_id: str
-    name: str
-    quantity: int
-    shelf_id: str
+    available_quantity: int
+    total_quantity: int
+    reserved_quantity: int
+    shelf_locations: List[str]
+    name: Optional[str] = None
     description: Optional[str] = None
     category: Optional[str] = None
 
 
 @dataclass
 class ItemShelfLocation:
-    """Information about item location on a shelf."""
+    """Information about item location on a shelf (pending-aware)."""
     item_id: str
     shelf_id: str
-    quantity: int
+    quantity: int  # Available quantity (quantity - pending)
     last_updated: float  # Unix timestamp
 
 
@@ -52,6 +54,7 @@ class MapData:
     shelves: Dict[str, Tuple[int, int]]  # shelf_id -> cell coordinates
     dropoff_zones: List[Tuple[int, int]]
     charging_zones: List[Tuple[int, int]]
+    idle_zones: List[Tuple[int, int]]
 
 
 @dataclass
@@ -410,6 +413,25 @@ class ISimulationDataService(ABC):
         Cleanup expired bay locks.
         """
         pass
+
+    @abstractmethod
+    def get_bay_lock_info(self, bay_id: str) -> Optional[Dict]:
+        """
+        Get information about a bay lock.
+
+        Args:
+            bay_id: Bay identifier to check
+
+        Returns:
+            Dict with lock information if locked, None if unlocked.
+            Format: {
+                'robot_id': str,
+                'locked_at': float,  # timestamp
+                'heartbeat_at': float,  # timestamp
+                'lock_timeout_seconds': int
+            }
+        """
+        pass
     
     # Shelf Operations
     @abstractmethod
@@ -476,6 +498,39 @@ class ISimulationDataService(ABC):
         pass
     
     # Inventory Operations
+    @abstractmethod
+    def reserve_inventory(self, shelf_id: str, item_id: str, quantity: int) -> bool:
+        """
+        Reserve (pend) inventory for an item on a specific shelf.
+        Increments pending by quantity only if (quantity - pending) >= requested.
+
+        Returns:
+            bool: True if reservation succeeded, False if insufficient availability.
+        """
+        pass
+
+    @abstractmethod
+    def release_inventory(self, shelf_id: str, item_id: str, quantity: int) -> bool:
+        """
+        Release a previously reserved (pending) quantity without consuming stock.
+        Decrements pending by quantity when pending >= quantity.
+
+        Returns:
+            bool: True if release succeeded, False otherwise.
+        """
+        pass
+
+    @abstractmethod
+    def consume_inventory(self, shelf_id: str, item_id: str, quantity: int) -> bool:
+        """
+        Consume reserved inventory on successful task completion.
+        Atomically decreases both pending and quantity by the consumed amount
+        when pending >= quantity and quantity >= amount.
+
+        Returns:
+            bool: True if consumption succeeded, False otherwise.
+        """
+        pass
     @abstractmethod
     def get_shelf_info(self, shelf_id: str) -> Optional[ShelfInfo]:
         """

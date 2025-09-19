@@ -1,5 +1,5 @@
 """
-JobsProcessor implementation - converts orders to robot tasks.
+JobsProcessor implementation - converts orders to robot tasks with robust state management.
 
 This implementation handles the core workflow:
 1. Poll OrderSource for due orders
@@ -13,6 +13,12 @@ SINGLE-SHELF ALLOCATION STRATEGY:
 - Achieves order completion through task composition rather than complex multi-shelf tasks
 - Enables better parallelization and cleaner error handling
 
+ROBUST STATE MANAGEMENT:
+- Prevents double starts with comprehensive state tracking
+- Handles thread death gracefully with emergency cleanup
+- Ensures resource cleanup even when threads die unexpectedly
+- Provides monitoring capabilities for operational visibility
+
 Follows SOLID principles with dependency injection and clean separation of concerns.
 """
 import logging
@@ -22,6 +28,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set, Any
 from dataclasses import dataclass, field
+from enum import Enum
 
 from interfaces.jobs_processor_interface import (
     IJobsProcessor, Order, OrderItem, Priority, OrderStatus,
@@ -31,7 +38,15 @@ from interfaces.order_source_interface import IOrderSource
 from interfaces.simulation_data_service_interface import ISimulationDataService, ItemShelfLocation
 from interfaces.jobs_queue_interface import IJobsQueue
 from interfaces.task_handler_interface import Task, TaskType
-from interfaces.configuration_interface import IConfigurationProvider
+from interfaces.configuration_interface import IBusinessConfigurationProvider
+
+
+class ProcessingState(Enum):
+    """States for the jobs processor."""
+    STOPPED = "stopped"
+    STARTING = "starting"
+    RUNNING = "running"
+    STOPPING = "stopping"
 
 
 @dataclass
@@ -67,7 +82,7 @@ class JobsProcessorImpl(IJobsProcessor):
                  order_source: IOrderSource,
                  simulation_data_service: ISimulationDataService,
                  jobs_queue: IJobsQueue,
-                 config_provider: Optional[IConfigurationProvider] = None,
+                 config_provider: Optional[IBusinessConfigurationProvider] = None,
                  processing_interval: Optional[float] = None,
                  max_concurrent_orders: Optional[int] = None):
         """
@@ -112,10 +127,15 @@ class JobsProcessorImpl(IJobsProcessor):
         self._processor_thread: Optional[threading.Thread] = None
         self._shutdown_event = threading.Event()
         self._lock = threading.RLock()
+
+        # Processing state management
+        self._processing_state = ProcessingState.STOPPED
+        self._processing_started = False  # Tracks if start_processing was ever called
         
         # Processing state
         self._active_orders: Dict[str, Order] = {}
         self._inventory_allocations: Dict[str, List[InventoryAllocation]] = {}
+        # Deprecated: physical shelf locks removed in favor of DB reservations
         self._locked_shelves: Set[str] = set()
         
         # Statistics
@@ -148,39 +168,91 @@ class JobsProcessorImpl(IJobsProcessor):
             self._battery_cost_factor = task_config.battery_cost_factor
     
     def start_processing(self) -> None:
-        """Start the background order processing thread."""
+        """Start the background order processing thread with robust state management."""
         with self._lock:
-            if self._processor_thread and self._processor_thread.is_alive():
-                raise JobsProcessorError("JobsProcessor is already running")
-            
+            # Prevent double starts - check both state and thread status
+            if self._processing_started:
+                if self._processing_state == ProcessingState.RUNNING:
+                    if self._processor_thread and self._processor_thread.is_alive():
+                        raise JobsProcessorError("JobsProcessor is already running")
+                    else:
+                        # Thread died unexpectedly - clean up and allow restart
+                        self._logger.warning("JobsProcessor thread died unexpectedly, cleaning up")
+                        self._cleanup_dead_thread()
+                elif self._processing_state in [ProcessingState.STARTING, ProcessingState.STOPPING]:
+                    raise JobsProcessorError(f"JobsProcessor is in {self._processing_state.value} state")
+                # If STOPPED, allow restart
+
+            # Update state
+            self._processing_state = ProcessingState.STARTING
+            self._processing_started = True
             self._shutdown_event.clear()
+
+            # Create and start new thread
             self._processor_thread = threading.Thread(
                 target=self._processor_loop,
                 name="JobsProcessor",
                 daemon=True
             )
             self._processor_thread.start()
-            self._logger.info("JobsProcessor started")
-    
-    def stop_processing(self) -> None:
-        """Stop the background processing thread gracefully."""
+
+            # Update state to running
+            self._processing_state = ProcessingState.RUNNING
+            self._logger.info("JobsProcessor started successfully")
+
+    def _cleanup_dead_thread(self) -> None:
+        """Clean up resources when a thread dies unexpectedly."""
         with self._lock:
-            if not self._processor_thread or not self._processor_thread.is_alive():
-                self._logger.warning("JobsProcessor is not running")
+            self._logger.warning("Performing emergency cleanup after thread death")
+
+            # Clean up all allocated resources
+            self._cleanup_allocations()
+
+            # Reset thread reference
+            self._processor_thread = None
+
+            # Reset state to allow restart
+            self._processing_state = ProcessingState.STOPPED
+
+            self._logger.info("Emergency cleanup completed")
+
+    def get_processing_state(self) -> str:
+        """Get the current processing state for monitoring."""
+        with self._lock:
+            return self._processing_state.value
+
+    def is_processing_started(self) -> bool:
+        """Check if processing has been started at least once."""
+        with self._lock:
+            return self._processing_started
+
+    def stop_processing(self) -> None:
+        """Stop the background processing thread gracefully with state management."""
+        with self._lock:
+            if self._processing_state == ProcessingState.STOPPED:
+                self._logger.info("JobsProcessor is already stopped")
                 return
-            
+
+            if not self._processor_thread or not self._processor_thread.is_alive():
+                self._logger.warning("JobsProcessor thread is not alive, performing cleanup")
+                self._cleanup_dead_thread()
+                return
+
             self._logger.info("Stopping JobsProcessor...")
+            self._processing_state = ProcessingState.STOPPING
             self._shutdown_event.set()
-            
+
             # Wait for thread to finish with timeout
             self._processor_thread.join(timeout=10.0)
             if self._processor_thread.is_alive():
                 self._logger.error("JobsProcessor thread did not stop gracefully")
+                # Force cleanup even if thread didn't stop
+                self._cleanup_dead_thread()
             else:
-                self._logger.info("JobsProcessor stopped")
-            
-            # Cleanup allocated resources
-            self._cleanup_allocations()
+                self._logger.info("JobsProcessor stopped gracefully")
+                # Normal cleanup
+                self._cleanup_allocations()
+                self._processing_state = ProcessingState.STOPPED
     
     def process_orders_once(self) -> ProcessingResult:
         """
@@ -228,7 +300,10 @@ class JobsProcessorImpl(IJobsProcessor):
                     error_msg = f"Failed to process order {order.order_id}: {str(e)}"
                     self._logger.error(error_msg, exc_info=True)
                     errors.append(error_msg)
-                    
+
+                    # Clean up any resources allocated during processing of this order
+                    self._cleanup_order_allocations(order.order_id)
+
                     # Update order status to failed
                     try:
                         self._order_source.update_order_status(
@@ -349,9 +424,19 @@ class JobsProcessorImpl(IJobsProcessor):
                 self._shutdown_event.wait(self._processing_interval)
                 
             except Exception as e:
-                self._logger.error(f"Unexpected error in processor loop: {e}", exc_info=True)
-                # Continue processing after error
-                self._shutdown_event.wait(self._processing_interval)
+                try:
+                    self._logger.error(f"Unexpected error in processor loop: {e}", exc_info=True)
+                    # Continue processing after error
+                    self._shutdown_event.wait(self._processing_interval)
+                except Exception as log_error:
+                    # If logging fails, at least try to wait
+                    print(f"CRITICAL: JobsProcessor logging failed: {log_error}, continuing...")
+                    try:
+                        self._shutdown_event.wait(self._processing_interval)
+                    except Exception as wait_error:
+                        print(f"CRITICAL: JobsProcessor wait failed: {wait_error}, thread may die")
+                        # Thread will die here, but cleanup will happen on next start
+                        break
         
         self._logger.info("JobsProcessor loop ended")
     
@@ -390,15 +475,7 @@ class JobsProcessorImpl(IJobsProcessor):
                         f"No shelf locations found for item {order_item.item_id}"
                     )
                 
-                # Get shelf info to check inventory
-                shelf_info = self._simulation_data_service.get_shelf_info(shelf_id)
-                if not shelf_info:
-                    raise JobsProcessorError(f"Shelf {shelf_id} not found")
-                
-                # For now, assume sufficient inventory (in real implementation, we'd check actual quantities)
-                # TODO: Add inventory quantity tracking to SimulationDataService
-                
-                # Allocate inventory and create tasks
+                # Allocate inventory and create tasks (reservation-based)
                 tasks_for_item = self._allocate_and_create_tasks(order, order_item, shelf_id)
                 tasks_created += len(tasks_for_item)
                 
@@ -410,8 +487,19 @@ class JobsProcessorImpl(IJobsProcessor):
             return tasks_created
             
         except Exception as e:
-            # Clean up on failure
-            self._cleanup_order_allocations(order.order_id)
+            # Clean up on failure (release all reservations for this order)
+            try:
+                with self._lock:
+                    allocations = list(self._inventory_allocations.get(order.order_id, []))
+                for allocation in allocations:
+                    try:
+                        self._simulation_data_service.release_inventory(
+                            allocation.shelf_id, allocation.item_id, allocation.quantity_allocated
+                        )
+                    except Exception as re:
+                        self._logger.error(f"Failed to release reservation on {allocation.shelf_id}/{allocation.item_id}: {re}")
+            finally:
+                self._cleanup_order_allocations(order.order_id)
             with self._lock:
                 if order.order_id in self._active_orders:
                     del self._active_orders[order.order_id]
@@ -437,20 +525,47 @@ class JobsProcessorImpl(IJobsProcessor):
             List[Task]: Created robot tasks (one task per shelf)
         """
         tasks = []
-        
-        # Check if shelf is already locked
-        with self._lock:
-            if shelf_id in self._locked_shelves:
-                raise JobsProcessorError(f"Shelf {shelf_id} is already locked")
-            
-            # Lock the shelf for this task
-            self._locked_shelves.add(shelf_id)
+
+        # Phase 3: Reservation-based allocation (no in-memory shelf locking)
+        # Try to reserve on the suggested shelf first; if not enough, try alternative shelves
+        reserved_shelf_id = None
+        try:
+            if self._simulation_data_service.reserve_inventory(
+                shelf_id, order_item.item_id, order_item.quantity
+            ):
+                reserved_shelf_id = shelf_id
+            else:
+                # Fallback: search other shelves with available quantity
+                self._logger.warning(f"Primary shelf {shelf_id} insufficient for {order_item.quantity} of {order_item.item_id}, trying alternatives")
+                try:
+                    candidate_locations = self._simulation_data_service.get_item_shelf_locations(order_item.item_id)
+                except Exception as lookup_err:
+                    raise JobsProcessorError(f"Failed to lookup shelves for {order_item.item_id}: {lookup_err}") from lookup_err
+                if not candidate_locations:
+                    self._logger.warning(f"No alternative shelves found for {order_item.item_id} - only primary shelf {shelf_id} exists")
+                for loc in candidate_locations:
+                    if loc.shelf_id == shelf_id:
+                        continue
+                    if loc.quantity >= order_item.quantity:
+                        if self._simulation_data_service.reserve_inventory(
+                            loc.shelf_id, order_item.item_id, order_item.quantity
+                        ):
+                            reserved_shelf_id = loc.shelf_id
+                            self._logger.info(f"Fallback reservation successful: {order_item.quantity} of {order_item.item_id} on {loc.shelf_id} instead of {shelf_id}")
+                            break
+            if reserved_shelf_id is None:
+                self._logger.warning(f"No shelves available to reserve {order_item.quantity} of {order_item.item_id} - inventory exhausted")
+                raise JobsProcessorError(
+                    f"Insufficient inventory to reserve {order_item.quantity} of {order_item.item_id}"
+                )
+        except Exception as e:
+            raise JobsProcessorError(f"Reservation failed for {order_item.item_id}: {e}") from e
         
         # Create allocation record
         allocation = InventoryAllocation(
             order_id=order.order_id,
             item_id=order_item.item_id,
-            shelf_id=shelf_id,
+            shelf_id=reserved_shelf_id,
             quantity_allocated=order_item.quantity,
             quantity_requested=order_item.quantity
         )
@@ -462,7 +577,7 @@ class JobsProcessorImpl(IJobsProcessor):
         task = Task.create_pick_and_deliver_task(
             task_id=f"task_{uuid.uuid4().hex[:8]}",
             order_id=order.order_id,
-            shelf_id=shelf_id,
+            shelf_id=reserved_shelf_id,
             item_id=order_item.item_id,
             quantity_to_pick=order_item.quantity,
             order_priority=order.priority.value.lower(),
@@ -476,7 +591,7 @@ class JobsProcessorImpl(IJobsProcessor):
         tasks.append(task)
         
         self._logger.debug(f"Created single-shelf task {task.task_id} for {order_item.quantity} of "
-                         f"{order_item.item_id} from shelf {shelf_id}")
+                         f"{order_item.item_id} from shelf {reserved_shelf_id}")
         
         return tasks
     
@@ -484,9 +599,8 @@ class JobsProcessorImpl(IJobsProcessor):
         """Clean up inventory allocations for a specific order."""
         with self._lock:
             if order_id in self._inventory_allocations:
-                # Unlock shelves allocated to this order
-                for allocation in self._inventory_allocations[order_id]:
-                    self._locked_shelves.discard(allocation.shelf_id)
+                # No physical locks to release; reservations are released elsewhere on failure
+                # Only remove allocation records here
                 
                 # Remove allocation records
                 del self._inventory_allocations[order_id]
@@ -496,7 +610,7 @@ class JobsProcessorImpl(IJobsProcessor):
     def _cleanup_allocations(self) -> None:
         """Clean up all inventory allocations."""
         with self._lock:
-            self._locked_shelves.clear()
+            # No physical locks to clear
             self._inventory_allocations.clear()
             self._active_orders.clear()
             self._logger.info("All inventory allocations cleaned up")
@@ -571,9 +685,12 @@ class JobsProcessorImpl(IJobsProcessor):
             )
             
         except Exception as e:
-            error_msg = f"Failed to process order {order.order_id}: {str(e)}"
+            error_msg = f" {order.order_id}: {str(e)}"
             self._logger.error(error_msg, exc_info=True)
-            
+
+            # Clean up any resources allocated during processing of this order
+            self._cleanup_order_allocations(order.order_id)
+
             # Update order status to failed
             try:
                 self._order_source.update_order_status(
@@ -626,7 +743,10 @@ class JobsProcessorImpl(IJobsProcessor):
         except Exception as e:
             error_msg = f"Failed to process order {order.order_id}: {str(e)}"
             self._logger.error(error_msg, exc_info=True)
-            
+
+            # Clean up any resources allocated during processing of this order
+            self._cleanup_order_allocations(order.order_id)
+
             processing_time = time.time() - start_time
             self._update_stats(0, 0, 1, processing_time)
             

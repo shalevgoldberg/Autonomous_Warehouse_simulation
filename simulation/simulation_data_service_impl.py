@@ -372,14 +372,30 @@ class SimulationDataServiceImpl(ISimulationDataService):
                         shelves[shelf['shelf_id']] = (cell_x, cell_y)
                     
                     # Create map data from warehouse map and database shelves
+                    # Scan warehouse map for all zone types
+                    dropoff_zones = []
+                    charging_zones = []
+                    idle_zones = []
+
+                    for y in range(self.warehouse_map.height):
+                        for x in range(self.warehouse_map.width):
+                            cell_value = self.warehouse_map.grid[y, x]
+                            if cell_value == 3:  # Charging zone
+                                charging_zones.append((x, y))
+                            elif cell_value == 4:  # Idle zone
+                                idle_zones.append((x, y))
+                            elif cell_value == 5:  # Drop-off station
+                                dropoff_zones.append((x, y))
+
                     map_data = MapData(
                         width=self.warehouse_map.width,
                         height=self.warehouse_map.height,
                         cell_size=self.warehouse_map.grid_size,
                         obstacles=self.warehouse_map.get_obstacle_cells(),
                         shelves=shelves,
-                        dropoff_zones=[(9, 9), (10, 9)],  # TODO: Make configurable
-                        charging_zones=[(0, 0), (1, 0)]   # TODO: Make configurable
+                        dropoff_zones=dropoff_zones,
+                        charging_zones=charging_zones,
+                        idle_zones=idle_zones
                     )
                     
                     # Update cache
@@ -568,6 +584,7 @@ class SimulationDataServiceImpl(ISimulationDataService):
                     )
                     released = cur.rowcount > 0
                     conn.commit()
+                    print(f"SimulationDataService {bay_id}: release_bay_lock: {released}") # TODO: remove
                     return released
         except Exception as e:
             logger.error("Failed to release bay lock %s by %s: %s", bay_id, robot_id, e)
@@ -603,7 +620,52 @@ class SimulationDataServiceImpl(ISimulationDataService):
         except Exception as e:
             logger.error("Failed to cleanup expired bay locks: %s", e)
             raise SimulationDataServiceError(f"Failed to cleanup expired bay locks: {e}")
-    
+
+    def get_bay_lock_info(self, bay_id: str) -> Optional[Dict]:
+        """
+        Get information about a bay lock.
+
+        Args:
+            bay_id: Bay identifier to check
+
+        Returns:
+            Dict with lock information if locked, None if unlocked.
+            Format: {
+                'robot_id': str,
+                'locked_at': float,  # timestamp
+                'heartbeat_at': float,  # timestamp
+                'lock_timeout_seconds': int
+            }
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(
+                        """
+                        SELECT robot_id, locked_at, heartbeat_at, lock_timeout_seconds
+                        FROM bay_locks
+                        WHERE bay_id = %s
+                        """,
+                        (bay_id,)
+                    )
+                    row = cur.fetchone()
+
+                    if row:
+                        # Convert datetime objects to timestamps for consistency
+                        return {
+                            'robot_id': row['robot_id'],
+                            'locked_at': row['locked_at'].timestamp() if row['locked_at'] else None,
+                            'heartbeat_at': row['heartbeat_at'].timestamp() if row['heartbeat_at'] else None,
+                            'lock_timeout_seconds': row['lock_timeout_seconds']
+                        }
+                    else:
+                        # No lock exists for this bay
+                        return None
+
+        except Exception as e:
+            logger.error("Failed to get bay lock info for %s: %s", bay_id, e)
+            raise SimulationDataServiceError(f"Failed to get bay lock info: {e}")
+
     # Shelf Operations
     def lock_shelf(self, shelf_id: str, robot_id: str) -> bool:
         """
@@ -820,11 +882,12 @@ class SimulationDataServiceImpl(ISimulationDataService):
         try:
             with self._get_connection() as conn:
                 with conn.cursor() as cur:
+                    # Prefer shelves with highest available (quantity - pending)
                     cur.execute("""
-                        SELECT si.shelf_id 
+                        SELECT si.shelf_id
                         FROM shelf_inventory si
-                        WHERE si.item_id = %s AND si.quantity > 0
-                        ORDER BY si.quantity DESC
+                        WHERE si.item_id = %s AND (si.quantity - si.pending) > 0
+                        ORDER BY (si.quantity - si.pending) DESC, si.quantity DESC
                         LIMIT 1
                     """, (item_id,))
                     
@@ -1096,18 +1159,17 @@ class SimulationDataServiceImpl(ISimulationDataService):
                     if not item:
                         return None
                     
-                    # Get inventory across all shelves
+                    # Get inventory across all shelves (pending-aware)
                     cur.execute("""
-                        SELECT si.shelf_id, si.quantity, s.is_locked
+                        SELECT si.shelf_id, si.quantity, si.pending
                         FROM shelf_inventory si
-                        JOIN shelves s ON si.shelf_id = s.shelf_id
                         WHERE si.item_id = %s
                     """, (item_id,))
                     
                     shelf_data = cur.fetchall()
                     
                     total_quantity = sum(row['quantity'] for row in shelf_data)
-                    available_quantity = sum(row['quantity'] for row in shelf_data if not row['is_locked'])
+                    available_quantity = sum(max(0, row['quantity'] - row.get('pending', 0)) for row in shelf_data)
                     shelf_locations = [row['shelf_id'] for row in shelf_data]
                     
                     return ItemInventoryInfo(
@@ -1121,6 +1183,101 @@ class SimulationDataServiceImpl(ISimulationDataService):
         except Exception as e:
             logger.error(f"Failed to get item inventory for {item_id}: {e}")
             raise SimulationDataServiceError(f"Failed to get item inventory: {e}")
+
+    # --- Reservation primitives (Phase 2) ---
+    def reserve_inventory(self, shelf_id: str, item_id: str, quantity: int) -> bool:
+        """
+        Atomically reserve (pend) inventory on a shelf when available.
+        Returns True on success, False if insufficient availability.
+        """
+        if quantity <= 0:
+            return True
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE shelf_inventory
+                        SET pending = pending + %s,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE shelf_id = %s AND item_id = %s
+                              AND (quantity - pending) >= %s
+                        """,
+                        (quantity, shelf_id, item_id, quantity)
+                    )
+                    if cur.rowcount == 1:
+                        conn.commit()
+                        logger.debug(f"Reserved {quantity} of {item_id} on {shelf_id}")
+                        return True
+                    conn.rollback()
+                    logger.warning(f"Failed to reserve {quantity} of {item_id} on {shelf_id} - insufficient availability")
+                    return False
+        except Exception as e:
+            logger.error(f"Failed to reserve inventory {item_id} on {shelf_id}: {e}")
+            raise SimulationDataServiceError(f"reserve_inventory failed: {e}")
+
+    def release_inventory(self, shelf_id: str, item_id: str, quantity: int) -> bool:
+        """
+        Atomically release (unpend) a previously reserved quantity.
+        Returns True on success, False otherwise.
+        """
+        if quantity <= 0:
+            return True
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE shelf_inventory
+                        SET pending = pending - %s,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE shelf_id = %s AND item_id = %s
+                              AND pending >= %s
+                        """,
+                        (quantity, shelf_id, item_id, quantity)
+                    )
+                    if cur.rowcount == 1:
+                        conn.commit()
+                        logger.debug(f"Released {quantity} of {item_id} on {shelf_id}")
+                        return True
+                    conn.rollback()
+                    logger.warning(f"Failed to release {quantity} of {item_id} on {shelf_id} - insufficient pending quantity")
+                    return False
+        except Exception as e:
+            logger.error(f"Failed to release inventory {item_id} on {shelf_id}: {e}")
+            raise SimulationDataServiceError(f"release_inventory failed: {e}")
+
+    def consume_inventory(self, shelf_id: str, item_id: str, quantity: int) -> bool:
+        """
+        Atomically consume reserved inventory on successful completion.
+        Returns True on success, False otherwise.
+        """
+        if quantity <= 0:
+            return True
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE shelf_inventory
+                        SET pending = pending - %s,
+                            quantity = quantity - %s,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE shelf_id = %s AND item_id = %s
+                              AND pending >= %s AND quantity >= %s
+                        """,
+                        (quantity, quantity, shelf_id, item_id, quantity, quantity)
+                    )
+                    if cur.rowcount == 1:
+                        conn.commit()
+                        logger.info(f"Consumed {quantity} of {item_id} on {shelf_id}")
+                        return True
+                    conn.rollback()
+                    logger.warning(f"Failed to consume {quantity} of {item_id} on {shelf_id} - insufficient pending or total quantity")
+                    return False
+        except Exception as e:
+            logger.error(f"Failed to consume inventory {item_id} on {shelf_id}: {e}")
+            raise SimulationDataServiceError(f"consume_inventory failed: {e}")
     
     def get_item_shelf_locations(self, item_id: str) -> List['ItemShelfLocation']:
         """
@@ -1136,20 +1293,19 @@ class SimulationDataServiceImpl(ISimulationDataService):
             with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
-                        SELECT si.shelf_id, si.quantity, s.is_locked, s.locked_by
+                        SELECT si.shelf_id, si.quantity, si.pending
                         FROM shelf_inventory si
-                        JOIN shelves s ON si.shelf_id = s.shelf_id
                         WHERE si.item_id = %s
-                        ORDER BY si.quantity DESC
+                        ORDER BY (si.quantity - si.pending) DESC, si.quantity DESC
                     """, (item_id,))
                     
                     locations = []
                     for row in cur.fetchall():
                         locations.append(ItemShelfLocation(
+                            item_id=item_id,
                             shelf_id=row['shelf_id'],
-                            quantity=row['quantity'],
-                            is_reserved=row['is_locked'],
-                            reserved_by=row['locked_by']
+                            quantity=max(0, row['quantity'] - row.get('pending', 0)),
+                            last_updated=time.time()
                         ))
                     
                     return locations
@@ -1553,6 +1709,7 @@ class SimulationDataServiceImpl(ISimulationDataService):
             with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     # Use the database function we created
+                    logger.debug(f"[Diag][SDS] Requesting DB release for {box_id} by {robot_id}")
                     cur.execute("SELECT release_conflict_box_lock(%s, %s)", 
                                (box_id, robot_id))
                     result = cur.fetchone()
@@ -1561,9 +1718,9 @@ class SimulationDataServiceImpl(ISimulationDataService):
                     conn.commit()
                     
                     if success:
-                        logger.debug(f"Released conflict box lock: {box_id} by robot {robot_id}")
+                        logger.debug(f"[Diag][SDS] DB release success for {box_id} by {robot_id}")
                     else:
-                        logger.debug(f"Failed to release conflict box lock: {box_id} by robot {robot_id}")
+                        logger.debug(f"[Diag][SDS] DB release failed for {box_id} by {robot_id}")
                     
                     return success
                     

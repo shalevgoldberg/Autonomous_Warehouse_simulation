@@ -33,12 +33,21 @@ CREATE TABLE shelf_inventory (
     shelf_id VARCHAR(36) NOT NULL,
     item_id VARCHAR(36) NOT NULL,
     quantity INTEGER NOT NULL DEFAULT 0,
+    -- Pending quantity reserved by accepted tasks but not yet consumed
+    pending INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (shelf_id) REFERENCES shelves(shelf_id) ON DELETE CASCADE,
     FOREIGN KEY (item_id) REFERENCES items(item_id) ON DELETE CASCADE,
     UNIQUE(shelf_id, item_id)
 );
+
+-- Data integrity constraints for reservations
+ALTER TABLE shelf_inventory
+    ADD CONSTRAINT chk_shelf_inventory_pending_non_negative
+        CHECK (pending >= 0),
+    ADD CONSTRAINT chk_shelf_inventory_pending_not_exceed_quantity
+        CHECK (pending <= quantity);
 
 -- 4. Robots Table - Store only robot definitions
 CREATE TABLE robots (
