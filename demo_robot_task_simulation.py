@@ -8,11 +8,20 @@ Demonstrates a fully integrated robot task simulation with:
 - PICK_AND_DELIVER task execution (shelf → drop-off → idle)
 - Real database integration with inventory management
 - Real-time visualization
+- LiDAR collision avoidance system with live scan data logging
 - Clean architecture with loose coupling
 
 ⚠️  DEMO CONFIGURATION: Lane tolerance set to 3.0m (too soft for production!)
     This allows tasks to complete despite navigation issues. For production,
     use 0.1-0.3m tolerance for safe warehouse operation.
+
+LiDAR Features in Demo:
+- Real-time scan data logging (every 3 seconds)
+- Individual beam distance data (when ≤10 rays)
+- Obstacle detection and distance reporting
+- LiDAR operational status monitoring
+- Detailed scan performance summaries per task
+- Configured for 5 beams for optimal logging visibility
 
 Run with: python demo_robot_task_simulation.py
 """
@@ -23,6 +32,7 @@ import threading
 from typing import List, Optional
 from unittest.mock import MagicMock
 import logging
+import numpy as np
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -74,7 +84,7 @@ class TaskSimulationManager:
             self.physics = SharedMuJoCoPhysics(shared_engine, robot_id="robot_1")
         except Exception as e:
             print(f"   ⚠️  SharedMuJoCoEngine not available ({e}); falling back to SimpleMuJoCoPhysics")
-            self.physics = SimpleMuJoCoPhysics(self.warehouse_map)
+            self.physics = SimpleMuJoCoPhysics(self.warehouse_map, robot_id="robot_1")
         print(f"   ✅ Physics ready: {self.physics.is_simulation_ready()}")
         
         # Configuration provider already initialized above
@@ -96,10 +106,23 @@ class TaskSimulationManager:
         # Populate inventory for demo
         self._populate_demo_inventory()
         
-        # Create robot agent with real services
+        # Create robot agent with real services using configuration provider
+        # This ensures all parameters including new robot dimensions are properly loaded
+        self.robot_config = self.config_provider.get_robot_config("warehouse_robot_1")
+
+        # Override demo-specific parameters for stability
+        from interfaces.configuration_interface import RobotConfig
         self.robot_config = RobotConfig(
             robot_id="warehouse_robot_1",
-            max_speed=0.5,  # Reduced for stability with lower actuator gains
+            # Use configured robot dimensions
+            robot_width=self.robot_config.robot_width,
+            robot_height=self.robot_config.robot_height,
+            robot_length=self.robot_config.robot_length,
+            # Use proportional wheel parameters
+            wheel_base_ratio=self.robot_config.wheel_base_ratio,
+            wheel_radius_ratio=self.robot_config.wheel_radius_ratio,
+            # Demo-specific overrides for stability
+            max_speed=0.5,  # supposed to be 0.5, reduced
             control_frequency=10.0,
             motion_frequency=100.0,
             cell_size=1.0,
@@ -111,12 +134,9 @@ class TaskSimulationManager:
             max_linear_velocity=0.5,  # Reduced for stability with lower actuator gains
             max_angular_velocity=0.5,  # Reduced for stability
             movement_speed=0.5,  # Reduced for stability with lower actuator gains
-            wheel_base=0.5,
-            wheel_radius=0.1,
             picking_duration=2.0,
             dropping_duration=2.0,
             position_tolerance=0.1,
-            charging_threshold=0.2,
             emergency_stop_distance=0.5,
             stall_recovery_timeout=10.0
         )
@@ -140,7 +160,42 @@ class TaskSimulationManager:
             simulation_data_service=self.simulation_data_service
         )
         print(f"   ✅ Robot agent created: {self.robot_config.robot_id}")
-        
+
+        # Configure LiDAR for demo with fewer rays for better logging
+        if hasattr(self.robot, 'lidar_service') and self.robot.lidar_service is not None:
+            try:
+                # Create demo config with 5 rays for detailed logging
+                from interfaces.lidar_interface import LiDARConfig
+                demo_lidar_config = LiDARConfig(
+                    enabled=True,
+                    num_rays=5,  # Reduced for demo logging
+                    max_range=3.0,
+                    min_range=0.2,
+                    scan_frequency=10.0,
+                    field_of_view=90.0,  # 90° spread over 5 rays
+                    safety_distance=0.8,
+                    enable_scan_caching=True,
+                    scan_cache_ttl=0.1
+                )
+
+                # Update the LiDAR service with demo config
+                self.robot.lidar_service.set_config("robot_1", demo_lidar_config)
+
+                # Wait for configuration to be eligible for application (100ms minimum)
+                import time
+                time.sleep(0.15)  # Wait 150ms to be safe
+
+                # Apply the configuration
+                if hasattr(self.robot.lidar_service, '_apply_pending_config'):
+                    self.robot.lidar_service._apply_pending_config()
+
+                print(f"   🔍 LiDAR configured for demo: {demo_lidar_config.num_rays} rays, "
+                      f"{demo_lidar_config.max_range}m range, {demo_lidar_config.field_of_view}° FOV")
+            except Exception as e:
+                print(f"   🔍 LiDAR: Demo configuration failed ({str(e)[:50]}...)")
+        else:
+            print("   🔍 LiDAR: Not available (requires mujoco_authoritative physics)")
+
         # Configure lane follower for DEMO (very soft tolerance)
         self.robot.lane_follower.set_config(
             LaneFollowingConfig(
@@ -158,7 +213,8 @@ class TaskSimulationManager:
         # Visualization
         self.visualization: Optional[IVisualization] = MujocoVisualization(
             state_holder=self.robot.state_holder,
-            warehouse_map=self.warehouse_map
+            warehouse_map=self.warehouse_map,
+            robot_config=self.robot_config
         )
         self.visualization_thread: Optional[VisualizationThread] = None
         
@@ -254,10 +310,40 @@ class TaskSimulationManager:
             print(f"   ⚠️ Visualization not started: {e}")
         
         # Give robot initial position
-        initial_pos = self.warehouse_map.grid_to_world(1, 1)
+        initial_pos = self.warehouse_map.grid_to_world(5, 4)
         self.physics.reset_robot_position(initial_pos[0], initial_pos[1], 0.0)
-        
+
         print("   ✅ Robot positioned at start")
+
+        # Initial LiDAR test
+        if hasattr(self.robot, 'lidar_service') and self.robot.lidar_service is not None:
+            try:
+                # Give LiDAR a moment to initialize
+                time.sleep(0.1)
+                initial_scan = self.robot.get_lidar_scan()
+                if initial_scan is not None:
+                    valid_points = initial_scan.valid_mask.sum()
+                    total_rays = len(initial_scan.distances)
+
+                    if total_rays <= 10 and valid_points > 0:
+                        # Show individual beam data for few rays
+                        beam_data = []
+                        for i in range(total_rays):
+                            angle_deg = initial_scan.angles[i] * 180.0 / 3.14159
+                            if initial_scan.valid_mask[i]:
+                                beam_data.append(f"{angle_deg:.0f}°:{initial_scan.distances[i]:.1f}m")
+                            else:
+                                beam_data.append(f"{angle_deg:.0f}°:invalid")
+                        beam_str = " | ".join(beam_data)
+                        print(f"   🔍 LiDAR test scan: [{beam_str}] - System ready!")
+                    else:
+                        print(f"   🔍 LiDAR test scan: {valid_points}/{total_rays} rays valid - System ready!")
+                else:
+                    print("   🔍 LiDAR: Initializing scan data...")
+            except Exception as e:
+                print(f"   🔍 LiDAR: Initialization check failed ({str(e)[:30]}...)")
+        else:
+            print("   🔍 LiDAR: Not available for this simulation")
     
     def stop_simulation(self) -> None:
         """Stop complete simulation."""
@@ -404,10 +490,68 @@ def demo_automated_tasks():
                         position = robot_status.get('position', [0.0, 0.0, 0.0])
                         motion_status = robot_status.get('motion_status', 'unknown')
                         
+                        # Get battery level from robot status
+                        battery_level = robot_status.get('battery_level', 0.0)
+
+                        # Get conflict box status
+                        acquired_boxes = robot_status.get('acquired_conflict_boxes', [])
+                        pending_box = robot_status.get('pending_conflict_box')
+
+                        # Format conflict box info
+                        if acquired_boxes:
+                            conflict_info = f"Locks: {acquired_boxes}"
+                        else:
+                            conflict_info = "Locks: None"
+
+                        if pending_box:
+                            conflict_info += f" | Pending: {pending_box}"
+                        else:
+                            conflict_info += " | Pending: None"
+
+                        # Get LiDAR scan data
+                        lidar_info = "LiDAR: N/A"
+                        if hasattr(sim.robot, 'lidar_service') and sim.robot.lidar_service is not None:
+                            try:
+                                lidar_scan = sim.robot.get_lidar_scan()
+                                if lidar_scan is not None:
+                                    valid_points = lidar_scan.valid_mask.sum()
+                                    total_rays = len(lidar_scan.distances)
+
+                                    if valid_points > 0:
+                                        distances = lidar_scan.distances[lidar_scan.valid_mask]
+                                        min_dist = distances.min()
+                                        max_dist = distances.max()
+
+                                        # For few rays, show individual beam data
+                                        if total_rays <= 10:
+                                            beam_distances = []
+                                            for i in range(total_rays):
+                                                angle_deg = lidar_scan.angles[i] * 180.0 / 3.14159
+                                                if lidar_scan.valid_mask[i]:
+                                                    beam_distances.append(f"{angle_deg:.0f}°:{lidar_scan.distances[i]:.2f}m")
+                                                else:
+                                                    beam_distances.append(f"{angle_deg:.0f}°:invalid")
+                                            beam_str = " | ".join(beam_distances)
+                                            lidar_info = f"LiDAR: [{beam_str}]"
+                                        else:
+                                            # For many rays, show summary
+                                            lidar_info = f"LiDAR: {valid_points}/{total_rays} valid, {min_dist:.2f}-{max_dist:.2f}m"
+                                    else:
+                                        lidar_info = f"LiDAR: No obstacles ({total_rays} rays)"
+                                elif sim.robot.is_lidar_operational():
+                                    lidar_info = "LiDAR: Scanning..."
+                                else:
+                                    lidar_info = "LiDAR: Offline"
+                            except Exception as e:
+                                lidar_info = f"LiDAR: Error ({str(e)[:20]}...)"
+
                         print(f"   Status: {operational_status} | "
                               f"Progress: {progress:.1%} | "
                               f"Position: ({position[0]:.2f}, {position[1]:.2f}) | "
-                              f"Motion: {motion_status}")
+                              f"Motion: {motion_status} | "
+                              f"Battery: {battery_level:.1%} | "
+                              f"{conflict_info} | "
+                              f"{lidar_info}")
                     
                     # Check if task completed
                     task_status = robot_status.get('task_status')
@@ -422,6 +566,39 @@ def demo_automated_tasks():
                                 print(f"   ✅ Task {completed_task.task_id} SUCCESSFULLY completed!")
                                 print(f"      Final position: ({final_position[0]:.2f}, {final_position[1]:.2f})")
                                 print(f"      🎯 PICK_AND_DELIVER: Shelf → Drop-off → Idle Zone")
+
+                                # Log LiDAR performance summary for completed task
+                                if hasattr(sim.robot, 'lidar_service') and sim.robot.lidar_service is not None:
+                                    try:
+                                        final_scan = sim.robot.get_lidar_scan()
+                                        if final_scan is not None:
+                                            valid_points = final_scan.valid_mask.sum()
+                                            total_rays = len(final_scan.distances)
+
+                                            if valid_points > 0:
+                                                distances = final_scan.distances[final_scan.valid_mask]
+                                                avg_distance = distances.mean()
+
+                                                # Show detailed beam data for few rays
+                                                if total_rays <= 10:
+                                                    beam_details = []
+                                                    for i in range(total_rays):
+                                                        angle_deg = final_scan.angles[i] * 180.0 / 3.14159
+                                                        if final_scan.valid_mask[i]:
+                                                            beam_details.append(f"{angle_deg:.0f}°:{final_scan.distances[i]:.2f}m")
+                                                        else:
+                                                            beam_details.append(f"{angle_deg:.0f}°:invalid")
+                                                    beam_summary = " | ".join(beam_details)
+                                                    print(f"      🔍 LiDAR Summary: [{beam_summary}]")
+                                                else:
+                                                    print(f"      🔍 LiDAR Summary: {valid_points}/{total_rays} rays valid, "
+                                                          f"avg distance: {avg_distance:.2f}m")
+                                            else:
+                                                print(f"      🔍 LiDAR Summary: No obstacles detected in final scan ({total_rays} rays)")
+                                        else:
+                                            print("      🔍 LiDAR Summary: No scan data available")
+                                    except Exception as e:
+                                        print(f"      🔍 LiDAR Summary: Error retrieving final scan ({str(e)[:30]}...)")
                                 break
                             else:
                                 print(f"   ❌ Task {completed_task.task_id} failed with status: {completed_task.status.value}")
@@ -444,6 +621,29 @@ def demo_automated_tasks():
         
         print(f"\n🎉 Completed {task_cycle - 1} PICK_AND_DELIVER tasks successfully!")
         print("   📦 Full lifecycle: SHELF → DROP-OFF → IDLE ZONE")
+
+        # KPI Overview (Phase 5)
+        try:
+            export_enabled = sim.config_provider.get_value("kpi.export_csv_enabled", True).value
+            export_path = sim.config_provider.get_value("kpi.export_csv_path", "kpi_results.csv").value
+        except Exception:
+            export_enabled = True
+            export_path = "kpi_results.csv"
+
+        try:
+            overview = sim.simulation_data_service.get_kpi_overview()
+            print("\n📊 KPI SUMMARY:")
+            print(f"   ✅ Tasks Completed: {overview.get('tasks_completed', 0)}")
+            print(f"   ⏱️  Avg Task Time: {overview.get('avg_task_time_seconds', 0.0):.2f}s")
+            print(f"   📈 Success Rate: {overview.get('task_success_rate', 0.0):.1f}%")
+            print(f"   🧩 PD Completed: {overview.get('pd_tasks_completed', 0)} | PD Failed: {overview.get('pd_tasks_failed', 0)} | PD Success: {overview.get('pd_success_rate', 0):.1f}% | PD Avg Time: {overview.get('pd_avg_task_time_seconds', 0):.1f}s")
+            if export_enabled:
+                if sim.simulation_data_service.export_kpi_overview_csv(overview, export_path):
+                    print(f"   💾 KPI CSV exported: {export_path}")
+                else:
+                    print("   ⚠️  KPI CSV export failed (see logs)")
+        except Exception as e:
+            print(f"   ⚠️  KPI overview unavailable: {e}")
         
     except KeyboardInterrupt:
         print("\n⚠️  Simulation interrupted by user")

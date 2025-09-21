@@ -212,6 +212,7 @@ class TaskHandlerImpl(ITaskHandler):
         # Task state
         self._current_task: Optional[Task] = None
         self._operational_status = OperationalStatus.IDLE
+        self._status_change_time: Optional[float] = None
         # Phase-specific initialization flags
         self._picking_initialized: bool = False
         self._task_phase = TaskPhase.COMPLETED
@@ -284,6 +285,12 @@ class TaskHandlerImpl(ITaskHandler):
             self._battery_check_interval = task_config.battery_check_interval
             self._safe_interrupt_task_types = [TaskType(task_type) for task_type in task_config.safe_interrupt_tasks]
             self._prevent_duplicate_charging = task_config.prevent_duplicate_charging
+            # Availability during charging
+            try:
+                self._charging_availability_threshold = float(task_config.charging_availability_threshold)
+            except Exception:
+                self.logger.warning("Invalid charging availability threshold, using default")
+                self._charging_availability_threshold = 0.60
             # Optional idle/wander configuration
             try:
                 idle_wander_enabled = config_provider.get_value("idle.wander.enabled").value
@@ -313,6 +320,8 @@ class TaskHandlerImpl(ITaskHandler):
             # Idle/wander defaults
             self._idle_wander_enabled = True
             self._wander_min_target_distance = 2.0
+            # Availability during charging default
+            self._charging_availability_threshold = 0.60
 
         # Automatic charging state
         self._charging_task_pending = False
@@ -587,6 +596,20 @@ class TaskHandlerImpl(ITaskHandler):
             else:
                 self.logger.warning(f"Invalid charging threshold: {threshold}")
     
+    def set_charging_availability_threshold(self, threshold: float) -> None:
+        """
+        Set the battery threshold for bidding availability while charging.
+
+        Args:
+            threshold: Battery level threshold (0.0 to 1.0)
+        """
+        with WriteLock(self._status_lock):
+            if 0.0 <= threshold <= 1.0:
+                self._charging_availability_threshold = threshold
+                self.logger.info(f"Charging availability threshold set to {threshold:.1%}")
+            else:
+                self.logger.warning(f"Invalid charging availability threshold: {threshold}")
+    
     def update_config_from_robot(self, robot_config) -> None:
         """Update task parameters with robot-specific configuration."""
         if robot_config:
@@ -786,17 +809,17 @@ class TaskHandlerImpl(ITaskHandler):
             # Set initial phase and status
             if task.task_type == TaskType.PICK_AND_DELIVER:
                 self._task_phase = TaskPhase.PLANNING
-                self._operational_status = OperationalStatus.MOVING_TO_SHELF
+                self._update_operational_status(OperationalStatus.MOVING_TO_SHELF)
             elif task.task_type == TaskType.MOVE_TO_CHARGING:
                 self._task_phase = TaskPhase.PLANNING
-                self._operational_status = OperationalStatus.MOVING_TO_CHARGING
+                self._update_operational_status(OperationalStatus.MOVING_TO_CHARGING)
             elif task.task_type == TaskType.MOVE_TO_POSITION:
                 self._task_phase = TaskPhase.PLANNING
-                self._operational_status = OperationalStatus.MOVING_TO_SHELF  # Generic movement
+                self._update_operational_status(OperationalStatus.MOVING_TO_SHELF)  # Generic movement
             elif task.task_type == TaskType.IDLE_PARK:
                 # Explicitly mark as moving to idle so status reflects intent during planning
                 self._task_phase = TaskPhase.PLANNING
-                self._operational_status = OperationalStatus.MOVING_TO_IDLE
+                self._update_operational_status(OperationalStatus.MOVING_TO_IDLE)
             
             # Log task start event
             self._log_kpi_event("task_start", {
@@ -843,7 +866,7 @@ class TaskHandlerImpl(ITaskHandler):
                 self._stall_retry_count = 1
                 print(f"[TaskHandler] Initial stall detected: {reason}")
             
-            self._operational_status = OperationalStatus.STALLED
+            self._update_operational_status(OperationalStatus.STALLED)
             self._stall_reason = reason
             self._stall_start_time = time.time()
             self._stall_retry_start_time = time.time()
@@ -864,6 +887,16 @@ class TaskHandlerImpl(ITaskHandler):
             # While waiting for charging, the robot is intentionally unavailable for bidding
             if getattr(self, "_waiting_for_charging", False):
                 return False
+            
+            # If currently charging and battery above availability threshold, allow bidding
+            try:
+                if (self._current_task and self._current_task.task_type == TaskType.MOVE_TO_CHARGING and
+                    self._operational_status in (OperationalStatus.CHARGING, OperationalStatus.MOVING_TO_CHARGING)):
+                    battery_level = self.state_holder.get_battery_level()
+                    if battery_level >= getattr(self, '_charging_availability_threshold', 0.60):
+                        return True
+            except Exception:
+                pass
             # Consider IDLE_PARK (including WANDERING) as available for work
             if self._current_task and self._current_task.task_type == TaskType.IDLE_PARK:
                 return True
@@ -1812,7 +1845,7 @@ class TaskHandlerImpl(ITaskHandler):
         print(f"[TaskHandler] Attempting stall recovery (attempt {self._stall_retry_count}/{self._retry_attempts})")
         
         # Simple recovery: try to resume the current phase
-        self._operational_status = self._get_status_for_phase(self._task_phase)
+        self._update_operational_status(self._get_status_for_phase(self._task_phase))
         self._stall_reason = None
         self._stall_start_time = None
         self._stall_retry_start_time = None
@@ -1822,9 +1855,30 @@ class TaskHandlerImpl(ITaskHandler):
     
     def _advance_to_phase(self, new_phase: TaskPhase, new_status: OperationalStatus) -> None:
         """Internal: Advance to next task phase."""
+        # Emit previous phase duration before switching (best-effort)
+        try:
+            if hasattr(self, "_phase_start_time") and self._phase_start_time:
+                prev_phase = getattr(self, "_task_phase", None)
+                if prev_phase is not None:
+                    duration = max(0.0, time.time() - float(self._phase_start_time))
+                    self._log_kpi_event("phase_completed", {
+                        "phase_duration_seconds": duration
+                    })
+        except Exception:
+            pass
+
         self._task_phase = new_phase
-        self._operational_status = new_status
+        self._update_operational_status(new_status)
         self._phase_start_time = time.time()
+
+        # Emit phase started event (numeric code for compatibility)
+        try:
+            idx = float(TASK_PHASE_ORDER.index(new_phase)) if new_phase in TASK_PHASE_ORDER else 0.0
+            self._log_kpi_event("phase_started", {
+                "phase_code": idx
+            })
+        except Exception:
+            pass
 
         # Stop motion when entering phases that require stopping
         if new_phase in [TaskPhase.PICKING_ITEM, TaskPhase.DROPPING_ITEM]:
@@ -1864,7 +1918,11 @@ class TaskHandlerImpl(ITaskHandler):
             "task_id": self._current_task.task_id,
             "order_id": self._current_task.order_id,
             "duration_seconds": task_duration,
-            "phase": self._task_phase.value
+            "phase": self._task_phase.value,
+            # Numeric flags for KPI aggregation
+            "is_pick_and_deliver": 1.0 if self._current_task.task_type == TaskType.PICK_AND_DELIVER else 0.0,
+            # Emit PD-only duration for targeted averaging
+            **({"pd_duration_seconds": float(task_duration)} if self._current_task.task_type == TaskType.PICK_AND_DELIVER else {})
         })
         
         print(f"[TaskHandler] Task {self._current_task.task_id} completed successfully ({self._get_battery_level_info()})")
@@ -1963,9 +2021,12 @@ class TaskHandlerImpl(ITaskHandler):
             self._log_kpi_event("task_failed", {
                 "task_id": self._current_task.task_id,
                 "order_id": self._current_task.order_id,
-                "duration_seconds": task_duration,
+            "duration_seconds": task_duration,
                 "error": error_message,
-                "phase": self._task_phase.value
+            "phase": self._task_phase.value,
+            # Numeric flags for KPI aggregation
+            "is_pick_and_deliver": 1.0 if self._current_task.task_type == TaskType.PICK_AND_DELIVER else 0.0,
+            **({"pd_duration_seconds": float(task_duration)} if self._current_task.task_type == TaskType.PICK_AND_DELIVER else {})
             })
             
             print(f"[TaskHandler] Task {self._current_task.task_id} failed: {error_message}")
@@ -2024,7 +2085,7 @@ class TaskHandlerImpl(ITaskHandler):
                 self._reached_idle_bay = False  # Reset the reached flag
         
         self._current_task = None
-        self._operational_status = OperationalStatus.IDLE
+        self._update_operational_status(OperationalStatus.IDLE)
         self._task_phase = TaskPhase.COMPLETED
         self._current_path = None
         self._task_start_time = None
@@ -2484,6 +2545,75 @@ class TaskHandlerImpl(ITaskHandler):
         except SimulationDataServiceError as e:
             self.logger.error(f"Failed to log KPI event {event_type}: {e}")
             # Don't fail the task for logging errors
+
+    def _update_operational_status(self, new_status: OperationalStatus) -> None:
+        """
+        Internal: Update operational status and emit KPI status change with duration of previous state.
+        """
+        if new_status == self._operational_status:
+            return
+        now = time.time()
+        try:
+            if self._status_change_time is not None:
+                duration = max(0.0, now - self._status_change_time)
+                # Emit busy/idle style durations via generic status_change metric
+                prev_status = self._operational_status
+                is_busy_prev = self._is_busy_status(prev_status)
+                self._log_kpi_event("status_change", {
+                    "prev_status_code": float(self._status_to_code(prev_status)),
+                    "new_status_code": float(self._status_to_code(new_status)),
+                    "status_duration_seconds": duration,
+                    "busy_duration_seconds": duration if is_busy_prev else 0.0,
+                    "idle_duration_seconds": 0.0 if is_busy_prev else duration,
+                })
+        except Exception:
+            pass
+
+        self._operational_status = new_status
+        self._status_change_time = now
+
+    def _status_to_code(self, status: OperationalStatus) -> int:
+        """Map OperationalStatus to a stable numeric code for KPI storage."""
+        ordering = [
+            OperationalStatus.IDLE,
+            OperationalStatus.MOVING_TO_SHELF,
+            OperationalStatus.APPROACHING_SHELF,
+            OperationalStatus.PICKING,
+            OperationalStatus.MOVING_TO_DROPOFF,
+            OperationalStatus.DROPPING,
+            OperationalStatus.MOVING_TO_CHARGING,
+            OperationalStatus.CHARGING,
+            OperationalStatus.MOVING_TO_IDLE,
+            OperationalStatus.WANDERING,
+            OperationalStatus.STALLED,
+            OperationalStatus.ERROR,
+            OperationalStatus.EMERGENCY_STOP,
+            OperationalStatus.APPROACHING_BAY,
+            OperationalStatus.ENTERING_BAY,
+            OperationalStatus.IN_BAY,
+            OperationalStatus.EXITING_BAY,
+        ]
+        try:
+            return ordering.index(status)
+        except ValueError:
+            return 0
+
+    def _is_busy_status(self, status: OperationalStatus) -> bool:
+        """Classify whether a status is considered busy for KPI purposes."""
+        return status in {
+            OperationalStatus.MOVING_TO_SHELF,
+            OperationalStatus.APPROACHING_SHELF,
+            OperationalStatus.PICKING,
+            OperationalStatus.MOVING_TO_DROPOFF,
+            OperationalStatus.DROPPING,
+            OperationalStatus.MOVING_TO_CHARGING,
+            OperationalStatus.CHARGING,
+            OperationalStatus.MOVING_TO_IDLE,
+            OperationalStatus.APPROACHING_BAY,
+            OperationalStatus.ENTERING_BAY,
+            OperationalStatus.IN_BAY,
+            OperationalStatus.EXITING_BAY,
+        }
     
     # --- Wander candidate selection helpers ---
     def _get_wander_candidates(self) -> List[Tuple[float, float]]:

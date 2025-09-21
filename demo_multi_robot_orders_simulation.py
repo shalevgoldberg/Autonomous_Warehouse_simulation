@@ -86,9 +86,9 @@ class MultiRobotSimulationManager:
         print("🚀 Initializing Multi-Robot Warehouse Simulation")
         print(f"   🤖 Robot Count: {robot_count}")
         
-        # Validate robot count
-        if robot_count < 1 or robot_count > 5:
-            raise ValueError("Robot count must be between 1 and 5 for demo purposes")
+        # Validate robot coun
+        if robot_count < 1 or robot_count > 15:
+            raise ValueError("Robot count must be between 1 and 15 for demo purposes")
         
         self.robot_count = robot_count
         self.robots: List[RobotInstance] = []
@@ -638,6 +638,35 @@ class MultiRobotSimulationManager:
         except Exception as e:
             logging.error(f"EXCEPTION: Order source disconnect failed: {e}", exc_info=True)
         
+        # KPI Overview (Phase 5)
+        try:
+            cfg = self.config_provider
+            export_enabled = cfg.get_value("kpi.export_csv_enabled", True).value
+            export_path = cfg.get_value("kpi.export_csv_path", "kpi_results.csv").value
+        except Exception:
+            export_enabled = True
+            export_path = "kpi_results.csv"
+
+        try:
+            overview = self.simulation_data_service.get_kpi_overview()
+            print("\n📊 KPI SUMMARY:")
+            print(f"   ✅ Tasks Completed: {overview.get('tasks_completed', 0)}")
+            print(f"   ❌ Tasks Failed: {overview.get('tasks_failed', 0)}")
+            print(f"   📈 Success Rate: {overview.get('task_success_rate', 0):.1f}%")
+            print(f"   ⏱️  Avg Task Time: {overview.get('avg_task_time_seconds', 0):.1f}s")
+            print(f"   🧩 PD Completed: {overview.get('pd_tasks_completed', 0)} | PD Failed: {overview.get('pd_tasks_failed', 0)} | PD Success: {overview.get('pd_success_rate', 0):.1f}% | PD Avg Time: {overview.get('pd_avg_task_time_seconds', 0):.1f}s")
+            print(f"   💼 Busy Time: {overview.get('busy_time_seconds', 0):.1f}s")
+            print(f"   📊 Avg Busy % per Robot: {overview.get('avg_busy_percent_per_robot', 0):.1f}%")
+            print(f"   🆓 Avg Idle % per Robot: {overview.get('avg_idle_percent_per_robot', 0):.1f}%")
+
+            if export_enabled:
+                if self.simulation_data_service.export_kpi_overview_csv(overview, export_path):
+                    print(f"   💾 KPI CSV exported: {export_path}")
+                else:
+                    print(f"   ⚠️  KPI CSV export failed: {export_path}")
+        except Exception as e:
+            print(f"   ⚠️  KPI summary unavailable: {e}")
+
         print("   ✅ Multi-robot simulation stopped cleanly")
     
     def create_demo_tasks(self, task_count: int) -> None:
@@ -895,7 +924,7 @@ def main():
             # Orders will be loaded from sample_orders.json and processed into tasks
             print(f"\n📋 Order processing will load orders from sample_orders.json automatically")
             # Extended monitoring for order processing and task execution
-            sim.monitor_robot_coordination(240.0)  # Extended time for full order processing
+            sim.monitor_robot_coordination(180.0)  # Extended time for full order processing
         finally:
             sim.stop_simulation()
     except KeyboardInterrupt:

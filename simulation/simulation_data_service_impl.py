@@ -42,6 +42,11 @@ from pathlib import Path
 from interfaces.navigation_types import LaneRec, BoxRec, Point, LaneDirection
 from warehouse.map import WarehouseMap
 
+# KPI recording infrastructure
+from kpi.kpi_recorder_db_impl import KpiRecorderDbImpl
+from kpi.kpi_recorder_interface import KpiEvent
+import csv
+
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -117,6 +122,25 @@ class SimulationDataServiceImpl(ISimulationDataService):
         # Initialize database connection and schema
         self._initialize_database()
         
+        # Per-simulation run identifier for KPI scoping
+        self._current_simulation_run_id: str = str(uuid.uuid4())
+
+        # Initialize KPI recorder (non-blocking, background persistence)
+        # Note: We use conservative defaults to avoid introducing new config dependencies here.
+        try:
+            self._kpi_recorder = KpiRecorderDbImpl(
+                connection_getter=self._get_connection,
+                flush_interval_sec=60.0,
+                max_batch_size=256,
+                queue_capacity=8192,
+                logger=logging.getLogger(f"{__name__}.KPI"),
+            )
+            logger.info("KPI recorder initialized (DB-backed)")
+        except Exception as e:
+            # Fallback: disable recorder; direct DB writes will be used with explicit logging
+            self._kpi_recorder = None
+            logger.error(f"Failed to initialize KPI recorder, falling back to direct DB writes: {e}")
+
         logger.info(f"SimulationDataService initialized with database {db_name}@{db_host}:{db_port}")
     
     def _initialize_database(self) -> None:
@@ -1324,32 +1348,53 @@ class SimulationDataServiceImpl(ISimulationDataService):
             robot_id: Robot associated with the event
             event_data: Additional event data
         """
+        # Prefer non-blocking KPI recorder when available
+        if hasattr(self, "_kpi_recorder") and self._kpi_recorder is not None:
+            try:
+                self._kpi_recorder.record_event(KpiEvent(
+                    event_type=event_type,
+                    robot_id=robot_id,
+                    event_data=event_data,
+                    simulation_run_id=self._current_simulation_run_id,
+                ))
+                # Ensure visibility for immediate queries (tests, end-of-sim summaries)
+                # This is a best-effort synchronous flush and should not be called from high-frequency loops.
+                self._kpi_recorder.flush()
+                return
+            except Exception as e:
+                # Explicitly log fallback and proceed with direct DB write
+                logger.error(
+                    f"KPI recorder flush failed, falling back to direct DB write for event {event_type} (robot {robot_id}): {e}"
+                )
+
+        # Fallback path: direct, synchronous DB writes preserving prior semantics
         try:
             with self._get_connection() as conn:
                 with conn.cursor() as cur:
-                    # Store event in simulation_metrics table
-                    event_id = str(uuid.uuid4())
-                    
-                    # Store main event
-                    cur.execute("""
+                    event_id = self._current_simulation_run_id
+
+                    cur.execute(
+                        """
                         INSERT INTO simulation_metrics (metric_name, metric_value, simulation_run_id)
                         VALUES (%s, %s, %s)
-                    """, (f"{event_type}_{robot_id}", 1.0, event_id))
-                    
-                    # Store event details as separate metrics
+                        """,
+                        (f"{event_type}_{robot_id}", 1.0, event_id),
+                    )
+
                     for key, value in event_data.items():
                         if isinstance(value, (int, float)):
-                            cur.execute("""
+                            cur.execute(
+                                """
                                 INSERT INTO simulation_metrics (metric_name, metric_value, simulation_run_id)
                                 VALUES (%s, %s, %s)
-                            """, (f"{event_type}_{key}", float(value), event_id))
-                    
-                    conn.commit()
-                    logger.debug(f"Logged event: {event_type} for robot {robot_id}")
-                    
+                                """,
+                                (f"{event_type}_{key}", float(value), event_id),
+                            )
+
+                conn.commit()
+                logger.debug(f"Logged event (fallback direct write): {event_type} for robot {robot_id}")
         except Exception as e:
-            # Don't raise exceptions for logging failures
-            logger.error(f"Failed to log event {event_type} for robot {robot_id}: {e}")
+            logger.error(f"Failed to log event (fallback) {event_type} for robot {robot_id}: {e}")
     
     # Lane-Based Navigation Operations
     def get_lanes(self) -> List[LaneRec]:
@@ -1799,32 +1844,57 @@ class SimulationDataServiceImpl(ISimulationDataService):
     def cleanup_expired_conflict_box_locks(self) -> int:
         """
         Remove expired conflict box lock entries.
-        
+
         Returns:
             int: Number of expired locks removed
-            
+
         Raises:
             SimulationDataServiceError: If cleanup operation fails
         """
         try:
             with self._get_connection() as conn:
                 with conn.cursor() as cur:
+                    # Check if function exists first (for debugging)
+                    cur.execute("""
+                        SELECT EXISTS (
+                            SELECT 1 FROM information_schema.routines
+                            WHERE routine_name = 'cleanup_expired_conflict_box_locks'
+                            AND routine_type = 'FUNCTION'
+                        )
+                    """)
+                    function_exists = cur.fetchone()[0]
+                    logger.info(f"[DEBUG] cleanup_expired_conflict_box_locks function exists: {function_exists}")
+
+                    if not function_exists:
+                        logger.error("[DEBUG] CRITICAL: cleanup_expired_conflict_box_locks function not found in schema - this WILL corrupt connection state")
+                        return 0
+
                     # Use the database function we created
+                    logger.debug("[DEBUG] Calling cleanup_expired_conflict_box_locks() function")
                     cur.execute("SELECT cleanup_expired_conflict_box_locks()")
                     result = cur.fetchone()
+                    logger.debug(f"[DEBUG] cleanup_expired_conflict_box_locks() returned: {result}")
                     deleted_count = result[0] if result else 0
-                    
+
                     conn.commit()
                     logger.debug(f"Cleaned up {deleted_count} expired conflict box locks")
                     return deleted_count
-                    
+
         except Exception as e:
-            logger.error(f"Failed to cleanup expired conflict box locks: {e}")
+            logger.error(f"[DEBUG] Failed to cleanup expired conflict box locks: {e}")
+            logger.error(f"[DEBUG] Exception type: {type(e).__name__}")
             raise SimulationDataServiceError(f"Failed to cleanup expired conflict box locks: {e}")
     
     def close(self) -> None:
         """Close database connections and cleanup resources."""
         try:
+            # Stop KPI recorder first
+            try:
+                if hasattr(self, "_kpi_recorder") and self._kpi_recorder is not None:
+                    self._kpi_recorder.stop()
+            except Exception as e:
+                logger.error(f"Error stopping KPI recorder: {e}")
+
             if self._connection_pool:
                 with self._pool_lock:
                     self._connection_pool.closeall()
@@ -1836,3 +1906,567 @@ class SimulationDataServiceImpl(ISimulationDataService):
     def __del__(self):
         """Ensure cleanup on object destruction."""
         self.close()
+
+    # ---------------------
+    # KPI Aggregation (Views/Queries)
+    # ---------------------
+    def get_kpi_overview(self, robot_id: Optional[str] = None, run_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Return a simple KPI overview built from simulation_metrics.
+
+        This is read-only and does not modify schema. It leverages naming
+        conventions introduced by Phase 1-2 emitters.
+        """
+        result: Dict[str, Any] = {
+            # Overall
+            "tasks_completed": 0.0,
+            "tasks_failed": 0.0,
+            "task_success_rate": 0.0,
+            "avg_task_time_seconds": 0.0,
+            # Pick-and-deliver subset
+            "pd_tasks_completed": 0.0,
+            "pd_tasks_failed": 0.0,
+            "pd_success_rate": 0.0,
+            "pd_avg_task_time_seconds": 0.0,
+            # Time utilization
+            "busy_time_seconds": 0.0,
+            "avg_idle_percent_per_robot": 0.0,
+            "avg_busy_percent_per_robot": 0.0,
+        }
+        try:
+            effective_run_id = run_id or getattr(self, "_current_simulation_run_id", None)
+            logger.info(f"[DEBUG] KPI aggregation starting with run_id: {effective_run_id}")
+
+            # Test connection state before running queries
+            try:
+                with self._get_connection() as test_conn:
+                    with test_conn.cursor() as test_cur:
+                        test_cur.execute("SELECT 1 as test")
+                        test_result = test_cur.fetchone()
+                        logger.info(f"[DEBUG] Connection test successful: {test_result}")
+            except Exception as test_e:
+                logger.error(f"[DEBUG] CRITICAL: Connection test FAILED before KPI queries: {test_e}")
+                logger.error("[DEBUG] CRITICAL: Database connection IS corrupted from previous operations")
+
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Completed/Failed counts
+                    if robot_id:
+                        if effective_run_id:
+                            cur.execute(
+                                """
+                                SELECT SUM(CASE WHEN metric_name = %s THEN 1 ELSE 0 END) AS completed,
+                                       SUM(CASE WHEN metric_name = %s THEN 1 ELSE 0 END) AS failed
+                                FROM simulation_metrics
+                                WHERE simulation_run_id = %s AND metric_name IN (%s, %s)
+                                """,
+                                (
+                                    f"task_completed_{robot_id}",
+                                    f"task_failed_{robot_id}",
+                                    effective_run_id,
+                                    f"task_completed_{robot_id}",
+                                    f"task_failed_{robot_id}",
+                                ),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                SELECT SUM(CASE WHEN metric_name = %s THEN 1 ELSE 0 END) AS completed,
+                                       SUM(CASE WHEN metric_name = %s THEN 1 ELSE 0 END) AS failed
+                                FROM simulation_metrics
+                                WHERE metric_name IN (%s, %s)
+                                """,
+                                (
+                                    f"task_completed_{robot_id}",
+                                    f"task_failed_{robot_id}",
+                                    f"task_completed_{robot_id}",
+                                    f"task_failed_{robot_id}",
+                                ),
+                            )
+                    else:
+                        if effective_run_id:
+                            cur.execute(
+                                """
+                                SELECT
+                                    SUM(CASE WHEN metric_name LIKE %s THEN 1 ELSE 0 END) AS completed,
+                                    SUM(CASE WHEN metric_name LIKE %s THEN 1 ELSE 0 END) AS failed
+                                FROM simulation_metrics
+                                WHERE simulation_run_id = %s AND (metric_name LIKE %s OR metric_name LIKE %s)
+                                """,
+                                (
+                                    'task_completed_%',
+                                    'task_failed_%',
+                                    effective_run_id,
+                                    'task_completed_%',
+                                    'task_failed_%',
+                                ),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                SELECT
+                                    SUM(CASE WHEN metric_name LIKE %s THEN 1 ELSE 0 END) AS completed,
+                                    SUM(CASE WHEN metric_name LIKE %s THEN 1 ELSE 0 END) AS failed
+                                FROM simulation_metrics
+                                WHERE metric_name LIKE %s OR metric_name LIKE %s
+                                """,
+                                (
+                                    'task_completed_%',
+                                    'task_failed_%',
+                                    'task_completed_%',
+                                    'task_failed_%',
+                                ),
+                            )
+                    raw_row = cur.fetchone()
+                    logger.info(f"[DEBUG] KPI fetchone() returned: {raw_row} (type: {type(raw_row)})")
+                    row = raw_row or {}
+                    logger.info(f"[DEBUG] Processed row: {row} (type: {type(row)})")
+
+                    # Check if row is not a dict (indicates corrupted connection)
+                    if not isinstance(row, dict):
+                        logger.error(f"[DEBUG] CRITICAL: fetchone() returned non-dict type: {type(row)} = {row}")
+                        logger.error("[DEBUG] CRITICAL: This PROVES corrupted database connection state from missing cleanup function")
+
+                    completed = float(row.get("completed", 0) or 0)
+                    failed = float(row.get("failed", 0) or 0)
+                    total = max(1.0, completed + failed)
+                    result["tasks_completed"] = completed
+                    result["tasks_failed"] = failed
+                    result["task_success_rate"] = (completed / total) * 100.0
+
+                    # Average task time (use per-robot metric when available)
+                    if robot_id:
+                        if effective_run_id:
+                            cur.execute(
+                                """
+                                SELECT AVG(metric_value) AS avg_time
+                                FROM simulation_metrics
+                                WHERE simulation_run_id = %s AND metric_name = %s
+                                """,
+                                (effective_run_id, f"task_completed_duration_seconds_{robot_id}"),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                SELECT AVG(metric_value) AS avg_time
+                                FROM simulation_metrics
+                                WHERE metric_name = %s
+                                """,
+                                (f"task_completed_duration_seconds_{robot_id}",),
+                            )
+                        r = cur.fetchone() or {}
+                        avg_time = r.get("avg_time")
+                        if avg_time is None:
+                            # Fallback to global if per-robot is absent
+                            if effective_run_id:
+                                cur.execute(
+                                    """
+                                    SELECT AVG(metric_value) AS avg_time
+                                    FROM simulation_metrics
+                                    WHERE simulation_run_id = %s AND metric_name = 'task_completed_duration_seconds'
+                                    """,
+                                    (effective_run_id,),
+                                )
+                            else:
+                                cur.execute(
+                                    """
+                                    SELECT AVG(metric_value) AS avg_time
+                                    FROM simulation_metrics
+                                    WHERE metric_name = 'task_completed_duration_seconds'
+                                    """
+                                )
+                            r = cur.fetchone() or {}
+                            avg_time = r.get("avg_time")
+                    else:
+                        if effective_run_id:
+                            cur.execute(
+                                """
+                                SELECT AVG(metric_value) AS avg_time
+                                FROM simulation_metrics
+                                WHERE simulation_run_id = %s AND metric_name = 'task_completed_duration_seconds'
+                                """,
+                                (effective_run_id,),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                SELECT AVG(metric_value) AS avg_time
+                                FROM simulation_metrics
+                                WHERE metric_name = 'task_completed_duration_seconds'
+                                """
+                            )
+                        r = cur.fetchone() or {}
+                        avg_time = r.get("avg_time")
+
+                    result["avg_task_time_seconds"] = float(avg_time or 0.0)
+
+                    # --- Pick-and-deliver breakdown ---
+                    # Completed PD tasks: count events where is_pick_and_deliver == 1
+                    if robot_id:
+                        if effective_run_id:
+                            cur.execute(
+                                """
+                                SELECT SUM(CASE WHEN metric_name = %s THEN 1 ELSE 0 END) AS pd_completed,
+                                       SUM(CASE WHEN metric_name = %s THEN 1 ELSE 0 END) AS pd_failed
+                                FROM simulation_metrics
+                                WHERE simulation_run_id = %s AND metric_name IN (%s, %s)
+                                """,
+                                (
+                                    f"task_completed_{robot_id}",
+                                    f"task_failed_{robot_id}",
+                                    effective_run_id,
+                                    f"task_completed_{robot_id}",
+                                    f"task_failed_{robot_id}",
+                                ),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                SELECT SUM(CASE WHEN metric_name = %s THEN 1 ELSE 0 END) AS pd_completed,
+                                       SUM(CASE WHEN metric_name = %s THEN 1 ELSE 0 END) AS pd_failed
+                                FROM simulation_metrics
+                                WHERE metric_name IN (%s, %s)
+                                """,
+                                (
+                                    f"task_completed_{robot_id}",
+                                    f"task_failed_{robot_id}",
+                                    f"task_completed_{robot_id}",
+                                    f"task_failed_{robot_id}",
+                                ),
+                            )
+                    else:
+                        if effective_run_id:
+                            cur.execute(
+                                """
+                                SELECT
+                                    SUM(CASE WHEN metric_name LIKE %s THEN 1 ELSE 0 END) AS pd_completed,
+                                    SUM(CASE WHEN metric_name LIKE %s THEN 1 ELSE 0 END) AS pd_failed
+                                FROM simulation_metrics
+                                WHERE simulation_run_id = %s AND (metric_name LIKE %s OR metric_name LIKE %s)
+                                """,
+                                (
+                                    'task_completed_%',
+                                    'task_failed_%',
+                                    effective_run_id,
+                                    'task_completed_%',
+                                    'task_failed_%',
+                                ),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                SELECT
+                                    SUM(CASE WHEN metric_name LIKE %s THEN 1 ELSE 0 END) AS pd_completed,
+                                    SUM(CASE WHEN metric_name LIKE %s THEN 1 ELSE 0 END) AS pd_failed
+                                FROM simulation_metrics
+                                WHERE metric_name LIKE %s OR metric_name LIKE %s
+                                """,
+                                (
+                                    'task_completed_%',
+                                    'task_failed_%',
+                                    'task_completed_%',
+                                    'task_failed_%',
+                                ),
+                            )
+                    pd_row = cur.fetchone() or {}
+                    # We need to filter by PD-only events: we logged a numeric flag is_pick_and_deliver.
+                    # Count PD tasks by summing the flag metrics aligned with completion/failure.
+                    # Global flag metrics names: task_completed_is_pick_and_deliver, task_failed_is_pick_and_deliver
+                    # Per-robot flag metrics names: task_completed_is_pick_and_deliver_<robot>, task_failed_is_pick_and_deliver_<robot>
+                    if robot_id:
+                        key_completed = f"task_completed_is_pick_and_deliver_{robot_id}"
+                        key_failed = f"task_failed_is_pick_and_deliver_{robot_id}"
+                    else:
+                        key_completed = "task_completed_is_pick_and_deliver"
+                        key_failed = "task_failed_is_pick_and_deliver"
+
+                    if effective_run_id:
+                        cur.execute(
+                            """
+                            SELECT
+                                COALESCE(SUM(CASE WHEN metric_name = %s THEN metric_value ELSE 0 END), 0) AS pd_completed,
+                                COALESCE(SUM(CASE WHEN metric_name = %s THEN metric_value ELSE 0 END), 0) AS pd_failed
+                            FROM simulation_metrics
+                            WHERE simulation_run_id = %s AND metric_name IN (%s, %s)
+                            """,
+                            (key_completed, key_failed, effective_run_id, key_completed, key_failed),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT
+                                COALESCE(SUM(CASE WHEN metric_name = %s THEN metric_value ELSE 0 END), 0) AS pd_completed,
+                                COALESCE(SUM(CASE WHEN metric_name = %s THEN metric_value ELSE 0 END), 0) AS pd_failed
+                            FROM simulation_metrics
+                            WHERE metric_name IN (%s, %s)
+                            """,
+                            (key_completed, key_failed, key_completed, key_failed),
+                        )
+                    pd_counts = cur.fetchone() or {}
+                    pd_completed = float(pd_counts.get("pd_completed", 0) or 0)
+                    pd_failed = float(pd_counts.get("pd_failed", 0) or 0)
+                    pd_total = max(1.0, pd_completed + pd_failed)
+                    result["pd_tasks_completed"] = pd_completed
+                    result["pd_tasks_failed"] = pd_failed
+                    result["pd_success_rate"] = (pd_completed / pd_total) * 100.0
+
+                    # PD average time: use pd_duration_seconds metrics
+                    if robot_id:
+                        pd_dur_key = f"task_completed_pd_duration_seconds_{robot_id}"
+                    else:
+                        pd_dur_key = "task_completed_pd_duration_seconds"
+                    if effective_run_id:
+                        cur.execute(
+                            """
+                            SELECT AVG(metric_value) AS avg_pd_time
+                            FROM simulation_metrics
+                            WHERE simulation_run_id = %s AND metric_name = %s
+                            """,
+                            (effective_run_id, pd_dur_key),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT AVG(metric_value) AS avg_pd_time
+                            FROM simulation_metrics
+                            WHERE metric_name = %s
+                            """,
+                            (pd_dur_key,),
+                        )
+                    rpd = cur.fetchone() or {}
+                    result["pd_avg_task_time_seconds"] = float(rpd.get("avg_pd_time", 0.0) or 0.0)
+
+                    # Status durations (busy/idle) derived from status_change events
+                    if robot_id:
+                        duration_key = f"status_duration_seconds_{robot_id}"
+                    else:
+                        duration_key = "status_duration_seconds"
+
+                    cur.execute(
+                        """
+                        SELECT metric_name, SUM(metric_value) AS total
+                        FROM simulation_metrics
+                        WHERE metric_name IN (%s, %s)
+                        GROUP BY metric_name
+                        """,
+                        (
+                            f"status_change_{duration_key}",  # not exact; fallback handled below
+                            f"status_change_{duration_key}",
+                        ),
+                    )
+                    # The above query is a placeholder; fallback to summing all status_change duration entries
+                    # and partitioning by new_status_code buckets using separate queries.
+
+                    # Busy time: sum durations where new_status_code ∈ {moving_to_*, picking, dropping, charging}
+                    # We only have numeric values in simulation_metrics, so query by specific metric names we write:
+                    # - status_change_status_duration_seconds (global)
+                    # - status_change_status_duration_seconds_<robot_id> (per-robot)
+                    busy_sum = 0.0
+                    idle_sum = 0.0
+
+                    # Global sums
+                    if effective_run_id:
+                        cur.execute(
+                            """
+                            SELECT SUM(metric_value) AS total
+                            FROM simulation_metrics
+                            WHERE simulation_run_id = %s AND metric_name = 'status_change_status_duration_seconds'
+                            """,
+                            (effective_run_id,),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT SUM(metric_value) AS total
+                            FROM simulation_metrics
+                            WHERE metric_name = 'status_change_status_duration_seconds'
+                            """
+                        )
+                    r = cur.fetchone() or {}
+                    global_total = float(r.get("total") or 0.0)
+
+                    # Per-robot sums if available
+                    if robot_id:
+                        if effective_run_id:
+                            cur.execute(
+                                """
+                                SELECT SUM(metric_value) AS total
+                                FROM simulation_metrics
+                                WHERE simulation_run_id = %s AND metric_name = %s
+                                """,
+                                (effective_run_id, f"status_change_status_duration_seconds_{robot_id}"),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                SELECT SUM(metric_value) AS total
+                                FROM simulation_metrics
+                                WHERE metric_name = %s
+                                """,
+                                (f"status_change_status_duration_seconds_{robot_id}",),
+                            )
+                        r = cur.fetchone() or {}
+                        robot_total = float(r.get("total") or 0.0)
+                        total_status_time = robot_total or global_total
+                    else:
+                        total_status_time = global_total
+
+                    # Sum busy and idle durations emitted per status change
+                    if robot_id:
+                        busy_key = f"status_change_busy_duration_seconds_{robot_id}"
+                        idle_key = f"status_change_idle_duration_seconds_{robot_id}"
+                    else:
+                        busy_key = "status_change_busy_duration_seconds"
+                        idle_key = "status_change_idle_duration_seconds"
+
+                    # Busy sum
+                    if effective_run_id:
+                        cur.execute(
+                            """
+                            SELECT COALESCE(SUM(metric_value), 0) AS total
+                            FROM simulation_metrics
+                            WHERE simulation_run_id = %s AND metric_name = %s
+                            """,
+                            (effective_run_id, busy_key),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT COALESCE(SUM(metric_value), 0) AS total
+                            FROM simulation_metrics
+                            WHERE metric_name = %s
+                            """,
+                            (busy_key,),
+                        )
+                    rb = cur.fetchone() or {}
+                    busy_sum = float(rb.get("total", 0.0) or 0.0)
+
+                    # Idle sum
+                    if effective_run_id:
+                        cur.execute(
+                            """
+                            SELECT COALESCE(SUM(metric_value), 0) AS total
+                            FROM simulation_metrics
+                            WHERE simulation_run_id = %s AND metric_name = %s
+                            """,
+                            (effective_run_id, idle_key),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT COALESCE(SUM(metric_value), 0) AS total
+                            FROM simulation_metrics
+                            WHERE metric_name = %s
+                            """,
+                            (idle_key,),
+                        )
+                    ri = cur.fetchone() or {}
+                    idle_sum = float(ri.get("total", 0.0) or 0.0)
+
+                    result["busy_time_seconds"] = busy_sum
+
+                    # Busy percent averaged per robot: compute per-robot busy/total and average them
+                    try:
+                        # Compute per-robot busy% = busy_seconds(robot) / (busy+idle)(robot)
+                        if effective_run_id:
+                            cur.execute(
+                                """
+                                SELECT
+                                    REGEXP_REPLACE(metric_name, '^status_change_busy_duration_seconds_', '') AS robot_id,
+                                    SUM(metric_value) AS busy_seconds
+                                FROM simulation_metrics
+                                WHERE simulation_run_id = %s AND metric_name LIKE %s
+                                GROUP BY 1
+                                """,
+                                (effective_run_id, 'status_change_busy_duration_seconds_%'),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                SELECT
+                                    REGEXP_REPLACE(metric_name, '^status_change_busy_duration_seconds_', '') AS robot_id,
+                                    SUM(metric_value) AS busy_seconds
+                                FROM simulation_metrics
+                                WHERE metric_name LIKE %s
+                                GROUP BY 1
+                                """,
+                                ('status_change_busy_duration_seconds_%',),
+                            )
+                        rows = cur.fetchall() or []
+                        # Build map of busy seconds per robot
+                        busy_map: Dict[str, float] = {}
+                        for rr in rows:
+                            if isinstance(rr, dict):
+                                busy_map[str(rr.get('robot_id'))] = float(rr.get('busy_seconds', 0.0) or 0.0)
+
+                        # Fetch idle per robot
+                        if effective_run_id:
+                            cur.execute(
+                                """
+                                SELECT
+                                    REGEXP_REPLACE(metric_name, '^status_change_idle_duration_seconds_', '') AS robot_id,
+                                    SUM(metric_value) AS idle_seconds
+                                FROM simulation_metrics
+                                WHERE simulation_run_id = %s AND metric_name LIKE %s
+                                GROUP BY 1
+                                """,
+                                (effective_run_id, 'status_change_idle_duration_seconds_%'),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                SELECT
+                                    REGEXP_REPLACE(metric_name, '^status_change_idle_duration_seconds_', '') AS robot_id,
+                                    SUM(metric_value) AS idle_seconds
+                                FROM simulation_metrics
+                                WHERE metric_name LIKE %s
+                                GROUP BY 1
+                                """,
+                                ('status_change_idle_duration_seconds_%',),
+                            )
+                        idle_rows = cur.fetchall() or []
+                        idle_map: Dict[str, float] = {}
+                        for rr in idle_rows:
+                            if isinstance(rr, dict):
+                                idle_map[str(rr.get('robot_id'))] = float(rr.get('idle_seconds', 0.0) or 0.0)
+
+                        # Compute average of per-robot busy percentages
+                        per_robot_percents: List[float] = []
+                        for rid, busy_s in busy_map.items():
+                            total_s = busy_s + float(idle_map.get(rid, 0.0))
+                            if total_s > 0:
+                                per_robot_percents.append((busy_s / total_s) * 100.0)
+                        if per_robot_percents:
+                            result["avg_busy_percent_per_robot"] = sum(per_robot_percents) / len(per_robot_percents)
+                            result["avg_idle_percent_per_robot"] = 100.0 - result["avg_busy_percent_per_robot"]
+                    except Exception as _:
+                        pass
+
+        except Exception as e:
+            logger.error(f"[DEBUG] CRITICAL: Failed to build KPI overview: {e}")
+            logger.error(f"[DEBUG] CRITICAL: Exception type: {type(e).__name__}")
+            logger.error(f"[DEBUG] CRITICAL: Exception args: {e.args}")
+            import traceback
+            logger.error(f"[DEBUG] CRITICAL: Full traceback:\n{traceback.format_exc()}")
+            logger.error("[DEBUG] CRITICAL: This error proves the connection corruption theory!")
+        return result
+
+    def export_kpi_overview_csv(self, overview: Dict[str, Any], file_path: str) -> bool:
+        """Export KPI overview dict to a CSV file with simple key/value rows."""
+        try:
+            with open(file_path, mode="w", newline="") as f:
+                writer = csv.writer(f)
+                # Include run id as header for clarity
+                try:
+                    run_id = getattr(self, "_current_simulation_run_id", None)
+                    if run_id:
+                        writer.writerow(["simulation_run_id", run_id])
+                except Exception:
+                    pass
+                writer.writerow(["Metric", "Value"])
+                for k, v in overview.items():
+                    writer.writerow([k, v])
+            return True
+        except Exception as e:
+            logger.error(f"Failed to export KPI overview to CSV at {file_path}: {e}")
+            return False

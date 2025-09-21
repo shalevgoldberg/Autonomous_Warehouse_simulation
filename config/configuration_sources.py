@@ -275,7 +275,7 @@ class DefaultConfigurationSource(IConfigurationSource):
     def load_configuration(self) -> Dict[str, Any]:
         """
         Load default configuration.
-        
+
         Returns:
             Dict[str, Any]: Default configuration data
         """
@@ -303,6 +303,12 @@ class DefaultConfigurationSource(IConfigurationSource):
             "robot.position_tolerance": 0.1,
             "robot.control_frequency": 10.0,
             "robot.motion_frequency": 100.0,
+
+            # Physical robot dimensions (0.25m diameter target)
+            "robot.robot_width": 0.25,   # meters (diameter for circular robots)
+            "robot.robot_height": 0.12,  # meters
+            "robot.robot_length": 0.25,  # meters (same as width for circular)
+
             "robot.lane_tolerance": 0.2,  # Should be 0.1-0.3m for production use
             "robot.corner_speed": 0.3,
             "robot.bay_approach_speed": 0.2,
@@ -311,14 +317,64 @@ class DefaultConfigurationSource(IConfigurationSource):
             "robot.max_linear_velocity": 2.0,
             "robot.max_angular_velocity": 2.0,
             "robot.movement_speed": 1.5,
-            "robot.wheel_base": 0.3,
-            "robot.wheel_radius": 0.05,
-            "robot.picking_duration": 5.0,
-            "robot.dropping_duration": 3.0,
+
+            # Wheel parameters (proportional to robot size)
+            "robot.wheel_base_ratio": 0.8,   # wheel_base = robot_width * 0.8
+            "robot.wheel_radius_ratio": 0.25, # wheel_radius = robot_height * 0.25
+            "robot.picking_duration": 1.0,
+            "robot.dropping_duration": 2.0,
             "robot.charging_threshold": 0.2,
             "robot.emergency_stop_distance": 0.5,
             "robot.stall_recovery_timeout": 10.0,
-            
+
+            # Battery management configuration - TEMPORARILY MODIFIED FOR DEMO
+            "battery.enabled": True,  # Enable enhanced battery management
+            "battery.capacity_wh": 1000.0,  # Battery capacity in watt-hours
+            "battery.idle_consumption_rate": 8000.0,  # TEMP: 50kW when idle (10,000x normal)
+            "battery.moving_consumption_rate": 80000.0,  # TEMP: 500kW when moving (10,000x normal)
+            "battery.carrying_consumption_rate": 150000.0,  # TEMP: 800kW when carrying (10,000x normal)
+            "battery.stalled_consumption_rate": 15000.0,  # TEMP: 100kW when stalled (10,000x normal)
+            "battery.charging_rate": -50000.0,  # TEMP: 500W when charging (faster for testing)
+            "battery.speed_consumption_multiplier": 100.0,  # TEMP: 1000W per m/s speed (100x normal)
+            "battery.load_consumption_multiplier": 3000.0,  # TEMP: 3000W when carrying (100x normal)
+            "battery.task_safety_margin": 0.15,  # 15% safety margin for task battery checks
+            "battery.low_battery_threshold": 0.2,  
+            "battery.critical_battery_threshold": 0.6,  # TEMP: 60% emergency actions (higher for demo visibility)
+            "battery.emergency_stop_threshold": 0.01,  
+            "battery.charging_efficiency": 0.95,  # 95% charging efficiency
+            "battery.self_discharge_rate": 0.1,  # TEMP: 10% per hour self-discharge (100x normal)
+
+            # Charging station management configuration
+            "charging_station.enabled": True,  # Enable charging station management
+            "charging_station.auto_discover_stations": True,  # Auto-discover from warehouse map
+            "charging_station.station_lock_timeout": 600,  # 10 minutes lock timeout
+            "charging_station.station_heartbeat_interval": 30,  # 30 seconds heartbeat
+            "charging_station.station_power_watts": 150.0,  # Station power output (watts)
+            "charging_station.station_efficiency": 0.95,  # Charging efficiency (0.95 = 95%)
+            # "charging_station.max_search_distance": 50.0,  # Max search distance (meters) - UNUSED
+            # "charging_station.station_selection_timeout": 10.0,  # Selection timeout (seconds) - UNUSED
+            # "charging_station.enable_maintenance_mode": True,  # Enable maintenance support - UNUSED
+            # "charging_station.maintenance_check_interval": 300,  # 5 minutes check interval - UNUSED
+            # "charging_station.station_health_timeout": 60,  # 1 minute health timeout - UNUSED
+            # "charging_station.max_stations_per_robot": 1,  # Max stations per robot - UNUSED
+            # "charging_station.station_cache_ttl": 60,  # 1 minute cache TTL - UNUSED
+            # "charging_station.concurrent_allocation_limit": 10,  # Max concurrent allocations - UNUSED
+            # "charging_station.enable_smart_allocation": False,  # Reserved for future enhancement - UNUSED
+            # "charging_station.enable_station_priorities": False,  # Reserved for future enhancement - UNUSED
+            # "charging_station.enable_load_balancing": False,  # Reserved for future enhancement - UNUSED
+
+            # Automatic charging configuration
+            "charging.auto_trigger_enabled": True,           # Enable automatic charging
+            "charging.trigger_threshold": 0.3,             # TEMP: 95% battery threshold
+            "charging.battery_check_interval": 1.0,          # Check battery every 1 second
+            "charging.safe_interrupt_tasks": ["idle_park", "move_to_position"],  # Tasks that can be interrupted
+            "charging.prevent_duplicates": True,             # Prevent duplicate charging tasks
+
+            # Idle/Wander configuration
+            "idle.wander.enabled": True,
+            "idle.wander.retry_interval_seconds": 1.5,
+            "idle.wander.min_target_distance_m": 1.0,
+
             # Database configuration
             "database.host": "localhost",
             "database.port": 5432,
@@ -366,6 +422,30 @@ class DefaultConfigurationSource(IConfigurationSource):
             "robot.wheel_radius": 0.05,  # meters - radius of robot wheels
             "robot.wheel_base": 0.3,     # meters - distance between left and right wheels
 
+            # Collision Avoidance configuration
+            "collision_avoidance.enabled": True,
+            #"collision_avoidance.fov_degrees": 50.0,
+            #"collision_avoidance.num_beams": 50,
+            "collision_avoidance.braking_cone_degrees": 10.0,
+            "collision_avoidance.lateral_guard_margin": 0.10,
+            "collision_avoidance.static_stop_distance": 0.08,
+            "collision_avoidance.dynamic_stop_distance": 0.30,
+            "collision_avoidance.dynamic_caution_distance": 0.50,
+            "collision_avoidance.headway_time_gap": 0.8,
+            "collision_avoidance.yaw_bias_max": 0.1,
+
+            # LiDAR configuration (for collision avoidance)
+            "lidar.enabled": True,
+            "lidar.num_rays": 50,
+            "lidar.max_range": 1.5,
+            "lidar.min_range": 0.1,
+            "lidar.scan_frequency": 10.0,
+            "lidar.field_of_view": 50.0,
+            "lidar.safety_distance": 0.5,
+            "lidar.enable_scan_caching": True,
+            "lidar.scan_cache_ttl": 0.1,
+
+
             # Appearance configuration
             "appearance.enabled": True,
             "appearance.carry_color": [0.0, 1.0, 0.0, 1.0],  # Bright GREEN RGBA for carrying state
@@ -409,5 +489,14 @@ class DefaultConfigurationSource(IConfigurationSource):
                 "battery_low": 0.2,
                 "task_timeout": 300.0,
                 "error_rate": 0.1
-            }
+            },
+            # KPI reporting
+            "kpi.export_csv_enabled": True,
+            "kpi.export_csv_path": "kpi_results.csv",
+
+ 
+
+            # Demo configuration
+            "demo.random_robot_placement": True,  # True for random placement, False for manual
+            "demo.robot_placement_min_distance": 0.5  # Minimum distance between robots in meters
         } 
