@@ -590,24 +590,36 @@ class ISimulationDataService(ABC):
         pass
     
     @abstractmethod
-    def populate_inventory(self, inventory_data: List[Dict[str, Any]]) -> int:
+    def populate_inventory(self, inventory_data: List[Dict[str, Any]],
+                          assignment_strategy: str = "random",
+                          strategy_options: Optional[Dict[str, Any]] = None) -> int:
         """
         Populate inventory with items and assign them to shelves.
-        
+
         Args:
             inventory_data: List of inventory data dictionaries with format:
                 {
                     'item_id': str,
                     'name': str,
                     'description': str (optional),
-                    'category': str (optional),
-                    'shelf_id': str,
-                    'quantity': int
+                    'category': str (optional),  # Used for category-based assignment
+                    'shelf_id': str (optional), # If provided, overrides strategy
+                    'quantity': int,
+                    'priority': str (optional)  # Used for proximity-based assignment
                 }
-            
+            assignment_strategy: Strategy for assigning items without explicit shelf_id:
+                - "random": Assign randomly from available shelves (default)
+                - "load_balanced": Assign to least utilized shelf
+                - "category_based": Group items by category and assign to zones
+                - "proximity_based": Assign high-priority items closer to picking stations
+            strategy_options: Additional configuration for the strategy:
+                - category_zones: Dict mapping categories to shelf ID prefixes
+                - priority_zones: Dict mapping priorities to shelf ID prefixes
+                - max_shelf_capacity: Maximum items per shelf
+
         Returns:
             int: Number of inventory entries created
-            
+
         Raises:
             SimulationDataServiceError: If inventory population fails
         """
@@ -626,7 +638,20 @@ class ISimulationDataService(ABC):
                 - low_stock_items: Items with quantity < 5
         """
         pass
-    
+
+    @abstractmethod
+    def export_inventory_status_csv(self, filename: str) -> bool:
+        """
+        Export complete inventory status to CSV file.
+
+        Args:
+            filename: Output CSV filename
+
+        Returns:
+            bool: True on success, False on failure
+        """
+        pass
+
     # KPI Logging
     @abstractmethod
     def log_event(self, event_type: str, robot_id: str, event_data: Dict[str, Any]) -> None:

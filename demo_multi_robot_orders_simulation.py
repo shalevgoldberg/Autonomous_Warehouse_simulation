@@ -81,14 +81,14 @@ class MultiRobotSimulationManager:
     and visualization following clean architecture principles.
     """
     
-    def __init__(self, warehouse_csv: str = "sample_warehouse.csv", robot_count: int = 2):
+    def __init__(self, warehouse_csv: str = "extended_warehouse.csv", robot_count: int = 2):
         """Initialize simulation manager."""
         print("🚀 Initializing Multi-Robot Warehouse Simulation")
         print(f"   🤖 Robot Count: {robot_count}")
         
         # Validate robot coun
-        if robot_count < 1 or robot_count > 15:
-            raise ValueError("Robot count must be between 1 and 15 for demo purposes")
+        #if robot_count < 1 or robot_count > 15:
+        #    raise ValueError("Robot count must be between 1 and 15 for demo purposes")
         
         self.robot_count = robot_count
         self.robots: List[RobotInstance] = []
@@ -135,6 +135,16 @@ class MultiRobotSimulationManager:
             print("   ✅ Shared engine initialized with appearance service")
         except Exception as e:
             print(f"   ⚠️  Shared engine initialization failed: {e}")
+
+        # Wire KPI recorder to engine for collision KPIs (authoritative mode only)
+        try:
+            if hasattr(self.simulation_data_service, "_kpi_recorder") and self.simulation_data_service._kpi_recorder is not None:
+                self.shared_engine.set_kpi_recorder(
+                    self.simulation_data_service._kpi_recorder,
+                    run_id_provider=lambda: getattr(self.simulation_data_service, "_current_simulation_run_id", None)
+                )
+        except Exception as e:
+            logging.error(f"EXCEPTION: Failed to inject KPI recorder into shared engine: {e}", exc_info=True)
 
         # Create robot controller components
         self.jobs_queue = JobsQueueImpl()
@@ -411,26 +421,23 @@ class MultiRobotSimulationManager:
             shelves_created = self.simulation_data_service.create_shelves_from_map(clear_existing=True)
             print(f"      ✅ Created {shelves_created} shelves from warehouse map")
             
-            # Create demo inventory data based on actual warehouse layout
-            # From sample_warehouse.csv: shelves are in rows 3, 6, 9 (0-indexed)
-            # Warehouse is 10x14, with shelves from x=3 to x=7
-            # Shelf IDs now use grid coordinates: shelf_x_y
+            # Create demo inventory data using default assignment strategy
+            # Items will be automatically assigned to random available shelves
             demo_inventory = [
-                {'item_id': 'laptop_001', 'name': 'Gaming Laptop', 'shelf_id': 'shelf_3_3', 'quantity': 5},
-                {'item_id': 'phone_001', 'name': 'Smartphone', 'shelf_id': 'shelf_4_3', 'quantity': 10},
-                {'item_id': 'tablet_001', 'name': 'Tablet', 'shelf_id': 'shelf_6_3', 'quantity': 8},
-                {'item_id': 'headphones_001', 'name': 'Wireless Headphones', 'shelf_id': 'shelf_7_3', 'quantity': 15},
-                {'item_id': 'keyboard_001', 'name': 'Mechanical Keyboard', 'shelf_id': 'shelf_3_6', 'quantity': 12},
-                {'item_id': 'mouse_001', 'name': 'Gaming Mouse', 'shelf_id': 'shelf_4_6', 'quantity': 20},
-                {'item_id': 'monitor_001', 'name': '4K Monitor', 'shelf_id': 'shelf_6_6', 'quantity': 6},
-                {'item_id': 'speaker_001', 'name': 'Bluetooth Speaker', 'shelf_id': 'shelf_7_6', 'quantity': 9},
-                {'item_id': 'camera_001', 'name': 'Action Camera', 'shelf_id': 'shelf_3_9', 'quantity': 7},
-                {'item_id': 'drone_001', 'name': 'Quadcopter Drone', 'shelf_id': 'shelf_4_9', 'quantity': 4},
-                {'item_id': 'gaming_console_001', 'name': 'Gaming Console', 'shelf_id': 'shelf_6_9', 'quantity': 3},
-                {'item_id': 'vr_headset_001', 'name': 'VR Headset', 'shelf_id': 'shelf_7_9', 'quantity': 8},
-                # Add missing items from sample_orders.json
-                {'item_id': 'book_001', 'name': 'Programming Book', 'shelf_id': 'shelf_3_3', 'quantity': 15},
-                {'item_id': 'audio_001', 'name': 'Audio Equipment', 'shelf_id': 'shelf_4_6', 'quantity': 6},
+                {'item_id': 'laptop_001', 'name': 'Gaming Laptop', 'quantity': 5},
+                {'item_id': 'phone_001', 'name': 'Smartphone', 'quantity': 10},
+                {'item_id': 'tablet_001', 'name': 'Tablet', 'quantity': 8},
+                {'item_id': 'headphones_001', 'name': 'Wireless Headphones', 'quantity': 15},
+                {'item_id': 'keyboard_001', 'name': 'Mechanical Keyboard', 'quantity': 12},
+                {'item_id': 'mouse_001', 'name': 'Gaming Mouse', 'quantity': 20},
+                {'item_id': 'monitor_001', 'name': '4K Monitor', 'quantity': 6},
+                {'item_id': 'speaker_001', 'name': 'Bluetooth Speaker', 'quantity': 9},
+                {'item_id': 'camera_001', 'name': 'Action Camera', 'quantity': 7},
+                {'item_id': 'drone_001', 'name': 'Quadcopter Drone', 'quantity': 4},
+                {'item_id': 'gaming_console_001', 'name': 'Gaming Console', 'quantity': 3},
+                {'item_id': 'vr_headset_001', 'name': 'VR Headset', 'quantity': 8},
+                {'item_id': 'book_001', 'name': 'Programming Book', 'quantity': 15},
+                {'item_id': 'audio_001', 'name': 'Audio Equipment', 'quantity': 6},
             ]
             
             # Populate inventory
@@ -440,7 +447,13 @@ class MultiRobotSimulationManager:
             # Get inventory statistics
             stats = self.simulation_data_service.get_inventory_statistics()
             print(f"      📊 Inventory stats: {stats['total_items']} items across {stats['total_shelves']} shelves")
-            
+
+            # Export initial inventory status
+            if self.simulation_data_service.export_inventory_status_csv("initial_inventory_status.csv"):
+                print("      📊 Initial inventory status exported: initial_inventory_status.csv")
+            else:
+                print("      ⚠️  Failed to export initial inventory status")
+
         except Exception as e:
             print(f"      ⚠️  Warning: Could not populate inventory: {e}")
             print("      Continuing with mock inventory...")
@@ -650,14 +663,14 @@ class MultiRobotSimulationManager:
         try:
             overview = self.simulation_data_service.get_kpi_overview()
             print("\n📊 KPI SUMMARY:")
-            print(f"   ✅ Tasks Completed: {overview.get('tasks_completed', 0)}")
+            print(f"   🧩 PD Tasks Completed: {overview.get('pd_tasks_completed', 0)} | PD Tasks Failed: {overview.get('pd_tasks_failed', 0)} | PD Success: {overview.get('pd_success_rate', 0):.1f}% | PD Avg Time: {overview.get('pd_avg_task_time_seconds', 0):.1f}s")
+            print(f"   ✅ Overall Tasks Completed: {overview.get('tasks_completed', 0)}")
             print(f"   ❌ Tasks Failed: {overview.get('tasks_failed', 0)}")
             print(f"   📈 Success Rate: {overview.get('task_success_rate', 0):.1f}%")
-            print(f"   ⏱️  Avg Task Time: {overview.get('avg_task_time_seconds', 0):.1f}s")
-            print(f"   🧩 PD Completed: {overview.get('pd_tasks_completed', 0)} | PD Failed: {overview.get('pd_tasks_failed', 0)} | PD Success: {overview.get('pd_success_rate', 0):.1f}% | PD Avg Time: {overview.get('pd_avg_task_time_seconds', 0):.1f}s")
-            print(f"   💼 Busy Time: {overview.get('busy_time_seconds', 0):.1f}s")
+            #print(f"   💼 Busy Time: {overview.get('busy_time_seconds', 0):.1f}s")
             print(f"   📊 Avg Busy % per Robot: {overview.get('avg_busy_percent_per_robot', 0):.1f}%")
             print(f"   🆓 Avg Idle % per Robot: {overview.get('avg_idle_percent_per_robot', 0):.1f}%")
+            print(f"   💥 Collisions: {overview.get('collision_count', 0)}")
 
             if export_enabled:
                 if self.simulation_data_service.export_kpi_overview_csv(overview, export_path):
@@ -666,6 +679,13 @@ class MultiRobotSimulationManager:
                     print(f"   ⚠️  KPI CSV export failed: {export_path}")
         except Exception as e:
             print(f"   ⚠️  KPI summary unavailable: {e}")
+
+        # Export final inventory status
+        print("\n📊 Exporting Final Inventory Status...")
+        if self.simulation_data_service.export_inventory_status_csv("final_inventory_status.csv"):
+            print("      📊 Final inventory status exported: final_inventory_status.csv")
+        else:
+            print("      ⚠️  Failed to export final inventory status")
 
         print("   ✅ Multi-robot simulation stopped cleanly")
     

@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 import json
+import random
 from contextlib import contextmanager
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
@@ -142,6 +143,29 @@ class SimulationDataServiceImpl(ISimulationDataService):
             logger.error(f"Failed to initialize KPI recorder, falling back to direct DB writes: {e}")
 
         logger.info(f"SimulationDataService initialized with database {db_name}@{db_host}:{db_port}")
+
+        # Inject KPI recorder into SharedMuJoCoEngine when present for collision KPIs
+        try:
+            # Some demos pass the engine into robots and keep a reference accessible
+            # If the warehouse map or other subsystem exposes the engine, skip. Here we only set when possible.
+            from simulation.shared_mujoco_engine import SharedMuJoCoEngine
+            for attr_name in dir(self):
+                try:
+                    candidate = getattr(self, attr_name)
+                    if isinstance(candidate, SharedMuJoCoEngine):
+                        try:
+                            candidate.set_kpi_recorder(
+                                self._kpi_recorder,
+                                run_id_provider=lambda: getattr(self, "_current_simulation_run_id", None)
+                            )
+                            logger.info("Injected KPI recorder into SharedMuJoCoEngine for collision KPIs")
+                        except Exception as ie:
+                            logger.error(f"Failed to inject KPI recorder into engine: {ie}")
+                except Exception:
+                    continue
+        except Exception:
+            # Best-effort only; engines are typically created in demos and can call set_kpi_recorder directly
+            pass
     
     def _initialize_database(self) -> None:
         """Initialize database connection pool and verify schema."""
@@ -1041,41 +1065,159 @@ class SimulationDataServiceImpl(ISimulationDataService):
         except Exception as e:
             logger.error(f"Failed to create shelves from map: {e}")
             raise SimulationDataServiceError(f"Shelf creation failed: {e}")
-    
-    def populate_inventory(self, inventory_data: List[Dict[str, Any]]) -> int:
+
+    def _select_shelf_for_item(self, item_data: Dict[str, Any],
+                              assignment_strategy: str,
+                              strategy_options: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Select appropriate shelf based on assignment strategy.
+
+        Args:
+            item_data: Item data dictionary
+            assignment_strategy: Strategy to use for assignment
+            strategy_options: Additional configuration for the strategy
+
+        Returns:
+            str: Selected shelf ID
+
+        Raises:
+            SimulationDataServiceError: If no suitable shelf can be found
+        """
+        try:
+            available_shelves = list(self.warehouse_map.shelves.keys())
+
+            if not available_shelves:
+                raise SimulationDataServiceError("No shelves available for inventory assignment")
+
+            if assignment_strategy == "random":
+                return self._get_random_shelf(available_shelves)
+            elif assignment_strategy == "load_balanced":
+                # For now, fall back to random since load balancing isn't implemented yet
+                logger.warning(f"Load balanced strategy not yet implemented, falling back to random assignment")
+                return self._get_random_shelf(available_shelves)
+            elif assignment_strategy == "category_based":
+                # For now, fall back to random since category-based isn't implemented yet
+                logger.warning(f"Category-based strategy not yet implemented, falling back to random assignment")
+                return self._get_random_shelf(available_shelves)
+            elif assignment_strategy == "proximity_based":
+                # For now, fall back to random since proximity-based isn't implemented yet
+                logger.warning(f"Proximity-based strategy not yet implemented, falling back to random assignment")
+                return self._get_random_shelf(available_shelves)
+            else:
+                # This should not happen due to validation above, but just in case
+                logger.warning(f"Unknown assignment strategy '{assignment_strategy}', falling back to random assignment")
+                return self._get_random_shelf(available_shelves)
+
+        except SimulationDataServiceError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to select shelf for item {item_data.get('item_id', 'unknown')}: {e}")
+            # Final fallback to random assignment
+            logger.warning(f"Falling back to random assignment due to error: {e}")
+            try:
+                available_shelves = list(self.warehouse_map.shelves.keys())
+                return self._get_random_shelf(available_shelves)
+            except Exception:
+                raise SimulationDataServiceError(f"Unable to assign shelf for item {item_data.get('item_id', 'unknown')}")
+
+    def _get_random_shelf(self, available_shelves: List[str]) -> str:
+        """
+        Select random available shelf.
+
+        Args:
+            available_shelves: List of available shelf IDs
+
+        Returns:
+            str: Randomly selected shelf ID
+        """
+        return random.choice(available_shelves)
+
+    def populate_inventory(self, inventory_data: List[Dict[str, Any]],
+                          assignment_strategy: str = "random",
+                          strategy_options: Optional[Dict[str, Any]] = None) -> int:
         """
         Populate inventory with items and assign them to shelves.
-        
+
         Args:
             inventory_data: List of inventory data dictionaries with format:
                 {
                     'item_id': str,
                     'name': str,
                     'description': str (optional),
-                    'category': str (optional),
-                    'shelf_id': str,
-                    'quantity': int
+                    'category': str (optional),  # Used for category-based assignment
+                    'shelf_id': str (optional), # If provided, overrides strategy
+                    'quantity': int,
+                    'priority': str (optional)  # Used for proximity-based assignment
                 }
-            
+            assignment_strategy: Strategy for assigning items without explicit shelf_id:
+                - "random": Assign randomly from available shelves (default)
+                - "load_balanced": Assign to least utilized shelf
+                - "category_based": Group items by category and assign to zones
+                - "proximity_based": Assign high-priority items closer to picking stations
+            strategy_options: Additional configuration for the strategy:
+                - category_zones: Dict mapping categories to shelf ID prefixes
+                - priority_zones: Dict mapping priorities to shelf ID prefixes
+                - max_shelf_capacity: Maximum items per shelf
+
         Returns:
             int: Number of inventory entries created
-            
+
         Raises:
             SimulationDataServiceError: If inventory population fails
         """
         try:
+            # Validate strategy options
+            if strategy_options is None:
+                strategy_options = {}
+
+            # Validate assignment strategy
+            valid_strategies = ["random", "load_balanced", "category_based", "proximity_based"]
+            if assignment_strategy not in valid_strategies:
+                logger.warning(f"Invalid assignment strategy '{assignment_strategy}', falling back to 'random'")
+                assignment_strategy = "random"
+
+            # Get available shelves
+            available_shelves = list(self.warehouse_map.shelves.keys())
+            if not available_shelves:
+                raise SimulationDataServiceError("No shelves available for inventory assignment")
+
             with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     inventory_created = 0
-                    
+
                     for item_data in inventory_data:
+                        # Validate required fields
+                        if 'item_id' not in item_data or 'name' not in item_data or 'quantity' not in item_data:
+                            logger.warning(f"Skipping invalid item data (missing required fields): {item_data}")
+                            continue
+
+                        # Validate quantity is positive
+                        if not isinstance(item_data['quantity'], int) or item_data['quantity'] <= 0:
+                            logger.warning(f"Skipping item with invalid quantity: {item_data}")
+                            continue
+
+                        # Use explicit shelf_id if provided, otherwise apply strategy
+                        shelf_id = item_data.get('shelf_id')
+                        if not shelf_id:
+                            try:
+                                shelf_id = self._select_shelf_for_item(item_data, assignment_strategy, strategy_options)
+                                logger.debug(f"Assigned item '{item_data['item_id']}' to shelf '{shelf_id}' using {assignment_strategy} strategy")
+                            except Exception as e:
+                                logger.error(f"Failed to assign shelf for item '{item_data['item_id']}': {e}")
+                                continue
+
+                        # Validate shelf exists
+                        if shelf_id not in available_shelves:
+                            logger.warning(f"Shelf '{shelf_id}' not found in warehouse map, skipping item '{item_data['item_id']}'")
+                            continue
+
                         # Insert item if it doesn't exist (let defaults handle created_at/updated_at)
                         cur.execute("""
                             INSERT INTO items (item_id, name)
                             VALUES (%s, %s)
                             ON CONFLICT (item_id) DO NOTHING
                         """, (item_data['item_id'], item_data['name']))
-                        
+
                         # Insert inventory on shelf
                         cur.execute("""
                             INSERT INTO shelf_inventory (shelf_id, item_id, quantity)
@@ -1083,16 +1225,16 @@ class SimulationDataServiceImpl(ISimulationDataService):
                             ON CONFLICT (shelf_id, item_id)
                             DO UPDATE SET quantity = EXCLUDED.quantity
                         """, (
-                            item_data['shelf_id'],
+                            shelf_id,
                             item_data['item_id'],
                             item_data['quantity']
                         ))
-                        
+
                         if cur.rowcount > 0:
                             inventory_created += 1
-                    
+
                     conn.commit()
-                    logger.info(f"Populated {inventory_created} inventory entries")
+                    logger.info(f"Populated {inventory_created} inventory entries using {assignment_strategy} strategy")
                     return inventory_created
                     
         except Exception as e:
@@ -1158,7 +1300,92 @@ class SimulationDataServiceImpl(ISimulationDataService):
         except Exception as e:
             logger.error(f"Failed to get inventory statistics: {e}")
             raise SimulationDataServiceError(f"Failed to get inventory statistics: {e}")
-    
+
+    def export_inventory_status_csv(self, filename: str) -> bool:
+        """
+        Export complete inventory status including reserved quantities to CSV.
+
+        CSV Format:
+        - shelf_id,item_id,item_name,total_quantity,reserved_quantity,available_quantity,created_at,updated_at
+
+        Plus summary statistics at the end.
+
+        Args:
+            filename: Output CSV filename
+
+        Returns:
+            bool: True on success, False on failure
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    # Get complete inventory status with item details
+                    cur.execute("""
+                        SELECT
+                            si.shelf_id,
+                            si.item_id,
+                            i.name as item_name,
+                            si.quantity as total_quantity,
+                            COALESCE(si.pending, 0) as reserved_quantity,
+                            (si.quantity - COALESCE(si.pending, 0)) as available_quantity,
+                            si.created_at,
+                            si.updated_at
+                        FROM shelf_inventory si
+                        JOIN items i ON si.item_id = i.item_id
+                        ORDER BY si.shelf_id, si.item_id
+                    """)
+
+                    inventory_data = cur.fetchall()
+
+                    # Get summary statistics
+                    cur.execute("""
+                        SELECT
+                            COUNT(DISTINCT si.item_id) as total_items,
+                            COUNT(DISTINCT si.shelf_id) as total_shelves,
+                            SUM(si.quantity) as total_quantity,
+                            SUM(COALESCE(si.pending, 0)) as total_reserved,
+                            SUM(si.quantity - COALESCE(si.pending, 0)) as total_available
+                        FROM shelf_inventory si
+                    """)
+
+                    summary = cur.fetchone()
+
+            # Write CSV file
+            import csv
+            with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+
+                # Write header
+                writer.writerow([
+                    'shelf_id', 'item_id', 'item_name',
+                    'total_quantity', 'reserved_quantity', 'available_quantity',
+                    'created_at', 'updated_at'
+                ])
+
+                # Write inventory data
+                for row in inventory_data:
+                    writer.writerow([
+                        row['shelf_id'], row['item_id'], row['item_name'],
+                        row['total_quantity'], row['reserved_quantity'], row['available_quantity'],
+                        row['created_at'], row['updated_at']
+                    ])
+
+                # Write summary statistics
+                writer.writerow([])
+                writer.writerow(['SUMMARY'])
+                writer.writerow(['Total Items', summary['total_items']])
+                writer.writerow(['Total Shelves Used', summary['total_shelves']])
+                writer.writerow(['Total Quantity', summary['total_quantity']])
+                writer.writerow(['Total Reserved', summary['total_reserved']])
+                writer.writerow(['Total Available', summary['total_available']])
+
+            logger.info(f"Inventory status exported to {filename}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to export inventory status to {filename}: {e}")
+            return False
+
     def get_item_inventory(self, item_id: str) -> Optional['ItemInventoryInfo']:
         """
         Get inventory information for a specific item.
@@ -1932,6 +2159,12 @@ class SimulationDataServiceImpl(ISimulationDataService):
             "busy_time_seconds": 0.0,
             "avg_idle_percent_per_robot": 0.0,
             "avg_busy_percent_per_robot": 0.0,
+            # Collision KPIs
+            "collision_count": 0.0,
+            "collision_rate_per_min": 0.0,
+            "collision_types_robot": 0.0,
+            "collision_types_shelf": 0.0,
+            "collision_types_wall": 0.0,
         }
         try:
             effective_run_id = run_id or getattr(self, "_current_simulation_run_id", None)
@@ -2441,6 +2674,167 @@ class SimulationDataServiceImpl(ISimulationDataService):
                             result["avg_idle_percent_per_robot"] = 100.0 - result["avg_busy_percent_per_robot"]
                     except Exception as _:
                         pass
+
+                    # --- Collision KPIs (Database-level dedup within 1-second buckets) ---
+                    # Use per-robot detail rows: metric_name LIKE 'collision_detected_collision_type_%'
+                    # Bucket timestamps into 1-second windows and count unique (robot, type, bucket)
+                    bucket_seconds = 1.0
+                    if robot_id:
+                        metric_name = f"collision_detected_collision_type_{robot_id}"
+                        if effective_run_id:
+                            cur.execute(
+                                """
+                                SELECT COUNT(*) AS cnt FROM (
+                                    SELECT
+                                        FLOOR(EXTRACT(EPOCH FROM metric_timestamp) / %s)::BIGINT AS bucket,
+                                        metric_value::INT AS type_code
+                                    FROM simulation_metrics
+                                    WHERE simulation_run_id = %s AND metric_name = %s
+                                    GROUP BY bucket, type_code
+                                ) s
+                                """,
+                                (bucket_seconds, effective_run_id, metric_name),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                SELECT COUNT(*) AS cnt FROM (
+                                    SELECT
+                                        FLOOR(EXTRACT(EPOCH FROM metric_timestamp) / %s)::BIGINT AS bucket,
+                                        metric_value::INT AS type_code
+                                    FROM simulation_metrics
+                                    WHERE metric_name = %s
+                                    GROUP BY bucket, type_code
+                                ) s
+                                """,
+                                (bucket_seconds, metric_name),
+                            )
+                    else:
+                        like = 'collision_detected_collision_type_%'
+                        if effective_run_id:
+                            cur.execute(
+                                """
+                                SELECT COUNT(*) AS cnt FROM (
+                                    SELECT
+                                        REGEXP_REPLACE(metric_name, '^collision_detected_collision_type_', '') AS rid,
+                                        FLOOR(EXTRACT(EPOCH FROM metric_timestamp) / %s)::BIGINT AS bucket,
+                                        metric_value::INT AS type_code
+                                    FROM simulation_metrics
+                                    WHERE simulation_run_id = %s AND metric_name LIKE %s
+                                    GROUP BY rid, bucket, type_code
+                                ) s
+                                """,
+                                (bucket_seconds, effective_run_id, like),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                SELECT COUNT(*) AS cnt FROM (
+                                    SELECT
+                                        REGEXP_REPLACE(metric_name, '^collision_detected_collision_type_', '') AS rid,
+                                        FLOOR(EXTRACT(EPOCH FROM metric_timestamp) / %s)::BIGINT AS bucket,
+                                        metric_value::INT AS type_code
+                                    FROM simulation_metrics
+                                    WHERE metric_name LIKE %s
+                                    GROUP BY rid, bucket, type_code
+                                ) s
+                                """,
+                                (bucket_seconds, like),
+                            )
+                    r = cur.fetchone() or {}
+                    dedup_count = float(r.get("cnt", 0) or 0)
+                    result["collision_count"] = dedup_count
+
+                    # Collision rate per minute based on deduped count and run duration
+                    try:
+                        if effective_run_id:
+                            cur.execute(
+                                """
+                                SELECT EXTRACT(EPOCH FROM (MAX(metric_timestamp) - MIN(metric_timestamp))) AS seconds
+                                FROM simulation_metrics WHERE simulation_run_id = %s
+                                """,
+                                (effective_run_id,),
+                            )
+                            rr = cur.fetchone() or {}
+                            seconds = float(rr.get("seconds", 0.0) or 0.0)
+                            minutes = max(1.0 / 60.0, seconds / 60.0)
+                            result["collision_rate_per_min"] = dedup_count / minutes if minutes > 0 else 0.0
+                    except Exception:
+                        pass
+
+                    # Collision type breakdown on deduped events
+                    if robot_id:
+                        metric_name = f"collision_detected_collision_type_{robot_id}"
+                        if effective_run_id:
+                            cur.execute(
+                                """
+                                SELECT type_code, COUNT(*) AS cnt FROM (
+                                    SELECT
+                                        FLOOR(EXTRACT(EPOCH FROM metric_timestamp) / %s)::BIGINT AS bucket,
+                                        metric_value::INT AS type_code
+                                    FROM simulation_metrics
+                                    WHERE simulation_run_id = %s AND metric_name = %s
+                                    GROUP BY bucket, type_code
+                                ) s GROUP BY type_code
+                                """,
+                                (bucket_seconds, effective_run_id, metric_name),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                SELECT type_code, COUNT(*) AS cnt FROM (
+                                    SELECT
+                                        FLOOR(EXTRACT(EPOCH FROM metric_timestamp) / %s)::BIGINT AS bucket,
+                                        metric_value::INT AS type_code
+                                    FROM simulation_metrics
+                                    WHERE metric_name = %s
+                                    GROUP BY bucket, type_code
+                                ) s GROUP BY type_code
+                                """,
+                                (bucket_seconds, metric_name),
+                            )
+                    else:
+                        like = 'collision_detected_collision_type_%'
+                        if effective_run_id:
+                            cur.execute(
+                                """
+                                SELECT type_code, COUNT(*) AS cnt FROM (
+                                    SELECT
+                                        REGEXP_REPLACE(metric_name, '^collision_detected_collision_type_', '') AS rid,
+                                        FLOOR(EXTRACT(EPOCH FROM metric_timestamp) / %s)::BIGINT AS bucket,
+                                        metric_value::INT AS type_code
+                                    FROM simulation_metrics
+                                    WHERE simulation_run_id = %s AND metric_name LIKE %s
+                                    GROUP BY rid, bucket, type_code
+                                ) s GROUP BY type_code
+                                """,
+                                (bucket_seconds, effective_run_id, like),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                SELECT type_code, COUNT(*) AS cnt FROM (
+                                    SELECT
+                                        REGEXP_REPLACE(metric_name, '^collision_detected_collision_type_', '') AS rid,
+                                        FLOOR(EXTRACT(EPOCH FROM metric_timestamp) / %s)::BIGINT AS bucket,
+                                        metric_value::INT AS type_code
+                                    FROM simulation_metrics
+                                    WHERE metric_name LIKE %s
+                                    GROUP BY rid, bucket, type_code
+                                ) s GROUP BY type_code
+                                """,
+                                (bucket_seconds, like),
+                            )
+                    rows = cur.fetchall() or []
+                    type_counts: Dict[int, float] = {}
+                    for rowtc in rows:
+                        if isinstance(rowtc, dict):
+                            type_counts[int(rowtc.get('type_code', 0) or 0)] = float(rowtc.get('cnt', 0) or 0)
+                    result["collision_types_robot"] = type_counts.get(1, 0.0)
+                    result["collision_types_shelf"] = type_counts.get(2, 0.0)
+                    result["collision_types_wall"] = type_counts.get(3, 0.0)
+                    # To expose shelf and wall separately, we would need per-type metric names.
+                    # For now, keep robot sum and allow total count/rate for visibility.
 
         except Exception as e:
             logger.error(f"[DEBUG] CRITICAL: Failed to build KPI overview: {e}")
