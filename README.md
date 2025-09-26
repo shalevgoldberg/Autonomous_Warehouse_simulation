@@ -207,6 +207,138 @@ except Exception as e:
 "
 ```
 
+#### 4.4 Robot Registry Setup and Configuration
+
+The **Robot Registry** is a database-backed system for managing robot identities and their persistent runtime state (position and battery level). This enables robots to maintain their state across simulation runs and supports deterministic robot selection.
+
+##### Database Schema Overview
+
+The robot registry uses two main tables:
+
+**`robots` table:**
+- `robot_id`: Unique identifier (36-character UUID, MuJoCo-safe format)
+- `name`: Human-friendly name (optional)
+- `created_at`, `updated_at`: Timestamps
+
+**`robot_runtime_state` table:**
+- `robot_id`: Foreign key to robots table
+- `pos_x`, `pos_y`, `theta`: Position data (NULL when unplaced)
+- `battery_level`: Battery percentage (0.0-1.0, persists across runs)
+
+##### Robot Management CLI
+
+The `robot_registry_cli.py` provides comprehensive robot management:
+
+```bash
+# List all registered robots
+python -m warehouse.robot_registry_cli list
+
+# Register individual robot
+python -m warehouse.robot_registry_cli register --id "robot_001" --name "Alpha"
+
+# Register multiple robots (auto-generates MuJoCo-safe IDs)
+python -m warehouse.robot_registry_cli register-bulk --count 3 --name-prefix "DemoRobot"
+
+# Delete specific robot
+python -m warehouse.robot_registry_cli delete --id "robot_001"
+
+# Delete all robots
+python -m warehouse.robot_registry_cli delete-all
+
+# Charge all robots to 100% battery
+python -m warehouse.robot_registry_cli charge-all
+
+# Clear positions for all robots (keeps battery levels)
+python -m warehouse.robot_registry_cli clear-positions
+```
+
+##### Automatic Sample Fleet Creation
+
+The `load_new_warehouse.py` script automatically creates a sample robot fleet if no robots exist:
+
+```bash
+# Load warehouse and auto-create 3 sample robots if none exist
+python load_new_warehouse.py --warehouse sample_warehouse.csv
+```
+
+**Sample Output:**
+```
+[INFO] No robots found in database - creating sample fleet
+[SUCCESS] Created sample robot fleet: 3 robots
+[INFO]    🤖 Sample robots: ['SampleRobot DB3A5A77', 'SampleRobot 817B1373', 'SampleRobot 67C860B9']
+[INFO]    🆔 Robot IDs: ['db3a5a77...', '817b1373...', '67c860b9...']
+```
+
+##### Robot ID Format
+
+Robot IDs are generated as 32-character hexadecimal strings (no hyphens) for MuJoCo compatibility:
+- **Format**: `uuid.uuid4().hex` (e.g., `db3a5a77c823400c90b3bfbca7b49ce5`)
+- **MuJoCo-Safe**: No special characters that could break joint/body naming
+- **Collision-Free**: Ensures unique identifiers across all robots
+
+##### Integration with Simulations
+
+The robot registry automatically:
+- **Persists positions**: Robots remember their last positions between runs
+- **Manages battery levels**: Battery state survives simulation restarts
+- **Supports selective runs**: Choose specific robots or all registered robots
+- **Handles warehouse resets**: Clears positions when loading new warehouses
+
+**Example: Run with specific robots**
+```bash
+# Run with first 2 robots from registry
+python demo_multi_robot_orders_simulation.py --robots 2 --placement persisted
+
+# Run with all registered robots
+python demo_multi_robot_orders_simulation.py --robots 0 --placement persisted
+```
+
+##### Troubleshooting Robot Registry
+
+**"No robots found" when running simulation:**
+```bash
+# Check registered robots
+python -m warehouse.robot_registry_cli list
+
+# Create sample fleet if empty
+python -m warehouse.robot_registry_cli register-bulk --count 3 --name-prefix "Robot"
+```
+
+**"MuJoCo joint names not found" errors:**
+- Robot IDs are automatically MuJoCo-safe (hexadecimal format)
+- If you registered robots manually, ensure IDs contain only alphanumeric characters
+- Regenerate IDs: delete and re-register robots with the CLI
+
+**Robot positions not persisting:**
+```bash
+# Check current positions
+python -c "
+from warehouse.impl.robot_registry_impl import RobotRegistryImpl
+from simulation.simulation_data_service_impl import SimulationDataServiceImpl
+from warehouse.map import WarehouseMap
+
+wm = WarehouseMap()
+sds = SimulationDataServiceImpl(wm)
+registry = RobotRegistryImpl(sds)
+
+for robot in registry.list_registered_robots():
+    state = registry.get_robot_state(robot.robot_id)
+    if state and state.position:
+        print(f'{robot.robot_id}: {state.position}')
+    else:
+        print(f'{robot.robot_id}: no position')
+"
+```
+
+**Database permission errors:**
+```bash
+# Ensure your database user has permissions on robot tables
+psql -U your_username -d warehouse_sim
+GRANT ALL ON robots TO your_username;
+GRANT ALL ON robot_runtime_state TO your_username;
+\q
+```
+
 ## 🚀 Running the System
 
 ### Basic Multi-Robot Demo
@@ -225,6 +357,28 @@ python3 demo_multi_robot_orders_simulation.py
 
 # Manual robot placement
 .\venv311\Scripts\python.exe demo_multi_robot_orders_simulation.py --robots 2 --placement manual
+
+# Persisted placement (uses robot registry - recommended)
+.\venv311\Scripts\python.exe demo_multi_robot_orders_simulation.py --robots 0 --placement persisted
+```
+
+### Robot Registry Integration
+
+The robot registry enables persistent robot state across simulation runs:
+
+```bash
+# 1. First, ensure robots are registered (if not, warehouse loading auto-creates sample fleet)
+python -m warehouse.robot_registry_cli list
+
+# 2. Run simulation with persisted robots (uses all registered robots)
+.\venv311\Scripts\python.exe demo_multi_robot_orders_simulation.py --robots 0 --placement persisted
+
+# 3. Run simulation with specific number of robots from registry
+.\venv311\Scripts\python.exe demo_multi_robot_orders_simulation.py --robots 2 --placement persisted
+
+# 4. Manage robots between runs
+python -m warehouse.robot_registry_cli charge-all  # Charge all robots
+python -m warehouse.robot_registry_cli clear-positions  # Reset all positions
 ```
 
 ### Other Demo Scripts
@@ -291,6 +445,79 @@ python -c "import mujoco; print('MuJoCo OK')"
 pip install -r requirements.txt --force-reinstall
 ```
 
+### Robot Registry Issues
+
+**"No robots found" or empty robot list:**
+```bash
+# Check if robots are registered
+python -m warehouse.robot_registry_cli list
+
+# Create sample fleet if needed
+python -m warehouse.robot_registry_cli register-bulk --count 3 --name-prefix "Robot"
+
+# Or load warehouse (auto-creates sample fleet if none exist)
+python load_new_warehouse.py --warehouse sample_warehouse.csv
+```
+
+**Robot positions not persisting between runs:**
+```bash
+# Verify positions are being saved
+python -m warehouse.robot_registry_cli list  # Should show robot names
+
+# Check specific robot state
+python -c "
+from warehouse.impl.robot_registry_impl import RobotRegistryImpl
+from simulation.simulation_data_service_impl import SimulationDataServiceImpl
+from warehouse.map import WarehouseMap
+
+wm = WarehouseMap()
+sds = SimulationDataServiceImpl(wm)
+registry = RobotRegistryImpl(sds)
+
+for robot in registry.list_registered_robots():
+    state = registry.get_robot_state(robot.robot_id)
+    print(f'{robot.robot_id}: position={state.position if state else None}, battery={state.battery_level if state else None}')
+"
+```
+
+**MuJoCo joint/body name errors:**
+- Robot IDs are automatically generated as MuJoCo-safe (hexadecimal format)
+- If manually registered, ensure IDs contain only alphanumeric characters
+- Fix: Delete and re-register robots using the CLI
+
+**Database permission errors with robot tables:**
+```bash
+# Grant permissions to your database user
+psql -U your_username -d warehouse_sim
+GRANT ALL ON robots TO your_username;
+GRANT ALL ON robot_runtime_state TO your_username;
+GRANT ALL ON warehouse_map TO your_username;  # If using load_new_warehouse.py
+\q
+```
+
+**Simulation fails to start with robot registry:**
+```bash
+# 1. Verify database connection
+python -c "
+from utils.database_config import get_database_config
+config = get_database_config()
+print('✅ Database config OK')
+"
+
+# 2. Check warehouse data exists
+python -c "
+from simulation.simulation_data_service_impl import SimulationDataServiceImpl
+from warehouse.map import WarehouseMap
+wm = WarehouseMap()
+sds = SimulationDataServiceImpl(wm)
+boxes = sds.get_conflict_boxes()
+print(f'✅ Navigation graph: {len(boxes)} boxes found')
+"
+
+# 3. Check robots exist
+python -m warehouse.robot_registry_cli list
+```
+
 ## 📚 Project Structure
 
 ```
@@ -300,6 +527,8 @@ autonomous-warehouse-v2/
 ├── robot/                  # Robot agent implementations
 ├── simulation/             # Physics and visualization
 ├── warehouse/              # Warehouse management and data models
+│   ├── robot_registry_cli.py      # Robot registry command-line interface
+│   └── impl/                      # Robot registry implementation
 ├── tests/                  # Unit and integration tests
 ├── utils/                  # Utility functions
 ├── *.py                    # Demo and utility scripts

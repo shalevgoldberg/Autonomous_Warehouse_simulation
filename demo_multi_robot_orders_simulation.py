@@ -12,12 +12,8 @@ Demonstrates coordinated multi-robot operation with:
 - Integrated order processing from configurable JSON orders file
 - Support for different warehouse layouts via CSV configuration
 
-⚠️  DEMO CONFIGURATION: Lane tolerance set to 3.0m (too soft for production!)
-    This allows tasks to complete despite navigation issues. For production,
-    use 0.1-0.3m tolerance for safe warehouse operation.
-
 CLI ARGUMENTS:
-    --robots N              Number of robots to simulate (default: 3)
+    --robots N              Number of robots to simulate
     --placement MODE        Robot placement: 'random' or 'manual' (default: random)
     --orders FILE           JSON orders file to process (default: sample_orders.json)
 
@@ -78,6 +74,8 @@ from pathlib import Path
 from warehouse.impl.robot_controller_impl import RobotController
 from warehouse.impl.transparent_bidding_system_impl import TransparentBiddingSystem
 from warehouse.impl.jobs_queue_impl import JobsQueueImpl
+from warehouse.impl.robot_registry_impl import RobotRegistryImpl
+from interfaces.robot_registry_interface import RobotRuntimeState, RobotIdentity
 
 
 @dataclass
@@ -112,7 +110,7 @@ class MultiRobotSimulationManager:
     and visualization following clean architecture principles.
     """
     
-    def __init__(self, robot_count: int = 2, placement_mode: str = "random", orders_file: str = "sample_orders.json"):
+    def __init__(self, robot_count: int = 0, placement_mode: str = "persisted", orders_file: str = "sample_orders.json"):
         """Initialize simulation manager."""
         print("🚀 Initializing Multi-Robot Warehouse Simulation")
         print(f"   🤖 Robot Count: {robot_count}")
@@ -123,10 +121,14 @@ class MultiRobotSimulationManager:
         #if robot_count < 1 or robot_count > 15:
         #    raise ValueError("Robot count must be between 1 and 15 for demo purposes")
 
+        # robot_count == 0 means: use all robots from registry
         self.robot_count = robot_count
+        # placement_mode in {persisted, random, manual}
         self.placement_mode = placement_mode
         self.orders_file = orders_file
         self.robots: List[RobotInstance] = []
+        # Selected robots (identities) for this run
+        self._selected_robots: List[RobotIdentity] = []
 
         # Try to initialize simulation with existing warehouse data
         try:
@@ -205,14 +207,16 @@ class MultiRobotSimulationManager:
             self.config_provider = ConfigurationProvider()
             print("   ✅ Configuration provider initialized")
 
-            # Set robot placement mode based on CLI argument
+            # Set robot placement mode for legacy consumers
             random_placement = self.placement_mode == "random"
             self.config_provider.set_value("demo.random_robot_placement", random_placement)
 
-            if random_placement:
+            if self.placement_mode == "random":
                 print("   ✅ Random robot placement enabled")
-            else:
+            elif self.placement_mode == "manual":
                 print("   ✅ Manual robot placement enabled (fixed positions)")
+            else:
+                print("   ✅ Persisted robot placement enabled (DB-backed)")
 
             # Shared MuJoCo engine for all robots (uses verified map)
             self.shared_engine = SharedMuJoCoEngine(self.warehouse_map, physics_dt=0.001, enable_time_gating=True,
@@ -237,7 +241,21 @@ class MultiRobotSimulationManager:
             except Exception as e:
                 print(f"   ⚠️  Warning: Could not clear conflict box locks: {e}")
 
-            # Register all robots with shared engine BEFORE initialization
+            # (moved) Robot selection and engine registration happen after registry init below
+
+            # Initialize robot registry (DB-backed)
+            try:
+                self.robot_registry = RobotRegistryImpl(self.simulation_data_service)
+                print("   ✅ Robot registry initialized")
+            except Exception as e:
+                print(f"   ❌ Failed to initialize robot registry: {e}")
+                logging.error(f"EXCEPTION: Robot registry initialization failed: {e}", exc_info=True)
+                raise
+
+            # Select robots for this run via registry (deterministic by name)
+            self._select_robots_via_registry()
+
+            # Register all selected robots with shared engine BEFORE initialization
             self._register_robots_with_engine()
 
             # Initialize shared engine (creates appearance service)
@@ -425,74 +443,142 @@ class MultiRobotSimulationManager:
 
         return random.sample(filtered_cells, count)
 
+    def _find_random_walkable_positions_excluding(self, count: int, exclude_cells: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        """
+        Variant of random position finder that excludes specified grid cells.
+        """
+        import random
+        from interfaces.navigation_types import Point
+
+        # Get all walkable cells (grid coordinates)
+        walkable_cells = []
+        for grid_y in range(self.warehouse_map.height):
+            for grid_x in range(self.warehouse_map.width):
+                if self.warehouse_map.grid[grid_y, grid_x] in [0, 3, 4, 5]:
+                    world_pos = self.warehouse_map.grid_to_world(grid_x, grid_y)
+                    walkable_cells.append((grid_x, grid_y, world_pos[0], world_pos[1]))
+
+        # Get conflict boxes (best-effort)
+        try:
+            conflict_boxes = self.simulation_data_service.get_conflict_boxes()
+        except Exception as e:
+            print(f"   ⚠️  Could not load conflict boxes, proceeding without conflict box avoidance: {e}")
+            conflict_boxes = []
+
+        # Build exclusion set for quick checks
+        exclude_set = set(exclude_cells)
+
+        filtered_cells: List[Tuple[int, int]] = []
+        for grid_x, grid_y, world_x, world_y in walkable_cells:
+            if (grid_x, grid_y) in exclude_set:
+                continue
+            cell_safe = True
+            for box in conflict_boxes:
+                half_w = box.width * 0.5
+                half_h = box.height * 0.5
+                if (abs(world_x - box.center.x) <= half_w and
+                    abs(world_y - box.center.y) <= half_h):
+                    cell_safe = False
+                    break
+            if cell_safe:
+                filtered_cells.append((grid_x, grid_y))
+
+        if len(filtered_cells) < count:
+            print(f"   ⚠️  Only {len(filtered_cells)} safe walkable cells available after exclusion, using all of them")
+            return filtered_cells
+        return random.sample(filtered_cells, count)
+
     def _register_robots_with_engine(self) -> None:
-        """Register all robots with shared engine before initialization."""
+        """Register selected robots with shared engine, honoring placement mode."""
         print("   🤖 Registering robots with shared engine...")
 
-        # Check if random placement is enabled
-        random_placement_config = self.config_provider.get_value("demo.random_robot_placement", True)
-        random_placement = random_placement_config.value if hasattr(random_placement_config, 'value') else random_placement_config
+        selected_ids = [ri.robot_id for ri in self._selected_robots]
 
-        if random_placement:
+        if self.placement_mode == "random":
             print("   🎲 Using random robot placement...")
-            # Find random walkable positions
-            random_positions = self._find_random_walkable_positions(self.robot_count)
-
-            for i in range(self.robot_count):
-                robot_id = f"warehouse_robot_{i+1}"
-                if i < len(random_positions):
-                    grid_x, grid_y = random_positions[i]
-                    world_pos = self.warehouse_map.grid_to_world(grid_x, grid_y)
-                    print(f"      🎯 {robot_id} -> Grid ({grid_x}, {grid_y}) -> World ({world_pos[0]:.2f}, {world_pos[1]:.2f})")
-                    self.shared_engine.register_robot(robot_id, (world_pos[0], world_pos[1], 0.0))
+            random_cells = self._find_random_walkable_positions(len(selected_ids))
+            for idx, robot_id in enumerate(selected_ids):
+                if idx < len(random_cells):
+                    gx, gy = random_cells[idx]
+                    wx, wy = self.warehouse_map.grid_to_world(gx, gy)
+                    print(f"      🎯 {robot_id} -> Grid ({gx}, {gy}) -> World ({wx:.2f}, {wy:.2f})")
+                    self.shared_engine.register_robot(robot_id, (wx, wy, 0.0))
                 else:
                     print(f"      ⚠️  No safe position found for {robot_id}, skipping")
-        else:
+        elif self.placement_mode == "manual":
             print("   📍 Using manual robot placement...")
-            # Define starting positions for robots (specific coordinates)
             start_positions = [
-                (6.25,2.25),   # Robot 1: Cell (2, 3)
-                (2.75, 9.25),   # Robot 2: Cell (4, 1)
-                (1.75, 8.25),     # Robot 3: Default position
-                (5.75, 1.25),     # Robot 4: Default position
-                (2.25, 2.75),     # Robot 5: Default position
-                (1.75, 1.25),     # Robot 6: Default position
-                (1.25, 6.25),     # Robot 7: Default position
-                (4.75, 5.75),     # Robot 8: Default position
-                (5.25, 8.25),     # Robot 9: Default position
-                (5.75, 4.75),     # Robot 10: Default position
-                (3.25, 2.25),     # Robot 11: Default position
-                (3.25, 1.75),     # Robot 12: Default position
-                (3.25, 1.25),     # Robot 13: Default position
-                (3.25, 0.75),     # Robot 14: Default position
-                (3.25, 0.25),     # Robot 15: Default position
+                (6.25,2.25),
+                (2.75, 9.25),
+                (1.75, 8.25),
+                (5.75, 1.25),
+                (2.25, 2.75),
+                (1.75, 1.25),
+                (1.25, 6.25),
+                (4.75, 5.75),
+                (5.25, 8.25),
+                (5.75, 4.75),
+                (3.25, 2.25),
+                (3.25, 1.75),
+                (3.25, 1.25),
+                (3.25, 0.75),
+                (3.25, 0.25),
             ]
-
-            for i in range(self.robot_count):
-                robot_id = f"warehouse_robot_{i+1}"
-                if i < len(start_positions):
-                    start_x, start_y = start_positions[i]
-                    print(f"      📍 {robot_id} -> World ({start_x:.2f}, {start_y:.2f})")
+            for idx, robot_id in enumerate(selected_ids):
+                if idx < len(start_positions):
+                    sx, sy = start_positions[idx]
                 else:
-                    # Fallback for additional robots
-                    start_x, start_y = 1.0, float(i)
-                    print(f"      📍 {robot_id} -> Fallback ({start_x:.2f}, {start_y:.2f})")
+                    sx, sy = 1.0, float(idx)
+                print(f"      📍 {robot_id} -> World ({sx:.2f}, {sy:.2f})")
+                self.shared_engine.register_robot(robot_id, (sx, sy, 0.0))
+        else:
+            print("   🧭 Using persisted robot placement (DB-backed)...")
+            # Build reserved cells from robots with persisted positions
+            reserved_cells: List[Tuple[int, int]] = []
+            robots_needing_random: List[str] = []
 
-                # Register robot with shared engine
-                self.shared_engine.register_robot(robot_id, (start_x, start_y, 0.0))
+            # First pass: register robots with valid persisted positions
+            for ri in self._selected_robots:
+                state = self.robot_registry.get_robot_state(ri.robot_id)
+                if state and state.position is not None:
+                    x, y, th = state.position
+                    # Validate walkability
+                    try:
+                        walkable = self.warehouse_map.is_walkable(x, y)
+                    except Exception:
+                        walkable = True
+                    if walkable:
+                        gx, gy = self.warehouse_map.world_to_grid(x, y)
+                        reserved_cells.append((int(gx), int(gy)))
+                        print(f"      🗂️  {ri.robot_id} -> Persisted World ({x:.2f}, {y:.2f})")
+                        self.shared_engine.register_robot(ri.robot_id, (x, y, float(th)))
+                    else:
+                        print(f"      ⚠️  {ri.robot_id} persisted position not walkable, reassigning randomly")
+                        robots_needing_random.append(ri.robot_id)
+                else:
+                    robots_needing_random.append(ri.robot_id)
 
-        print(f"   ✅ Registered {self.robot_count} robots with shared engine")
+            # Second pass: assign non-colliding random cells for remaining robots
+            if robots_needing_random:
+                needed = len(robots_needing_random)
+                random_cells = self._find_random_walkable_positions_excluding(needed, reserved_cells)
+                for idx, robot_id in enumerate(robots_needing_random):
+                    if idx < len(random_cells):
+                        gx, gy = random_cells[idx]
+                        wx, wy = self.warehouse_map.grid_to_world(gx, gy)
+                        reserved_cells.append((gx, gy))
+                        print(f"      🎯 {robot_id} -> Random Grid ({gx}, {gy}) -> World ({wx:.2f}, {wy:.2f})")
+                        self.shared_engine.register_robot(robot_id, (wx, wy, 0.0))
+                    else:
+                        print(f"      ⚠️  No safe random position found for {robot_id}, skipping registration")
+
+        print(f"   ✅ Registered {len(selected_ids)} robots with shared engine")
 
     def _create_robot_agents(self) -> None:
-        """Create multiple robot agents with different starting positions."""
+        """Create robot agents for the selected robots with current engine positions."""
         print("   🤖 Creating robot agents...")
 
-        # Get positions from shared engine (already registered)
-        random_placement_config = self.config_provider.get_value("demo.random_robot_placement", True)
-        random_placement = random_placement_config.value if hasattr(random_placement_config, 'value') else random_placement_config
-
-        for i in range(self.robot_count):
-            robot_id = f"warehouse_robot_{i+1}"
+        for robot_id in [ri.robot_id for ri in self._selected_robots]:
 
             # Get starting position from shared engine
             try:
@@ -502,18 +588,19 @@ class MultiRobotSimulationManager:
                 start_grid_x, start_grid_y = int(grid_pos[0]), int(grid_pos[1])
             except Exception as e:
                 print(f"      ⚠️  Could not get position for {robot_id}: {e}")
-                # Fallback to manual positions if registration fails
+                # Fallback to manual-like positions if registration fails
                 fallback_positions = [
-                    (2.75, 1.25),   # Robot 1: Cell (5, 2)
-                    (2.25, 0.75),   # Robot 2: Cell (4, 1)
-                    (1.0, 1.0),     # Robot 3: Default position
-                    (1.0, 2.0),     # Robot 4: Default position
-                    (1.0, 3.0),     # Robot 5: Default position
+                    (2.75, 1.25),
+                    (2.25, 0.75),
+                    (1.0, 1.0),
+                    (1.0, 2.0),
+                    (1.0, 3.0),
                 ]
-                if i < len(fallback_positions):
-                    start_x, start_y = fallback_positions[i]
+                idx = [ri.robot_id for ri in self._selected_robots].index(robot_id)
+                if idx < len(fallback_positions):
+                    start_x, start_y = fallback_positions[idx]
                 else:
-                    start_x, start_y = 1.0, float(i)
+                    start_x, start_y = 1.0, float(idx)
 
             # Get base configuration from provider and customize for multi-robot demo
             base_config = self.config_provider.get_robot_config(robot_id)
@@ -562,17 +649,7 @@ class MultiRobotSimulationManager:
             except Exception:
                 pass
             
-            # Ensure robot_id exists in DB for FK constraints (best-effort)
-            try:
-                with self.simulation_data_service._get_connection() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "INSERT INTO robots (robot_id, name) VALUES (%s, %s) ON CONFLICT (robot_id) DO NOTHING",
-                            (robot_id, robot_id.replace('_', ' ').title()),
-                        )
-                        conn.commit()
-            except Exception:
-                pass
+            # Identity is managed via RobotRegistry; no direct inserts here
 
             # Create robot agent with unique robot_id and dedicated physics
             robot = RobotAgent(
@@ -604,6 +681,35 @@ class MultiRobotSimulationManager:
             print(f"      ✅ Created {robot_id} at position ({start_x}, {start_y})")
 
         print(f"   ✅ Created {len(self.robots)} robot agents")
+
+    def _select_robots_via_registry(self) -> None:
+        """Select robots for this run from registry (deterministic by name)."""
+        try:
+            all_identities = self.robot_registry.list_registered_robots()
+        except Exception as e:
+            print(f"   ❌ Failed to list registered robots: {e}")
+            logging.error(f"EXCEPTION: Robot selection failed: {e}", exc_info=True)
+            raise
+
+        total = len(all_identities)
+        if self.robot_count and self.robot_count > 0:
+            if self.robot_count > total:
+                print(f"   ❌ Requested {self.robot_count} robots but only {total} are registered. Aborting.")
+                raise RuntimeError("Insufficient registered robots for requested run")
+            selected = all_identities[:self.robot_count]
+            unselected = all_identities[self.robot_count:]
+            # Nullify positions for unused robots as requested
+            try:
+                for ri in unselected:
+                    self.robot_registry.clear_robot_state(ri.robot_id)
+            except Exception as e:
+                logging.error(f"EXCEPTION: Failed to nullify positions for unselected robots: {e}", exc_info=True)
+        else:
+            selected = all_identities
+
+        self._selected_robots = selected
+        self.robot_count = len(selected)
+        print(f"   ✅ Selected {self.robot_count} robots for this run")
     
     def _verify_warehouse_data(self) -> None:
         """Verify that warehouse data exists and is valid."""
@@ -808,6 +914,19 @@ class MultiRobotSimulationManager:
                 print(f"   ⚠️  Error stopping {robot_instance.robot_id}: {e}")
                 logging.error(f"EXCEPTION: Robot {robot_instance.robot_id} shutdown failed: {e}", exc_info=True)
         
+        # Persist final runtime state (positions and battery) before tearing down visualization/engine
+        try:
+            for robot_instance in self.robots:
+                try:
+                    status = robot_instance.robot.get_status()
+                    pos = status.get('position', (0.0, 0.0, 0.0))
+                    battery = float(status.get('battery_level', 1.0))
+                    self.robot_registry.upsert_robot_state(robot_instance.robot_id, (float(pos[0]), float(pos[1]), float(pos[2])), battery)
+                except Exception as e:
+                    logging.error(f"EXCEPTION: Failed to persist state for {robot_instance.robot_id}: {e}", exc_info=True)
+        except Exception as e:
+            logging.error(f"EXCEPTION: Persisting final runtime state failed: {e}", exc_info=True)
+
         # Stop visualization
         try:
             if self.visualization_thread is not None:
@@ -1051,48 +1170,7 @@ class MultiRobotSimulationManager:
         }
 
 
-def demo_multi_robot_coordination():
-    """Demo: Multi-robot coordination and task execution."""
-    print("=" * 70)
-    print("🤖 MULTI-ROBOT WAREHOUSE COORDINATION SIMULATION")
-    print("=" * 70)
-    
-    # Create multi-robot simulation with default parameters (auto-manages warehouse data)
-    sim = MultiRobotSimulationManager(robot_count=2, placement_mode="random",
-                                     orders_file="sample_orders.json")
-    
-    try:
-        # Start simulation
-        sim.start_simulation()
 
-        print("\n⏳ Running multi-robot coordination simulation...")
-        print("   🤖 Robots will coordinate through the robot controller")
-        print("   📋 Tasks will be distributed via bidding system")
-        print("   🔄 Conflict box coordination ensures safe navigation")
-        print("   🏭 Using extended warehouse layout with sample orders")
-        
-        # Start order processing (orders will be processed from configured orders file)
-        print(f"\n📋 Starting order processing from {sim.orders_file}...")
-        sim.create_demo_tasks(0)  # This now starts the order processor, parameter ignored
-        
-        # Monitor coordination for a reasonable duration
-        monitoring_duration = 120.0  # Extended time for order processing
-        sim.monitor_robot_coordination(monitoring_duration)
-        
-        print(f"\n🎉 Multi-robot coordination simulation completed!")
-        print(f"   📋 Total tasks created: {sim.tasks_created}")
-        print(f"   🤖 Robots coordinated successfully")
-        print(f"   🔄 Conflict box coordination maintained safety")
-        
-    except KeyboardInterrupt:
-        print("\n⚠️  Simulation interrupted by user")
-    except Exception as e:
-        print(f"\n❌ Simulation error: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    finally:
-        sim.stop_simulation()
 
 
 def main():
@@ -1113,13 +1191,13 @@ def main():
     print("   📋 Configurable order processing")
     print()
     
-    # Optional CLI arguments (e.g., --robots 5 --placement random --orders sample_orders.json)
+    # Optional CLI arguments (e.g., --robots 5 --placement persisted --orders sample_orders.json)
     try:
         parser = argparse.ArgumentParser(add_help=False)
-        parser.add_argument("--robots", type=int, default=3,
-                          help="Number of robots to simulate (default: 3)")
-        parser.add_argument("--placement", choices=["random", "manual"], default="random",
-                          help="Robot placement mode: 'random' for random placement, 'manual' for fixed positions (default: random)")
+        parser.add_argument("--robots", type=int, default=0,
+                          help="Number of robots to simulate (0 = all registered; default: 0)")
+        parser.add_argument("--placement", choices=["persisted", "random", "manual"], default="persisted",
+                          help="Robot placement mode: 'persisted' (DB-backed), 'random', or 'manual' (default: persisted)")
         parser.add_argument("--orders", type=str, default="sample_orders.json",
                           help="JSON orders file to process (default: sample_orders.json)")
         args, _ = parser.parse_known_args()
@@ -1127,8 +1205,8 @@ def main():
         placement_mode = args.placement
         orders_file = args.orders
     except Exception:
-        robot_count = 3
-        placement_mode = "random"
+        robot_count = 0
+        placement_mode = "persisted"
         orders_file = "sample_orders.json"
 
     try:

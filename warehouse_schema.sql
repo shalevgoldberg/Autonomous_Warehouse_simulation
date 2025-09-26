@@ -181,6 +181,34 @@ COMMENT ON COLUMN warehouse_map.source_csv_file IS 'Original CSV file used to ge
 COMMENT ON COLUMN warehouse_map.source_csv_hash IS 'SHA256 hash of CSV file to detect changes';
 COMMENT ON TABLE simulation_metrics IS 'Performance metrics collected during simulation runs';
 
+-- 8. Robot Runtime State - Persist per-robot transient state across runs
+-- Idempotent creation to allow multiple applies safely
+CREATE TABLE IF NOT EXISTS robot_runtime_state (
+    robot_id VARCHAR(36) PRIMARY KEY,
+    pos_x DECIMAL(10,3) NULL,
+    pos_y DECIMAL(10,3) NULL,
+    theta DECIMAL(10,6) NULL,
+    battery_level DECIMAL(6,3) NOT NULL DEFAULT 1.000,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_robot_runtime_state_robot
+        FOREIGN KEY(robot_id) REFERENCES robots(robot_id)
+        ON DELETE CASCADE
+);
+
+-- Trigger to keep updated_at current
+CREATE TRIGGER IF NOT EXISTS update_robot_runtime_state_updated_at
+BEFORE UPDATE ON robot_runtime_state
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+COMMENT ON TABLE robot_runtime_state IS 'Transient robot state (position, yaw, battery) persisted between runs';
+COMMENT ON COLUMN robot_runtime_state.pos_x IS 'World X position (meters), NULL when unplaced';
+COMMENT ON COLUMN robot_runtime_state.pos_y IS 'World Y position (meters), NULL when unplaced';
+COMMENT ON COLUMN robot_runtime_state.theta IS 'Yaw (radians), NULL when unplaced';
+COMMENT ON COLUMN robot_runtime_state.battery_level IS 'Battery level 0.0-1.0 (persisted across runs)';
+
+-- Helpful index for recent state queries
+CREATE INDEX IF NOT EXISTS idx_robot_runtime_state_updated_at ON robot_runtime_state(updated_at);
+
 -- Grant permissions (adjust as needed for your setup)
 -- GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO your_user;
 -- GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO your_user; 

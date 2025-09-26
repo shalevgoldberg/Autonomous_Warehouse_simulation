@@ -158,6 +158,55 @@ class WarehouseGenerator:
             log_error(f"Component initialization failed: {e}")
             raise
 
+    def _ensure_sample_robot_fleet(self) -> None:
+        """
+        Ensure a sample robot fleet exists in the database.
+
+        Checks if any robots are registered, and if none exist,
+        registers 3 sample robots to provide a basic fleet for testing.
+        This enables immediate simulation without requiring separate
+        robot registration steps.
+
+        Design Principles:
+        - Single Responsibility: Only ensures sample robots exist
+        - Error Handling: Graceful fallback with logging
+        - Performance: Minimal database queries
+        - User Feedback: Clear logging of actions taken
+        """
+        try:
+            from warehouse.impl.robot_registry_impl import RobotRegistryImpl  # local import to avoid hard dependency if unused
+
+            # Create robot registry instance
+            registry = RobotRegistryImpl(self.simulation_data_service)
+
+            # Check existing robots
+            existing_robots = registry.list_registered_robots()
+            robot_count = len(existing_robots)
+
+            if robot_count > 0:
+                log_info(f"Found {robot_count} existing robots - using existing fleet")
+                log_info(f"   🤖 Existing robots: {[r.name for r in existing_robots]}")
+                return
+
+            # No robots found - create sample fleet
+            log_info("No robots found in database - creating sample fleet")
+
+            # Register 3 sample robots
+            created_robots = registry.register_robots(count=3, name_prefix="SampleRobot")
+
+            if created_robots:
+                robot_names = [r.name for r in created_robots]
+                robot_ids = [r.robot_id for r in created_robots]
+                log_success(f"Created sample robot fleet: {len(created_robots)} robots")
+                log_info(f"   🤖 Sample robots: {robot_names}")
+                log_info(f"   🆔 Robot IDs: {[rid[:8] + '...' for rid in robot_ids]}")
+            else:
+                log_warning("Failed to create sample robot fleet - no robots registered")
+
+        except Exception as e:
+            log_warning(f"Failed to ensure sample robot fleet: {e}")
+            log_info("   ℹ️  This is non-critical - you can register robots manually later")
+
     def _generate_navigation_graph(self) -> GraphPersistenceResult:
         """
         Generate and persist navigation graph from warehouse CSV.
@@ -271,6 +320,18 @@ class WarehouseGenerator:
             # Step 5: Populate inventory
             inventory_created = self._populate_inventory()
 
+            # Step 5.1: Check for existing robots and create sample fleet if needed
+            self._ensure_sample_robot_fleet()
+
+            # Step 5.2: Clear all robot positions to avoid stale placements in new warehouse
+            try:
+                from warehouse.impl.robot_registry_impl import RobotRegistryImpl  # local import to avoid hard dependency if unused
+                registry = RobotRegistryImpl(self.simulation_data_service)
+                affected = registry.clear_all_positions()
+                log_info(f"Cleared robot positions after warehouse load (affected rows: {affected})")
+            except Exception as e:
+                log_warning(f"Failed to clear robot positions after warehouse load: {e}")
+
             # Step 6: Persist metadata about the warehouse source
             try:
                 with self.simulation_data_service._get_connection() as conn:
@@ -357,7 +418,9 @@ The script will:
 2. Generate navigation graph (conflict boxes, nodes, edges)
 3. Create shelves from warehouse layout
 4. Populate inventory with demo data
-5. Export inventory status to CSV
+5. Ensure sample robot fleet exists (creates 3 robots if none found)
+6. Clear robot positions to avoid stale placements
+7. Export inventory status to CSV
 
 Exit codes:
   0 - Success
