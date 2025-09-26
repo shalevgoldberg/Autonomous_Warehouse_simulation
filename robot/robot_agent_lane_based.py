@@ -138,15 +138,15 @@ class RobotAgent:
         )
 
         # Store reference to state_holder in physics for direct updates
-        print(f"[RobotAgent] DIAGNOSTIC: Setting _state_holder on physics object")
-        print(f"[RobotAgent] DIAGNOSTIC: physics type: {type(self.physics)}")
-        print(f"[RobotAgent] DIAGNOSTIC: physics has _state_holder before: {hasattr(self.physics, '_state_holder')}")
+        #print(f"[RobotAgent] Setting _state_holder on physics object")
+        #print(f"[RobotAgent] physics type: {type(self.physics)}")
+        #print(f"[RobotAgent] DIAGNOSTIC: physics has _state_holder before: {hasattr(self.physics, '_state_holder')}")
 
         # Set the state holder reference for direct updates
         self.physics._state_holder = self.state_holder
 
-        print(f"[RobotAgent] DIAGNOSTIC: physics has _state_holder after: {hasattr(self.physics, '_state_holder')}")
-        print(f"[RobotAgent] DIAGNOSTIC: _state_holder is not None: {self.physics._state_holder is not None}")
+        #print(f"[RobotAgent] DIAGNOSTIC: physics has _state_holder after: {hasattr(self.physics, '_state_holder')}")
+        print(f"[RobotAgent] _state_holder is not None: {self.physics._state_holder is not None}")
 
         # Set motion command filter on motion executor for safety integration (Phase 4)
         if hasattr(self.motion_executor, 'set_motion_command_filter'):
@@ -169,6 +169,26 @@ class RobotAgent:
             print(f"[RobotAgent] Charging Station Manager: Disabled (Not available)")
         print(f"[RobotAgent] Database: {type(self.simulation_data_service).__name__}")
         print(f"[RobotAgent] Configuration: {len(self.config_provider.errors)} validation errors")
+
+        # Enqueue startup idle task if configured
+        try:
+            if getattr(self.robot_config, 'start_in_idle', True):
+                from interfaces.task_handler_interface import Task
+                idle_task = Task.create_idle_park_task(
+                    task_id=f"startup_idle_{self.robot_id}",
+                    robot_id=self.robot_id
+                )
+                # Use scheduling hook to preserve control-thread contract
+                if hasattr(self.task_handler, 'schedule_start_task'):
+                    self.task_handler.schedule_start_task(idle_task)
+                    print(f"[RobotAgent] Startup: scheduled IDLE_PARK task {idle_task.task_id}")
+                else:
+                    # Fallback with explicit log; do nothing else
+                    print(f"[RobotAgent] WARNING: schedule_start_task not available; startup idle not scheduled")
+            else:
+                print(f"[RobotAgent] Startup in idle disabled by configuration for {self.robot_id}")
+        except Exception as e:
+            print(f"[RobotAgent] ERROR scheduling startup idle task: {e}")
 
     # LiDAR access methods (Phase 2.2)
     def get_lidar_scan(self) -> Optional['LiDARScan']:
@@ -673,15 +693,19 @@ class RobotAgent:
     
     def get_status(self) -> dict:
         """Get comprehensive robot status."""
+        task_status = self.task_handler.get_task_status()
         return {
             'robot_id': self.robot_id,
             'running': self._running,
             'position': self.state_holder.get_position(),
             'battery_level': self.state_holder.get_battery_level(),
             'current_task': self.task_handler.get_current_task(),
-            'task_status': self.task_handler.get_task_status(),
+            'task_status': task_status,
             'motion_status': self.motion_executor.get_motion_status(),
             'lane_following_status': self.lane_follower.get_lane_following_status(),
+            'acquired_conflict_boxes': self.lane_follower.get_held_conflict_boxes(),
+            'pending_conflict_box': self.lane_follower.get_pending_conflict_box(),
+            'locked_bay_id': task_status.locked_bay_id,  # Current charging/idle bay lock
             'configuration_errors': self.config_provider.errors,
             'bid_calculation_stats': self.get_bid_calculation_statistics()
         }
@@ -770,7 +794,8 @@ class RobotAgent:
                             cat_counts = {str(k): int(v) for k, v in zip(unique.tolist(), counts.tolist())}
                     except Exception:
                         pass
-                    print(f"[RobotAgent.{self.robot_id}] Safety action: {safety_action.action_type.value} (reason: {safety_action.reason or 'none'}) categories={cat_counts}")
+                    if self.robot_id == "warehouse_robot_3":
+                        print(f"[RobotAgent.{self.robot_id}] Safety action: {safety_action.action_type.value} (reason: {safety_action.reason or 'none'}) categories={cat_counts}")
             else:
                 print(f"[RobotAgent] WARNING: Motion executor does not support safety actions")
 

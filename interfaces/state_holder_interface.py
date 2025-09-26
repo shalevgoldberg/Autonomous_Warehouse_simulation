@@ -2,9 +2,13 @@
 Interface for StateHolder - maintains robot state information.
 """
 from abc import ABC, abstractmethod
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, TYPE_CHECKING
 from dataclasses import dataclass
 from enum import Enum
+
+# Forward reference for LiDARScan to avoid circular imports
+if TYPE_CHECKING:
+    from interfaces.lidar_interface import LiDARScan
 
 
 @dataclass
@@ -16,6 +20,9 @@ class RobotPhysicsState:
     battery_level: float  # 0.0 to 1.0
     timestamp: float = 0.0
     additional_data: Optional[Dict[str, Any]] = None
+
+    # LiDAR sensor data (Phase 2.1)
+    lidar_scan: Optional['LiDARScan'] = None  # Latest LiDAR scan data
 
 
 class IStateHolder(ABC):
@@ -80,5 +87,29 @@ class IStateHolder(ABC):
         Update state information from MuJoCo simulation.
         **PHYSICS THREAD ONLY**: Must be called from physics thread at 1kHz.
         **Not thread-safe**: Never call from multiple threads simultaneously.
+        """
+        pass
+
+    # LiDAR sensor data access (Phase 2.1)
+    @abstractmethod
+    def get_lidar_scan(self) -> Optional['LiDARScan']:
+        """
+        Get the latest LiDAR scan data.
+        **Thread-safe**: Can be called from any thread.
+
+        Returns:
+            LiDARScan: Latest LiDAR scan data, or None if not available
+        """
+        pass
+
+    @abstractmethod
+    def update_lidar_scan(self, scan: 'LiDARScan') -> None:
+        """
+        Update LiDAR scan data in the state.
+        **PHYSICS THREAD ONLY**: Should be called from physics thread.
+        **Not thread-safe**: Never call from multiple threads simultaneously.
+
+        Args:
+            scan: New LiDAR scan data to store
         """
         pass 

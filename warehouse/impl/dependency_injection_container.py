@@ -14,6 +14,11 @@ from interfaces.dependency_injection_interface import (
     IServiceProvider, IServiceScope, IServiceFactory,
     ServiceNotRegisteredError, ServiceResolutionError, ServiceLifetimeError
 )
+from interfaces.collision_avoidance_interface import ICollisionAvoidanceService
+from interfaces.motion_command_filter_interface import IMotionCommandFilter
+from interfaces.configuration_interface import IBusinessConfigurationProvider
+from robot.impl.collision_avoidance_service_impl import CollisionAvoidanceServiceImpl, CollisionAvoidanceConfig
+from robot.impl.motion_command_filter_impl import MotionCommandFilterImpl
 
 T = TypeVar('T')
 
@@ -167,10 +172,70 @@ class DependencyInjectionContainer(IServiceProvider, IServiceFactory):
     def create_scope(self) -> IServiceScope:
         """Create a new service scope."""
         return ServiceScope(self)
-    
+
     def create_instance(self, service_type: Type[T], **kwargs) -> T:
         """Create a new instance of a service."""
         return self._create_instance(service_type, **kwargs)
+
+    def create_collision_avoidance_service(self, robot_id: str,
+                                         config_provider: Optional[IBusinessConfigurationProvider] = None) -> ICollisionAvoidanceService:
+        """
+        Create a collision avoidance service instance for a specific robot.
+
+        Args:
+            robot_id: Robot identifier for logging and per-robot state
+            config_provider: Configuration provider (resolved if not provided)
+
+        Returns:
+            ICollisionAvoidanceService: Configured collision avoidance service
+        """
+        if config_provider is None:
+            self.logger.warning(f"Config provider not provided for collision avoidance service on {robot_id}, resolving automatically")
+            config_provider = self.get_service(IBusinessConfigurationProvider)
+
+        # Load collision avoidance configuration
+        # Note: get_value returns ConfigurationValue objects, extract the .value field
+        ca_config = CollisionAvoidanceConfig(
+            fov_degrees=config_provider.get_value("collision_avoidance.fov_degrees", 50.0).value,
+            num_beams=config_provider.get_value("collision_avoidance.num_beams", 25).value,
+            braking_cone_degrees=config_provider.get_value("collision_avoidance.braking_cone_degrees", 10.0).value,
+            lateral_guard_margin=config_provider.get_value("collision_avoidance.lateral_guard_margin", 0.10).value,
+            static_stop_distance=config_provider.get_value("collision_avoidance.static_stop_distance", 0.15).value,
+            dynamic_stop_distance=config_provider.get_value("collision_avoidance.dynamic_stop_distance", 0.30).value,
+            dynamic_caution_distance=config_provider.get_value("collision_avoidance.dynamic_caution_distance", 0.50).value,
+            headway_time_gap=config_provider.get_value("collision_avoidance.headway_time_gap", 0.8).value,
+            yaw_bias_max=config_provider.get_value("collision_avoidance.yaw_bias_max", 0.1).value
+        )
+
+        # Get robot radius for lateral guard
+        robot_radius = config_provider.get_value("robot.robot_width", 0.25).value / 2.0
+
+        return CollisionAvoidanceServiceImpl(
+            config=ca_config,
+            robot_radius=robot_radius,
+            robot_id=robot_id
+        )
+
+    def create_motion_command_filter(self, robot_id: str,
+                                   config_provider: Optional[IBusinessConfigurationProvider] = None) -> IMotionCommandFilter:
+        """
+        Create a motion command filter instance for a specific robot.
+
+        Args:
+            robot_id: Robot identifier for logging
+            config_provider: Configuration provider (resolved if not provided)
+
+        Returns:
+            IMotionCommandFilter: Configured motion command filter
+        """
+        if config_provider is None:
+            self.logger.warning(f"Config provider not provided for motion command filter on {robot_id}, resolving automatically")
+            config_provider = self.get_service(IBusinessConfigurationProvider)
+
+        return MotionCommandFilterImpl(
+            config_provider=config_provider,
+            robot_id=robot_id
+        )
     
     def _create_instance(self, service_type: Type[T], **kwargs) -> T:
         """Internal method to create instances."""
@@ -205,6 +270,10 @@ class DependencyInjectionContainer(IServiceProvider, IServiceFactory):
         with self._lock:
             self._services.clear()
             self.logger.info("All services cleared")
+
+
+
+
 
 
 

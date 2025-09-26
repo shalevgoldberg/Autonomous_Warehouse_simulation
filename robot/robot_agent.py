@@ -240,7 +240,8 @@ class RobotAgent:
             motion_executor=self.motion_executor,
             coordinate_system=self.coordinate_system,
             simulation_data_service=self.simulation_data_service,
-            robot_id=self.config.robot_id
+            robot_id=self.config.robot_id,
+            battery_manager=None  # DEPRECATED: Battery manager not supported in legacy agent
         )
     
     def initialize_position(self) -> None:

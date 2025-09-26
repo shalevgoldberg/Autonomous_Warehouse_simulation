@@ -88,22 +88,48 @@ def lines_intersect(p1, p2, p3, p4):
 def mapdata_to_warehouse_map(map_data):
     """
     Convert MapData (from SimulationDataService) to a WarehouseMap instance.
+
+    This function reconstructs a complete WarehouseMap from MapData, including
+    all zone types (charging, idle, drop-off) to ensure RobotAgents have
+    access to the same warehouse layout as the main simulation.
+
     Args:
         map_data (MapData): The map data object from the data service.
+
     Returns:
-        WarehouseMap: A reconstructed warehouse map.
+        WarehouseMap: A reconstructed warehouse map with all zones.
     """
     from warehouse.map import WarehouseMap
     warehouse_map = WarehouseMap(width=map_data.width, height=map_data.height)
     warehouse_map.grid_size = map_data.cell_size
-    # Clear grid
+
+    # Initialize grid to empty
     warehouse_map.grid[:, :] = 0
-    # Set obstacles
+
+    # Set obstacles (walls)
     for (x, y) in map_data.obstacles:
         warehouse_map.grid[y, x] = 1
+
     # Set shelves
     warehouse_map.shelves = dict(map_data.shelves)
     for shelf_id, (x, y) in map_data.shelves.items():
-        warehouse_map.grid[y, x] = 2
-    # Do not assign dropoff_stations or charging_zones directly; rely on WarehouseMap methods
+        # Guard against out-of-bounds due to rounding or stale dimensions
+        if 0 <= y < warehouse_map.grid.shape[0] and 0 <= x < warehouse_map.grid.shape[1]:
+            warehouse_map.grid[y, x] = 2
+
+    # Set charging zones
+    for (x, y) in map_data.charging_zones:
+        if 0 <= y < warehouse_map.grid.shape[0] and 0 <= x < warehouse_map.grid.shape[1]:
+            warehouse_map.grid[y, x] = 3
+
+    # Set idle zones
+    for (x, y) in map_data.idle_zones:
+        if 0 <= y < warehouse_map.grid.shape[0] and 0 <= x < warehouse_map.grid.shape[1]:
+            warehouse_map.grid[y, x] = 4
+
+    # Set drop-off stations
+    for (x, y) in map_data.dropoff_zones:
+        if 0 <= y < warehouse_map.grid.shape[0] and 0 <= x < warehouse_map.grid.shape[1]:
+            warehouse_map.grid[y, x] = 5
+
     return warehouse_map 

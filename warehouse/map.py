@@ -35,7 +35,7 @@ class WarehouseMap:
         if csv_file and os.path.exists(csv_file):
             csv_width, csv_height = self._read_csv_dimensions(csv_file)
             if csv_width > 0 and csv_height > 0:
-                print(f"CSV file detected: using dimensions {csv_width}x{csv_height} (was {width}x{height})")
+                print(f"CSV file detected: using dimensions {csv_width}x{csv_height}")
                 width = csv_width
                 height = csv_height
             else:
@@ -58,11 +58,16 @@ class WarehouseMap:
             self._load_from_csv(csv_file)
         else:
             # Define warehouse layout - order matters to avoid conflicts
-            self._create_walls()
-            self._create_charging_zones()
-            self._create_idle_zones()
-            self._create_dropoff_stations()
-            self._create_shelves()  # Create shelves last to avoid conflicts
+            # Guard against too-small dimensions causing random-range errors
+            try:
+                self._create_walls()
+                self._create_charging_zones()
+                self._create_idle_zones()
+                self._create_dropoff_stations()
+                self._create_shelves()  # Create shelves last to avoid conflicts
+            except ValueError as e:
+                # Fallback: initialize empty layout without randomized placements
+                print(f"WARNING: Minimal map dimensions prevented procedural layout ({e}); using empty layout")
         
         # Define key locations (dynamic based on size)
         self.shelf_positions = self._get_shelf_positions()
@@ -161,7 +166,6 @@ class WarehouseMap:
                         self.grid[y, x] = 0
                         if cell_value:  # Only warn for non-empty unknown values
                             print(f"Warning: Unknown cell value '{cell_value}' at ({x}, {y}), treating as free space")
-            
             print(f"Successfully loaded warehouse layout from {csv_file}")
             print(f"Dimensions: {self.width}x{self.height}")
             print(f"Shelves: {len(self.shelves)}")

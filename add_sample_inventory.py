@@ -24,12 +24,7 @@ def add_sample_inventory():
         # Create simulation data service
         warehouse_map = WarehouseMap(width=20, height=15)
         simulation_data_service = SimulationDataServiceImpl(
-            warehouse_map=warehouse_map,
-            db_host="localhost",
-            db_port=5432,
-            db_name="warehouse_sim",
-            db_user="postgres",
-            db_password=os.getenv('WAREHOUSE_DB_PASSWORD')
+            warehouse_map=warehouse_map
         )
         
         # Add inventory

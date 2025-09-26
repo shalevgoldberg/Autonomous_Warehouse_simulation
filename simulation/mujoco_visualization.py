@@ -15,6 +15,7 @@ from mujoco import viewer
 
 from interfaces.visualization_interface import IVisualization, VisualizationError
 from interfaces.state_holder_interface import IStateHolder
+from interfaces.configuration_interface import RobotConfig
 from warehouse.map import WarehouseMap
 
 
@@ -26,9 +27,19 @@ class MujocoVisualization(IVisualization):
     - Uses mujoco.viewer passive viewer and keeps a single window alive
     """
     
-    def __init__(self, state_holder: IStateHolder, warehouse_map: WarehouseMap):
+    def __init__(self, state_holder: IStateHolder, warehouse_map: WarehouseMap,
+                 robot_config: RobotConfig = None):
         self.state_holder = state_holder
         self.warehouse_map = warehouse_map
+
+        # Use provided robot config or create default
+        if robot_config is None:
+            from config.configuration_provider import ConfigurationProvider
+            provider = ConfigurationProvider()
+            robot_config = provider.get_robot_config("robot_1")
+
+        self.robot_config = robot_config
+
         self._active = False
         self._model: Optional[mujoco.MjModel] = None
         self._data: Optional[mujoco.MjData] = None
@@ -144,6 +155,11 @@ class MujocoVisualization(IVisualization):
         world_width = self.warehouse_map.width * self.warehouse_map.grid_size
         world_height = self.warehouse_map.height * self.warehouse_map.grid_size
         cells_xml = self._generate_cells_xml()
+
+        # Calculate robot dimensions from configuration
+        robot_radius = self.robot_config.robot_width / 2.0
+        robot_half_height = self.robot_config.robot_height / 2.0
+
         return f"""<?xml version='1.0'?>
 <mujoco model='warehouse_world'>
   <compiler angle='radian' coordinate='local'/>
@@ -153,10 +169,10 @@ class MujocoVisualization(IVisualization):
     {cells_xml}
     <body name='robot_base' pos='{self.warehouse_map.grid_to_world(1, 1)[0]} {self.warehouse_map.grid_to_world(1, 1)[1]} 0.1'>
       <freejoint/>
-      <geom name='robot_body' type='cylinder' size='0.1 0.05' rgba='0.8 0.2 0.2 1'/>
+      <geom name='robot_body' type='cylinder' size='{robot_radius} {robot_half_height}' rgba='0.8 0.2 0.2 1'/>
       <site name='robot_site' pos='0 0 0' size='0.01'/>
       <!-- Rotation indicator line pointing in the direction the robot is facing -->
-      <geom name='robot_direction' type='cylinder' size='0.01 0.15' pos='0.15 0 0.05' rgba='1.0 1.0 0.0 1'/>
+      <geom name='robot_direction' type='cylinder' size='0.01 0.15' pos='{robot_radius + 0.02} 0 {robot_half_height + 0.01}' rgba='1.0 1.0 0.0 1'/>
     </body>
   </worldbody>
 </mujoco>

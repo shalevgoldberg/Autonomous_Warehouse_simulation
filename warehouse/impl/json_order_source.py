@@ -9,6 +9,7 @@ Features:
 - Efficient polling with change detection
 - Order status persistence
 - Comprehensive error handling
+- Support for relative timing (seconds from current time)
 """
 import json
 import os
@@ -31,15 +32,19 @@ from interfaces.jobs_processor_interface import (
 class JsonOrderSource(IOrderSource):
     """
     JSON file-based order source implementation.
-    
+
     Features:
     - Loads orders from JSON files in standard Order format
     - Tracks processed orders to avoid duplicates
     - File modification detection for efficient polling
     - Thread-safe operations with proper locking
-    
+    - Relative timing support (seconds from current time)
+
     JSON Format Support:
-    - Full format: [{"order_id": "...", "items": [...], "scheduled_time": "...", ...}]
+    - Full format: [{"order_id": "...", "items": [...], "scheduled_time": ..., ...}]
+    - scheduled_time can be:
+      * Integer/float: seconds from current time when loaded
+      * String: ISO datetime format (backward compatibility)
     """
     
     def __init__(self, file_path: str, order_id_prefix: str = "auto"):
@@ -96,6 +101,7 @@ class JsonOrderSource(IOrderSource):
                 now = datetime.now()
                 due_orders = []
                 
+                # Time format supports relative timing from current time
                 for order in self._orders.values():
                     # Only return orders that are:
                     # 1. Due for processing (scheduled_time <= now)
@@ -205,24 +211,24 @@ class JsonOrderSource(IOrderSource):
         with self._lock:
             try:
                 self._status = OrderSourceStatus.INITIALIZING
-                
+
                 # Validate file exists
                 if not self.file_path.exists():
                     raise OrderSourceError(f"Order file not found: {self.file_path}")
-                
+
                 # Load initial orders
                 self._load_orders_from_file()
-                
+
                 self._connected = True
                 self._status = OrderSourceStatus.CONNECTED
                 self.logger.info(f"Connected to order source: {self.file_path}")
-                
+
             except Exception as e:
                 self._status = OrderSourceStatus.ERROR
                 self._stats['error_count'] += 1
                 self._stats['last_error'] = str(e)
                 raise OrderSourceError(f"Failed to connect to {self.file_path}: {e}")
-    
+
     def disconnect(self) -> None:
         """Disconnect from the order source."""
         with self._lock:
@@ -358,11 +364,22 @@ class JsonOrderSource(IOrderSource):
                 quantity=item_data['quantity']
             ))
         
-        # Parse scheduled_time
-        if isinstance(raw_data['scheduled_time'], str):
-            scheduled_time = datetime.fromisoformat(raw_data['scheduled_time'])
+        # Parse scheduled_time - supports relative time (int/float) and absolute time (str)
+        scheduled_time_value = raw_data['scheduled_time']
+
+        if isinstance(scheduled_time_value, int) or isinstance(scheduled_time_value, float):
+            # Relative time in seconds from current time
+            scheduled_time = datetime.now() + timedelta(seconds=scheduled_time_value)
+        elif isinstance(scheduled_time_value, str):
+            # Absolute datetime string (backward compatibility)
+            try:
+                scheduled_time = datetime.fromisoformat(scheduled_time_value)
+            except ValueError as e:
+                self.logger.error(f"Invalid datetime format '{scheduled_time_value}' for order {raw_data['order_id']}: {e}")
+                raise ValueError(f"Invalid scheduled_time format: {scheduled_time_value}") from e
         else:
-            scheduled_time = datetime.fromtimestamp(raw_data['scheduled_time'])
+            # Fallback for other numeric types (like timestamp)
+            scheduled_time = datetime.fromtimestamp(float(scheduled_time_value))
         
         # Parse priority
         priority = Priority(raw_data.get('priority', 'normal'))

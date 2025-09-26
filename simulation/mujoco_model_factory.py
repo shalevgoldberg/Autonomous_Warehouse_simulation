@@ -9,18 +9,32 @@ operate decoupled from kinematic physics.
 from typing import Tuple
 
 from warehouse.map import WarehouseMap
+from interfaces.configuration_interface import RobotConfig
 
 
-def generate_warehouse_mjcf(warehouse_map: WarehouseMap, physics_dt: float = 0.001) -> str:
+def generate_warehouse_mjcf(warehouse_map: WarehouseMap, physics_dt: float = 0.001,
+                           robot_config: RobotConfig = None) -> str:
     """Generate a MuJoCo XML string describing the warehouse and a simple robot.
 
     Args:
         warehouse_map: The warehouse layout to visualize.
         physics_dt: Physics timestep to embed in the MJCF for viewer timing.
+        robot_config: Robot configuration with physical dimensions. If None, uses defaults.
 
     Returns:
         MJCF XML as a string.
     """
+    # Use provided robot config or create default
+    if robot_config is None:
+        from config.configuration_provider import ConfigurationProvider
+        provider = ConfigurationProvider()
+        robot_config = provider.get_robot_config("robot_1")
+
+    # Extract robot dimensions
+    robot_radius = robot_config.robot_width / 2.0  # Convert diameter to radius
+    robot_height = robot_config.robot_height
+    wheel_base = robot_config.wheel_base
+    wheel_radius = robot_config.wheel_radius
     world_width = warehouse_map.width * warehouse_map.grid_size
     world_height = warehouse_map.height * warehouse_map.grid_size
     start_x = warehouse_map.start_position[0] - world_width / 2
@@ -43,23 +57,23 @@ def generate_warehouse_mjcf(warehouse_map: WarehouseMap, physics_dt: float = 0.0
     <!-- Robot with differential drive (visualization-only) -->
     <body name="robot_base" pos="{start_x} {start_y} 0.1">
       <freejoint name="base_free"/>
-      <geom name="robot_body" type="cylinder" size="0.22 0.10" rgba="1.0 0.9 0.0 1"/>
+      <geom name="robot_body" type="cylinder" size="{robot_radius} {robot_height/2}" rgba="1.0 0.9 0.0 1"/>
       <site name="robot_site" pos="0 0 0" size="0.02" rgba="1.0 1.0 0.0 1"/>
       
-      <!-- Left wheel (enlarged) -->
-      <body name="left_wheel_body" pos="-0.18 0 0">
+      <!-- Left wheel (proportional to robot size) -->
+      <body name="left_wheel_body" pos="-{wheel_base/2} 0 0">
         <joint name="left_wheel" type="hinge" axis="0 1 0" limited="false"/>
-        <geom name="left_wheel_geom" type="cylinder" size="0.08 0.03" rgba="0.1 0.1 0.1 1"/>
+        <geom name="left_wheel_geom" type="cylinder" size="{wheel_radius} {wheel_radius/2}" rgba="0.1 0.1 0.1 1"/>
       </body>
-      
-      <!-- Right wheel (enlarged) -->
-      <body name="right_wheel_body" pos="0.18 0 0">
+
+      <!-- Right wheel (proportional to robot size) -->
+      <body name="right_wheel_body" pos="{wheel_base/2} 0 0">
         <joint name="right_wheel" type="hinge" axis="0 1 0" limited="false"/>
-        <geom name="right_wheel_geom" type="cylinder" size="0.08 0.03" rgba="0.1 0.1 0.1 1"/>
+        <geom name="right_wheel_geom" type="cylinder" size="{wheel_radius} {wheel_radius/2}" rgba="0.1 0.1 0.1 1"/>
       </body>
 
       <!-- Orientation arrow/marker for visible heading -->
-      <geom name="heading_marker" type="box" pos="0.22 0 0.10" size="0.04 0.01 0.02" rgba="1.0 0.2 0.2 1"/>
+      <geom name="heading_marker" type="box" pos="{robot_radius + 0.02} 0 {robot_height/2 + 0.01}" size="0.04 0.01 0.02" rgba="1.0 0.2 0.2 1"/>
     </body>
     
     <!-- Warehouse elements -->
@@ -97,31 +111,31 @@ def generate_warehouse_elements_xml(warehouse_map: WarehouseMap) -> str:
             if cell_type == 1:  # Wall
                 elements_xml += (
                     f'<geom name="wall_{x}_{y}" pos="{world_x} {world_y} 0.25" '
-                    f'size="0.25 0.25 0.25" rgba="0.5 0.5 0.5 1"/>'
+                    f'size="0.25 0.25 0.25" rgba="0.5 0.5 0.5 1" contype="1" conaffinity="1"/>'
                     "\n"
                 )
             elif cell_type == 2:  # Shelf
                 elements_xml += (
                     f'<geom name="shelf_{x}_{y}" pos="{world_x} {world_y} 0.6" '
-                    f'size="0.22 0.22 0.6" rgba="0.2 0.8 0.2 1"/>'
+                    f'size="0.22 0.22 0.6" rgba="0.2 0.8 0.2 1" contype="1" conaffinity="1"/>'
                     "\n"
                 )
             elif cell_type == 3:  # Charging zone
                 elements_xml += (
                     f'<geom name="charge_{x}_{y}" pos="{world_x} {world_y} 0.05" '
-                    f'size="0.3 0.3 0.05" rgba="1.0 0.8 0.0 1"/>'
+                    f'size="0.3 0.3 0.05" rgba="1.0 0.8 0.0 1" contype="1" conaffinity="1"/>'
                     "\n"
                 )
             elif cell_type == 4:  # Idle zone
                 elements_xml += (
                     f'<geom name="idle_{x}_{y}" pos="{world_x} {world_y} 0.05" '
-                    f'size="0.3 0.3 0.05" rgba="0.5 0.8 1.0 1"/>'
+                    f'size="0.3 0.3 0.05" rgba="0.5 0.8 1.0 1" contype="1" conaffinity="1"/>'
                     "\n"
                 )
             elif cell_type == 5:  # Drop-off station
                 elements_xml += (
-                    f'<geom name="dropoff_{x}_{y}" pos="{world_x} {world_y} 0.1" '
-                    f'size="0.3 0.3 0.1" rgba="1.0 0.4 0.4 1"/>'
+                    f'<geom name="dropoff_{x}_{y}" pos="{world_x} {world_y} 0.05" '
+                    f'size="0.3 0.3 0.05" rgba="1.0 0.4 0.4 1" contype="1" conaffinity="1"/>'
                     "\n"
                 )
     return elements_xml

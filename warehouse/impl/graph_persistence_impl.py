@@ -54,15 +54,28 @@ class GraphPersistenceImpl(IGraphPersistence):
                     # 3) Finally clear conflict boxes
                     cur.execute("DELETE FROM conflict_boxes")
 
-                # Insert conflict boxes first
+                # Insert conflict boxes first (rectangles)
                 for box_id, box in graph.conflict_boxes.items():
+                    # Support both ConflictBox (generator) and BoxRec (SDS) shapes
+                    center_obj = getattr(box, 'position', None) or getattr(box, 'center', None)
+                    if center_obj is None:
+                        raise ValueError(f"Conflict box {box_id} missing center/position")
+                    center_x = float(center_obj.x)
+                    center_y = float(center_obj.y)
+                    width = getattr(box, 'width', None)
+                    height = getattr(box, 'height', None)
+                    if width is None or height is None:
+                        # Fallback: derive from size as square
+                        size_val = float(getattr(box, 'size', 0.0))
+                        width = size_val
+                        height = size_val
                     cur.execute(
                         """
-                        INSERT INTO conflict_boxes (box_id, center_x, center_y, size)
-                        VALUES (%s, %s, %s, %s)
+                        INSERT INTO conflict_boxes (box_id, center_x, center_y, width, height)
+                        VALUES (%s, %s, %s, %s, %s)
                         ON CONFLICT (box_id) DO NOTHING
                         """,
-                        (str(box_id), float(box.center.x), float(box.center.y), float(box.size))
+                        (str(box_id), center_x, center_y, float(width), float(height))
                     )
                     boxes_persisted += 1
 

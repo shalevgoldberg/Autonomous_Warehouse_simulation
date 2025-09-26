@@ -108,6 +108,18 @@ class PathPlannerGraphImpl(IPathPlanner):
                     retry_after=30.0  # Retry after 30 seconds
                 )
             
+            # Trivial route detection: same-cell (or near-equal) target is considered already reached
+            try:
+                same_x = abs(float(start.x) - float(goal.x)) < 1e-6 if hasattr(start, 'x') else False
+                same_y = abs(float(start.y) - float(goal.y)) < 1e-6 if hasattr(start, 'y') else False
+                if same_x and same_y:
+                    # Return an empty route to signal completion without motion
+                    empty_route = Route(segments=[], total_distance=0.0, estimated_time=0.0, conflict_boxes=[])
+                    return PathPlanningResult.success_result(empty_route)
+            except Exception:
+                # Fall through to graph-based planning if any numeric issue occurs
+                pass
+
             # Find closest nodes to start and goal
             start_node_id = self._find_closest_node(start, graph)
             goal_node_id = self._find_closest_node(goal, graph)
@@ -132,6 +144,10 @@ class PathPlannerGraphImpl(IPathPlanner):
             path_node_ids = self._dijkstra(start_node_id, goal_node_id, graph)
             
             if not path_node_ids or len(path_node_ids) < 2:
+                # If start and goal snap to the same graph node, treat as trivial route
+                if start_node_id == goal_node_id:
+                    empty_route = Route(segments=[], total_distance=0.0, estimated_time=0.0, conflict_boxes=[])
+                    return PathPlanningResult.success_result(empty_route)
                 # Check if it's due to blocked cells
                 blocked_cells = self._get_blocked_cells()
                 if blocked_cells:

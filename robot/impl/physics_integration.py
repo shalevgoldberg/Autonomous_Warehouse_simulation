@@ -10,6 +10,7 @@ import time
 
 from simulation.mujoco_env import SimpleMuJoCoPhysics
 from interfaces.state_holder_interface import IStateHolder
+from interfaces.lidar_interface import ILiDARService  # Phase 2.2
 
 
 class IPhysicsStateProvider(Protocol):
@@ -115,14 +116,18 @@ class PhysicsThreadManager(IPhysicsThreadManager):
     - State holder updates at 1kHz
     - Database synchronization at configurable frequency
     """
-    def __init__(self, physics: IPhysicsCommandSink, 
+    def __init__(self, physics: IPhysicsCommandSink,
                  state_holder: Optional[IStateHolder] = None,
                  frequency_hz: float = 1000.0,
-                 db_sync_frequency_hz: float = 10.0):
+                 db_sync_frequency_hz: float = 10.0,
+                 lidar_service: Optional[ILiDARService] = None,  # Phase 2.2
+                 robot_id: Optional[str] = None):  # Phase 2.2
         self._physics = physics
         self._state_holder = state_holder
         self._frequency_hz = frequency_hz
         self._db_sync_frequency_hz = db_sync_frequency_hz
+        self._lidar_service = lidar_service  # Phase 2.2
+        self._robot_id = robot_id  # Phase 2.2
         self._running = False
         self._thread = None
         self._lock = None
@@ -155,14 +160,34 @@ class PhysicsThreadManager(IPhysicsThreadManager):
         db_sync_period = 1.0 / self._db_sync_frequency_hz
         last_db_sync = time.perf_counter()
         next_step = time.perf_counter() + period
-        
+
         while self._running:
             try:
                 # Step physics simulation
                 self._physics.step_physics()
+
                 # Update state holder (1kHz synchronization)
                 if self._state_holder is not None:
                     self._state_holder.update_from_simulation()
+
+                # LiDAR scanning (Phase 2.2) - only if LiDAR service is available
+                if self._lidar_service is not None and self._robot_id is not None:
+                    try:
+                        # Perform LiDAR scan (this will be called at 1kHz)
+                        # Note: LiDAR service handles its own frequency limiting internally
+                        self._lidar_service.perform_scan(self._robot_id)
+
+                        # Update state holder with LiDAR scan data if available
+                        if self._state_holder is not None:
+                            lidar_scan = self._lidar_service.get_scan_data(self._robot_id)
+                            if lidar_scan is not None:
+                                self._state_holder.update_lidar_scan(lidar_scan)
+                    except Exception as e:
+                        # LiDAR errors should not crash physics loop
+                        # Log only every 1000 errors to avoid I/O overhead
+                        if self._step_count % 1000 == 0:
+                            print(f"[PhysicsThreadManager] LiDAR scanning error: {e}")
+
                 # Database synchronization at lower frequency
                 now = time.perf_counter()
                 if now - last_db_sync >= db_sync_period:
@@ -197,9 +222,12 @@ class PhysicsThreadManager(IPhysicsThreadManager):
                 print(f"[PhysicsThreadManager] Database sync error: {e}")
 
 
-def create_physics_thread_manager(physics: IPhysicsCommandSink, 
+def create_physics_thread_manager(physics: IPhysicsCommandSink,
                                 state_holder: Optional[IStateHolder] = None,
                                 frequency_hz: float = 1000.0,
-                                db_sync_frequency_hz: float = 10.0) -> IPhysicsThreadManager:
+                                db_sync_frequency_hz: float = 10.0,
+                                lidar_service: Optional[ILiDARService] = None,  # Phase 2.2
+                                robot_id: Optional[str] = None) -> IPhysicsThreadManager:  # Phase 2.2
     """Factory function for physics thread manager."""
-    return PhysicsThreadManager(physics, state_holder, frequency_hz, db_sync_frequency_hz) 
+    return PhysicsThreadManager(physics, state_holder, frequency_hz, db_sync_frequency_hz,
+                                lidar_service, robot_id) 

@@ -360,12 +360,28 @@ class ISimulationDataService(ABC):
     def cleanup_expired_conflict_box_locks(self) -> int:
         """
         Remove expired conflict box lock entries.
-        
+
         Returns:
             int: Number of expired locks removed
-            
+
         Raises:
             SimulationDataServiceError: If cleanup operation fails
+        """
+        pass
+
+    @abstractmethod
+    def clear_all_conflict_box_locks(self) -> int:
+        """
+        Clear all conflict box lock entries.
+
+        WARNING: This method removes ALL conflict box locks regardless of state.
+        Use with caution as it may cause race conditions if locks are actively held.
+
+        Returns:
+            int: Number of locks removed
+
+        Raises:
+            SimulationDataServiceError: If clear operation fails
         """
         pass
 
@@ -649,6 +665,58 @@ class ISimulationDataService(ABC):
 
         Returns:
             bool: True on success, False on failure
+        """
+        pass
+
+    # Inventory maintenance (data-ops oriented)
+    @abstractmethod
+    def clear_all_reservations(self) -> int:
+        """
+        Clear all reserved (pending) quantities across all shelves, without consuming stock.
+
+        Returns:
+            int: Number of shelf_inventory rows affected (with pending > 0 before the update).
+        """
+        pass
+
+    @abstractmethod
+    def clear_all_inventory(self) -> int:
+        """
+        Remove all rows from shelf_inventory.
+
+        Returns:
+            int: Number of rows removed.
+        """
+        pass
+
+    @abstractmethod
+    def delete_inventory_for_items(self, item_ids: List[str], purge_items: bool = False) -> int:
+        """
+        Delete inventory rows for the specified item IDs. Optionally purge items that
+        no longer have inventory after deletion.
+
+        Args:
+            item_ids: List of item IDs to delete from shelf_inventory.
+            purge_items: If True, also delete from items table when no inventory remains.
+
+        Returns:
+            int: Number of shelf_inventory rows removed.
+        """
+        pass
+
+    @abstractmethod
+    def move_inventory(self, item_id: str, from_shelf_id: str, to_shelf_id: str, quantity: int) -> bool:
+        """
+        Atomically move quantity of item from one shelf to another, respecting pending reservations.
+
+        Args:
+            item_id: Item identifier.
+            from_shelf_id: Source shelf.
+            to_shelf_id: Destination shelf.
+            quantity: Quantity to move (must be > 0).
+
+        Returns:
+            bool: True when move succeeded, False when insufficient availability or invalid inputs.
         """
         pass
 

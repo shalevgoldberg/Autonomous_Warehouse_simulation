@@ -36,7 +36,8 @@ class ConflictBox:
     """Represents a conflict box with participating cells."""
     box_id: str
     position: Point
-    size: float
+    width: float
+    height: float
     participating_nodes: Set[str]
     directions: List[LaneDirection]
 

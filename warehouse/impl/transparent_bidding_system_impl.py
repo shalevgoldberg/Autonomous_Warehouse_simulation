@@ -26,7 +26,7 @@ from interfaces.bidding_system_interface import (
     IBiddingSystem, RobotBid, TaskAssignment, BiddingRound, 
     BiddingStats, BiddingStrategy, BidStatus, BiddingSystemError
 )
-from interfaces.task_handler_interface import Task
+from interfaces.task_handler_interface import Task, TaskType
 
 if TYPE_CHECKING:
     from robot.robot_agent_lane_based import RobotAgent
@@ -48,9 +48,10 @@ class TransparentBiddingSystem(IBiddingSystem):
     - Scenarios where simplicity is preferred over optimization
     """
     
-    def __init__(self):
+    def __init__(self, config_provider=None):
         """Initialize the transparent bidding system."""
         self._strategy = BiddingStrategy.TRANSPARENT
+        self._config_provider = config_provider
         self._stats = BiddingStats(
             total_rounds=0,
             total_bids_submitted=0,
@@ -62,7 +63,7 @@ class TransparentBiddingSystem(IBiddingSystem):
         self._recent_rounds: List[BiddingRound] = []
         self._max_round_history = 50
         self._lock = threading.RLock()  # Reentrant lock for thread safety
-        
+
         print("[TransparentBiddingSystem] Initialized with transparent strategy")
     
     def collect_bids(self, available_tasks: List[Task], 
@@ -124,6 +125,19 @@ class TransparentBiddingSystem(IBiddingSystem):
                                 continue
                 
                 print(f"[TransparentBiddingSystem] Collected {len(bids)} bids from {len(available_robots)} robots for {len(available_tasks)} tasks")
+                if len(bids) == 0 and len(available_tasks) > 0:
+                    # Diagnostic: why no bids? Log per-robot availability snapshot (low-noise)
+                    try:
+                        for robot in available_robots:
+                            st = robot.get_status()
+                            task_active = st.get('task_status', None)
+                            has_active = getattr(task_active, 'has_active_task', False) if task_active else False
+                            cur_task = st.get('current_task', None)
+                            op = st.get('operational_status', 'unknown')
+                            rid = getattr(robot, 'robot_id', 'unknown')
+                            print(f"[TransparentBiddingSystem][Diag] robot={rid} has_active={has_active} op={op} cur_task={getattr(cur_task,'task_type',None)}")
+                    except Exception:
+                        pass
                 return bids
                 
             except Exception as e:
@@ -349,14 +363,18 @@ class TransparentBiddingSystem(IBiddingSystem):
             bool: True if robot can bid on the task
         """
         try:
-            # Prefer robot's own availability method if present
-            try:
-                if hasattr(robot, 'is_available_for_bidding'):
-                    if not robot.is_available_for_bidding():
+            # Prefer and trust robot's own availability method if present
+            if hasattr(robot, 'is_available_for_bidding'):
+                try:
+                    avail = robot.is_available_for_bidding()
+                    # If robot explicitly says available/unavailable, trust it
+                    if avail is True:
+                        return True
+                    if avail is False:
                         return False
-            except Exception:
-                # Fall back to status-based evaluation
-                pass
+                except Exception:
+                    # Fall back to status-based evaluation on error
+                    pass
 
             # Get robot status
             status = robot.get_status()
@@ -372,11 +390,32 @@ class TransparentBiddingSystem(IBiddingSystem):
                     # Default to False if unknown
                     task_active = False
             if task_active:
-                return False
+                # If the only active task is IDLE_PARK, treat robot as available
+                current_task = status.get('current_task', None)
+                try:
+                    if current_task and hasattr(current_task, 'task_type'):
+                        tt = current_task.task_type
+                        if tt == TaskType.IDLE_PARK or getattr(tt, 'value', '') == 'idle_park':
+                            task_active = False
+                except Exception:
+                    pass
+                if task_active:
+                    return False
 
             # Check battery level (normalize to 0-100 if needed)
             battery_level_pct = self._extract_battery_level(status)
-            if battery_level_pct < 20.0:
+
+            # Get configurable low battery threshold (default to 20.0 if not configured)
+            low_battery_threshold = 20.0
+            if self._config_provider:
+                try:
+                    battery_config = self._config_provider.get_battery_config()
+                    low_battery_threshold = battery_config.low_battery_threshold * 100.0  # Convert to percentage
+                except Exception:
+                    # Fall back to default if configuration fails
+                    pass
+
+            if battery_level_pct < low_battery_threshold:
                 return False
 
             # Check operational status when present

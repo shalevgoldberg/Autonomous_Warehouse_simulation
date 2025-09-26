@@ -12,6 +12,7 @@ from typing import Tuple, Dict, Any, Optional, List
 from dataclasses import dataclass
 
 from warehouse.map import WarehouseMap
+from interfaces.configuration_interface import RobotConfig
 
 
 @dataclass(frozen=True)
@@ -38,20 +39,31 @@ class SimpleMuJoCoPhysics:
     - Wheel commands: Atomic updates from control thread
     """
     
-    def __init__(self, warehouse_map: WarehouseMap):
+    def __init__(self, warehouse_map: WarehouseMap, robot_id: str = "robot_1",
+                 robot_config: RobotConfig = None):
         """
         Initialize simple MuJoCo physics.
-        
+
         Args:
             warehouse_map: Warehouse layout for collision detection
+            robot_id: Identifier for this robot instance
+            robot_config: Robot configuration with physical dimensions
         """
         self.warehouse_map = warehouse_map
         self.robot_id = robot_id
-        
-        # Physics parameters
+
+        # Use provided robot config or create default
+        if robot_config is None:
+            from config.configuration_provider import ConfigurationProvider
+            provider = ConfigurationProvider()
+            robot_config = provider.get_robot_config(robot_id)
+
+        self.robot_config = robot_config
+
+        # Physics parameters (from robot configuration)
         self._physics_dt = 0.001  # 1kHz physics timestep
-        self._wheel_radius = 0.05  # meters
-        self._wheel_base = 0.3  # meters between wheels
+        self._wheel_radius = robot_config.wheel_radius  # Proportional to robot size
+        self._wheel_base = robot_config.wheel_base      # Proportional to robot size
         
         # Robot state (thread-safe)
         self._state_lock = threading.RLock()
@@ -69,26 +81,7 @@ class SimpleMuJoCoPhysics:
         # MuJoCo model and data (private scene used for collision-guard and shelf attach)
         self.model = None
         self.data = None
-        # Cached ids and maps for fast contact checks and pose writes
-        self._robot_geom_ids: set[int] = set()
-        self._shelf_geom_ids_by_id: Dict[str, set[int]] = {}
-        self._body_name_to_id: Dict[str, int] = {}
-        self._geom_name_to_id: Dict[str, int] = {}
-        self._robot_free_qpos_adr: Optional[int] = None
-        self._shelf_free_qpos_adr: Dict[str, int] = {}
-        # Attached shelf state
-        self._attached_shelf_id: Optional[str] = None
-        self._attached_shelf_offset: Tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._initialize_mujoco()
-
-        # Inter-robot collision guard via shared registry
-        self._collision_registry = collision_registry
-        self._min_inter_robot_distance = min_inter_robot_distance
-        if self._collision_registry is not None:
-            try:
-                self._collision_registry.register_robot(self.robot_id, self._current_state.position)
-            except Exception:
-                pass
 
         # Diagnostics: rate-limited logging (robot_2-focused) for wheel commands and pose
         self._diagnostics_enabled = False
@@ -97,9 +90,9 @@ class SimpleMuJoCoPhysics:
     
     def _initialize_mujoco(self) -> None:
         """
-        Initialize private MuJoCo scene for collision-guard and shelf attach.
-        Physics remains kinematic; we only use MuJoCo for kinematics consistency,
-        contact queries, and keeping an attached shelf aligned to the robot.
+        Initialize MuJoCo model for visualization.
+        **DISABLED**: MuJoCo visualization causes physics conflicts and stack overflow.
+        Our kinematic physics works perfectly without it.
         """
         try:
             xml_content = self._generate_warehouse_xml()
@@ -140,19 +133,19 @@ class SimpleMuJoCoPhysics:
     <!-- Robot with freejoint base (kinematic control writes qpos) -->
     <body name="robot_base" pos="{self.warehouse_map.start_position[0]} {self.warehouse_map.start_position[1]} 0.1">
       <freejoint name="base_free"/>
-      <geom name="robot_body" type="cylinder" size="0.12 0.06" rgba="0.8 0.2 0.2 1"/>
+      <geom name="robot_body" type="cylinder" size="{self.robot_config.robot_width/2} {self.robot_config.robot_height/2}" rgba="0.8 0.2 0.2 1"/>
       <site name="robot_site" pos="0 0 0" size="0.01"/>
-      
+
       <!-- Left wheel (visual-only; used for contact classification as robot geom) -->
-      <body name="left_wheel_body" pos="-0.15 0 0">
+      <body name="left_wheel_body" pos="-{self.robot_config.wheel_base/2} 0 0">
         <joint name="left_wheel" type="hinge" axis="0 1 0" limited="false"/>
-        <geom name="left_wheel_geom" type="cylinder" size="0.03 0.01" rgba="0.3 0.3 0.3 1"/>
+        <geom name="left_wheel_geom" type="cylinder" size="{self.robot_config.wheel_radius} {self.robot_config.wheel_radius/2}" rgba="0.3 0.3 0.3 1"/>
       </body>
-      
+
       <!-- Right wheel (visual-only) -->
-      <body name="right_wheel_body" pos="0.15 0 0">
+      <body name="right_wheel_body" pos="{self.robot_config.wheel_base/2} 0 0">
         <joint name="right_wheel" type="hinge" axis="0 1 0" limited="false"/>
-        <geom name="right_wheel_geom" type="cylinder" size="0.03 0.01" rgba="0.3 0.3 0.3 1"/>
+        <geom name="right_wheel_geom" type="cylinder" size="{self.robot_config.wheel_radius} {self.robot_config.wheel_radius/2}" rgba="0.3 0.3 0.3 1"/>
       </body>
     </body>
     
@@ -210,7 +203,7 @@ class SimpleMuJoCoPhysics:
                 elif cell_type == 5:  # Drop-off station
                     elements_xml += (
                         f'<geom name="dropoff_{x}_{y}" pos="{world_x} {world_y} 0.1" '
-                        f'size="0.3 0.3 0.1" rgba="1.0 0.4 0.4 1"/>\n'
+                        f'size="0.3 0.3 0.05" rgba="1.0 0.4 0.4 1"/>\n'
                     )
         
         return elements_xml
@@ -379,21 +372,33 @@ class SimpleMuJoCoPhysics:
         """
         Step physics simulation (called at 1kHz).
         **Thread-safe**: Should only be called from physics thread.
-        
+
         Performs simple kinematic integration without complex dynamics.
         """
         with self._command_lock:
             left_vel = self._left_wheel_vel
             right_vel = self._right_wheel_vel
-        
+
+        # 🔍 DIAGNOSTIC: Physics step input
+        if self._diagnostics_enabled:
+            print(f"[PHYSICS] Step input: L={left_vel:.3f}, R={right_vel:.3f}")
+
         # Simple differential drive kinematics
         linear_vel = (left_vel + right_vel) * self._wheel_radius / 2.0
         angular_vel = (right_vel - left_vel) * self._wheel_radius / self._wheel_base
-        
+
+        # 🔍 DIAGNOSTIC: Calculated velocities
+        if self._diagnostics_enabled:
+            print(f"[PHYSICS] Calculated: linear={linear_vel:.3f}, angular={angular_vel:.3f}")
+
         with self._state_lock:
             current_pos = self._current_state.position
             x, y, theta = current_pos
-            
+
+            # 🔍 DIAGNOSTIC: Before integration
+            if self._diagnostics_enabled:
+                print(f"[PHYSICS] Before: x={x:.3f}, y={y:.3f}, theta={theta:.3f}")
+
             # Simple Euler integration
             new_theta = theta + angular_vel * self._physics_dt
             attempted_x = x + linear_vel * np.cos(new_theta) * self._physics_dt
@@ -455,6 +460,10 @@ class SimpleMuJoCoPhysics:
                 velocity=(linear_vel * np.cos(new_theta), linear_vel * np.sin(new_theta), angular_vel),
                 timestamp=time.time()
             )
+
+            # 🔍 DIAGNOSTIC: After integration
+            if self._diagnostics_enabled:
+                print(f"[PHYSICS] After: x={new_x:.3f}, y={new_y:.3f}, theta={new_theta:.3f}, vel=({linear_vel:.3f}, {angular_vel:.3f})")
             # Update shared registry
             if self._collision_registry is not None:
                 try:

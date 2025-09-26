@@ -165,6 +165,18 @@ class ConfigurationValidatorImpl(IConfigurationValidator):
         if config.order_processing_interval <= 0:
             errors.append("Task.order_processing_interval: Processing interval must be positive")
         
+        # Charging-related thresholds must be within [0,1]
+        if config.charging_trigger_threshold < 0 or config.charging_trigger_threshold > 1:
+            errors.append("Task.charging_trigger_threshold: Must be between 0 and 1")
+        if config.charging_availability_threshold < 0 or config.charging_availability_threshold > 1:
+            errors.append("Task.charging_availability_threshold: Must be between 0 and 1")
+        # Additionally, availability threshold should not be lower than trigger threshold to avoid flapping
+        try:
+            if config.charging_availability_threshold < config.charging_trigger_threshold:
+                errors.append("Task.charging_availability_threshold: Should be >= charging_trigger_threshold to avoid flapping")
+        except Exception:
+            pass
+        
         return errors
     
     def validate_system_config(self, config: SystemConfig) -> List[str]:
@@ -337,11 +349,6 @@ class ConfigurationValidatorImpl(IConfigurationValidator):
                 lambda c: c.dropping_duration > 0,
                 "Dropping duration must be positive",
                 "dropping_duration"
-            ),
-            ValidationRule(
-                lambda c: 0 <= c.charging_threshold <= 1,
-                "Charging threshold must be between 0 and 1",
-                "charging_threshold"
             ),
             ValidationRule(
                 lambda c: c.emergency_stop_distance > 0,

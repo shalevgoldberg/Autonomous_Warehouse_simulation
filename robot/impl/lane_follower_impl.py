@@ -20,7 +20,7 @@ from interfaces.navigation_types import Route, RouteSegment, Point, BoxRec
 from interfaces.state_holder_interface import IStateHolder
 from interfaces.motion_executor_interface import IMotionExecutor, MotionStatus
 from interfaces.simulation_data_service_interface import ISimulationDataService
-from interfaces.configuration_interface import IConfigurationProvider
+from interfaces.configuration_interface import IBusinessConfigurationProvider
 from interfaces.conflict_box_queue_interface import (
     IConflictBoxQueue,
     LockAcquisitionResult,
@@ -70,7 +70,7 @@ class LaneFollowerImpl(ILaneFollower):
                  state_holder: IStateHolder,
                  motion_executor: IMotionExecutor,
                  simulation_data_service: ISimulationDataService,
-                 config_provider: Optional[IConfigurationProvider] = None,
+                 config_provider: Optional[IBusinessConfigurationProvider] = None,
                  conflict_box_queue: Optional[IConflictBoxQueue] = None):
         """
         Initialize the lane follower.
@@ -125,7 +125,10 @@ class LaneFollowerImpl(ILaneFollower):
         self._heartbeat_running = False
         # Pending lock gating for upcoming segment (box we are waiting to acquire)
         self._pending_lock_box_id: Optional[str] = None
-        
+
+        # Segment-based exit tracking (prevents re-acquisition within same segment)
+        self._exited_boxes_current_segment: Set[str] = set()
+
         # Progress tracking
         self._total_distance = 0.0
         self._distance_traveled = 0.0
@@ -147,7 +150,7 @@ class LaneFollowerImpl(ILaneFollower):
         # Conflict box pre-acquisition distance (meters). If we are within this
         # distance to the first waypoint inside a not-yet-held conflict box,
         # we will try to acquire its lock before crossing the boundary.
-        self._pre_acquire_distance: float = 0.2
+        self._pre_acquire_distance: float = 0.5
 
         self._logger.info(f"LaneFollower initialized for robot {robot_id}")
         # Diagnostics (robot_2-focused): rate-limited progress/no-progress logging
@@ -170,7 +173,8 @@ class LaneFollowerImpl(ILaneFollower):
                 raise LaneFollowingError(f"Cannot start route while status is {self._status}")
             
             if not route.segments:
-                raise LaneFollowingError("Route must have at least one segment")
+                print(f"LaneFollower {self._robot_id}: Warning: route with 0 segments")  
+              #  raise LaneFollowingError("Route must have at least one segment") 
             
             self._logger.info(f"Starting route with {len(route.segments)} segments")
             
@@ -181,8 +185,59 @@ class LaneFollowerImpl(ILaneFollower):
             self._distance_traveled = 0.0
             self._route_start_time = time.time()
             self._emergency_stopped = False
-            
+
+            # Professional: ensure a clean slate for per-route transient gates
+            # - Prevent stale rotation/lock from previous route
+            self._is_rotating = False
+            self._pending_rotation_heading = None
+            self._pending_lock_box_id = None
+            try:
+                # Clear any latched REACHED_TARGET from prior motion
+                if hasattr(self._motion_executor, 'clear_reached_target_flag'):
+                    self._motion_executor.clear_reached_target_flag()
+            except Exception:
+                pass
+
+            # Clear exited boxes tracking for new route
+            self._exited_boxes_current_segment.clear()
+
+            # Diagnostics: log pending lock and new route boxes (no behavior change)
+            try:
+                route_box_ids = [b.box_id for b in route.conflict_boxes] if getattr(route, 'conflict_boxes', None) else []
+                self._logger.info(f"[diag] follow_route start: pending_lock_box_id={self._pending_lock_box_id}, route_boxes={route_box_ids}")
+            except Exception:
+                pass
+
             # Initialize conflict box states
+            # Diagnostics: if any locks are still marked as held here, warn and show DB owner
+            if self._locked_boxes:
+                try:
+                    self._logger.warning(f"[Diag] Starting new route while still holding locks in-memory: {list(self._locked_boxes)}")
+                    robot_pos = self._state_holder.get_position()
+                    robot_xy = (robot_pos[0], robot_pos[1])
+
+                    for _box in list(self._locked_boxes):
+                        try:
+                            _owner = self._simulation_data_service.get_conflict_box_lock_owner(_box)
+                            self._logger.warning(f"[Diag] DB owner for {_box}: {_owner}")
+
+                            # Show geometry check vs cache discrepancy
+                            try:
+                                # Get box geometry from SDS
+                                all_boxes = self._simulation_data_service.get_conflict_boxes()
+                                box_dict = {b.box_id: b for b in all_boxes}
+                                if _box in box_dict:
+                                    box_rec = box_dict[_box]
+                                    computed_inside = self._is_point_in_conflict_box(robot_xy, box_rec)
+                                    cached_inside = self._conflict_boxes.get(_box, ConflictBoxState(_box)).robot_inside
+                                    print(f"[diag] follow_route: {_box} computed_inside={computed_inside}, cached_inside={cached_inside}, robot_at=({robot_xy[0]:.2f}, {robot_xy[1]:.2f}), box_center=({box_rec.center.x:.2f}, {box_rec.center.y:.2f}) w={box_rec.width:.2f} h={box_rec.height:.2f}")
+                            except Exception as _e:
+                                self._logger.warning(f"[diag] follow_route: failed to compute geometry for {_box}: {_e}")
+                        except Exception as _e:
+                            self._logger.warning(f"[Diag] Failed to query DB owner for {_box}: {_e}")
+                except Exception:
+                    print(f"[diag] follow_route: failed to query DB owner for {_box}: {_e}")
+                    pass
             self._conflict_boxes.clear()
             self._locked_boxes.clear()
             if route.conflict_boxes:
@@ -209,9 +264,23 @@ class LaneFollowerImpl(ILaneFollower):
             # Stop heartbeat thread
             self._stop_heartbeat_thread()
             
+            # Refresh conflict-box states to avoid stale unsafe decisions at shutdown
+            if not force_release:
+                try:
+                    self._update_conflict_box_states()
+                except Exception as _e:
+                    self._logger.warning(f"[Diag] Failed to refresh conflict-box states before stop-release: {_e}")
+
             # Release conflict box locks
             self._release_all_locks(force_release)
             
+            # Diagnostics: report if a pending lock gate remains set at stop
+            try:
+                if self._pending_lock_box_id is not None:
+                    self._logger.warning(f"[diag] stop_following: pending_lock_box_id still set: {self._pending_lock_box_id}")
+            except Exception:
+                pass
+
             # Reset state
             self._status = LaneFollowingStatus.IDLE
             self._current_route = None
@@ -242,16 +311,37 @@ class LaneFollowerImpl(ILaneFollower):
         with self._lock:
             if self._status == LaneFollowingStatus.IDLE or self._emergency_stopped:
                 return
-            
+
             try:
+                # Rate-limited entry diagnostics to confirm updates are running
+                try:
+                    now_diag = time.time()
+                    last = getattr(self, "_last_update_diag_time", 0.0)
+                    if now_diag - last > 1.5:
+                        setattr(self, "_last_update_diag_time", now_diag)
+                        ms = self._motion_executor.get_motion_status()
+                        ms_val = ms.value if hasattr(ms, 'value') else ms
+                        st_val = self._status.value if hasattr(self._status, 'value') else self._status
+                        #print(f"[diag][LF] update enter: status={st_val} robot={self._robot_id} is_rotating={self._is_rotating} pending={self._pending_lock_box_id} motion={ms_val} seg={self._segment_index}")
+                except Exception:
+                    pass
                 # If we're waiting on a lock for the current segment, retry acquisition
                 if self._pending_lock_box_id is not None and self._current_segment is not None:
                     box_id = self._pending_lock_box_id
+
+                    # Diagnostics: detect stale pending lock not present in current route
+                    try:
+                        route_box_ids = [b.box_id for b in self._current_route.conflict_boxes] if (self._current_route and self._current_route.conflict_boxes) else []
+                        if route_box_ids and box_id not in route_box_ids:
+                            self._logger.warning(f"[diag] update_lane_following: pending_lock_box_id={box_id} not in current route boxes={route_box_ids} (seg={self._segment_index + 1})")
+                    except Exception:
+                        pass
+
                     acquired = False
                     try:
                         acquired = self.try_acquire_conflict_box_lock(box_id)
                     except Exception as e:
-                        self._logger.warning(f"Retry lock acquisition failed for {box_id}: {e}")
+                        self._logger.warning(f"Lock retry failed for {box_id}: {e}")
                         acquired = False
 
                     if acquired:
@@ -262,34 +352,54 @@ class LaneFollowerImpl(ILaneFollower):
                         self._execute_segment_motion(self._current_segment.segment)
                         return
                     else:
-                        # Still waiting; skip rest of updates to avoid moving without lock
+                        self._logger.debug(f"[diag] update_lane_following: still waiting for lock {box_id}")
                         return
                 # Handle pending stop-and-turn rotation before moving to next segment
                 if self._is_rotating:
                     motion_status = self._motion_executor.get_motion_status()
-                    if motion_status not in [MotionStatus.EXECUTING, MotionStatus.REACHED_TARGET]:
-                        # Rotation finished (executor reports IDLE after stopping)
+                    # Diagnostics kept commented to avoid noise
+                    try:
+                        if getattr(self, "_pending_rotation_heading", None) is not None:
+                            pose = self._state_holder.get_position()
+                            theta = pose[2] if len(pose) >= 3 else 0.0
+                            target_h = float(self._pending_rotation_heading)
+                            err = target_h - theta
+                            while err > math.pi:
+                                err -= 2 * math.pi
+                            while err < -math.pi:
+                                err += 2 * math.pi
+                            ms_val = motion_status.value if hasattr(motion_status, 'value') else motion_status
+                            print(f"[diag][LF] robot={self._robot_id} rotating: motion={ms_val} heading_err={err:.3f} target={target_h:.3f} theta={theta:.3f}")
+                    except Exception:
+                        pass
+                    # Safe gate: if rotation is not actively executing (REACHED_TARGET or IDLE), treat as complete
+                    if motion_status != MotionStatus.EXECUTING:
                         self._is_rotating = False
                         self._pending_rotation_heading = None
-                        # Start the next segment now that heading is aligned
                         self._start_next_segment()
                         return
-                    # Still rotating; skip other updates until rotation completes
-                    return
-                
+                    else:
+                        try:
+                            ms_val = motion_status.value if hasattr(motion_status, 'value') else motion_status
+                            #print(f"[diag][LF] robot={self._robot_id} rotation branch: deferring due to motion_status={ms_val}")
+                        except Exception:
+                            pass
+                        return
+
                 # Update current segment progress
                 self._update_segment_progress()
-                
+
                 # Check for segment completion
                 if self._is_segment_complete():
+                    self._logger.info(f"Segment {self._segment_index + 1} completed - starting next")
                     self._complete_current_segment()
-                
+
                 # Handle conflict box transitions
                 self._update_conflict_box_states()
-                
+
                 # Safety monitoring
                 self._monitor_lane_deviation()
-                
+
             except Exception as e:
                 self._logger.error(f"Error in lane following update: {e}")
                 self._handle_error(str(e))
@@ -364,17 +474,47 @@ class LaneFollowerImpl(ILaneFollower):
         """Get list of conflict boxes currently held by this robot."""
         with self._lock:
             return list(self._locked_boxes)
-    
+
+    def get_pending_conflict_box(self) -> Optional[str]:
+        """Get the conflict box ID that this robot is currently waiting to acquire."""
+        with self._lock:
+            return self._pending_lock_box_id
+
     def get_unsafe_boxes(self) -> List[str]:
         """Get list of conflict boxes where robot is currently inside."""
         with self._lock:
-            unsafe_boxes = []
+            unsafe_boxes: List[str] = []
             robot_pos = self._state_holder.get_position()
-            
+            robot_xy = (robot_pos[0], robot_pos[1])
+
+            # Prefer fresh, on-demand geometry checks to avoid stale cache at release time
+            if self._current_route and self._current_route.conflict_boxes:
+                # Build lookup once for efficiency
+                route_boxes_by_id = {b.box_id: b for b in self._current_route.conflict_boxes}
+
+                for box_id, box_state in self._conflict_boxes.items():
+                    box_rec = route_boxes_by_id.get(box_id)
+                    if box_rec is None:
+                        # Fallback to cached state if box not in current route list (should be rare)
+                        print(f"[diag] get_unsafe_boxes: box {box_id} not in route context (route has {[b.box_id for b in self._current_route.conflict_boxes]}) — using cached robot_inside={box_state.robot_inside}")
+                        if box_state.robot_inside:
+                            unsafe_boxes.append(box_id)
+                        continue
+
+                    is_inside_now = self._is_point_in_conflict_box(robot_xy, box_rec)
+                    # Keep state consistent for subsequent logs/decisions
+                    box_state.robot_inside = is_inside_now
+                    if is_inside_now:
+                        unsafe_boxes.append(box_id)
+
+                return unsafe_boxes
+
+            # Fallback: no route context — use cached states
+            #print(f"[diag] get_unsafe_boxes: no route context — using cached states for {len(self._conflict_boxes)} boxes")
             for box_id, box_state in self._conflict_boxes.items():
                 if box_state.robot_inside:
                     unsafe_boxes.append(box_id)
-            
+
             return unsafe_boxes
     
     def report_lane_deviation(self, deviation_distance: float, 
@@ -459,7 +599,8 @@ class LaneFollowerImpl(ILaneFollower):
                     state.status = ConflictBoxStatus.LOCKED
                     state.heartbeat_time = time.time()
                     self._locked_boxes.add(box_id)
-                    self._logger.info(f"Acquired conflict box lock immediately: {box_id}")
+                    robot_pos = self._state_holder.get_position()
+                    self._logger.info(f"Acquired conflict box lock immediately: {box_id} at ({robot_pos[0]:.2f}, {robot_pos[1]:.2f})")
                 else:
                     state.status = ConflictBoxStatus.QUEUED
                     self._logger.info(f"Queued for conflict box {box_id} at position {result.queue_position} "
@@ -483,7 +624,8 @@ class LaneFollowerImpl(ILaneFollower):
                 self._conflict_boxes[box_id].heartbeat_time = time.time()
                 self._conflict_boxes[box_id].priority = priority
             
-            self._logger.info(f"Acquired conflict box lock: {box_id}")
+            robot_pos = self._state_holder.get_position()
+            self._logger.info(f"Acquired conflict box lock: {box_id} at ({robot_pos[0]:.2f}, {robot_pos[1]:.2f})")
         else:
             self._logger.debug(f"Failed to acquire conflict box lock: {box_id}")
         
@@ -493,6 +635,24 @@ class LaneFollowerImpl(ILaneFollower):
         """Release a conflict box lock."""
         with self._lock:
             try:
+                #print(f"[diag] release_conflict_box_lock: releasing lock {box_id} (queue={'yes' if self._conflict_box_queue else 'no'})")
+                # Defensive: if we still think we're inside due to stale cache, recompute now
+                if box_id in self._conflict_boxes:
+                    try:
+                        if self._current_route and self._current_route.conflict_boxes:
+                            route_boxes_by_id = {b.box_id: b for b in self._current_route.conflict_boxes}
+                            rec = route_boxes_by_id.get(box_id)
+                            if rec is not None:
+                                pos = self._state_holder.get_position()
+                                inside_now = self._is_point_in_conflict_box((pos[0], pos[1]), rec)
+                                self._conflict_boxes[box_id].robot_inside = inside_now
+                                #if inside_now:
+                                    #print(f"[diag] release_conflict_box_lock: recomputed inside=true at release for {box_id} at {pos}")
+                    except Exception as _e:
+                        self._logger.warning(f"[Diag] Failed recompute inside at release for {box_id}: {_e}")
+                        # If recompute failed, add diagnostic about cache state
+                        cached_state = self._conflict_boxes.get(box_id, ConflictBoxState(box_id))
+                        self._logger.warning(f"[diag] release_conflict_box_lock: proceeding with release despite recompute failure, cached_inside={cached_state.robot_inside}")
                 # Use queue system if available, otherwise fallback to direct release
                 if self._conflict_box_queue:
                     success = self._conflict_box_queue.release_lock(box_id, self._robot_id)
@@ -501,6 +661,7 @@ class LaneFollowerImpl(ILaneFollower):
                         box_id, self._robot_id)
                 
                 if success:
+                    #print(f"[diag] release_conflict_box_lock: backend release success for {box_id}; updating local state")
                     self._locked_boxes.discard(box_id)
                     if box_id in self._conflict_boxes:
                         self._conflict_boxes[box_id].status = ConflictBoxStatus.UNLOCKED
@@ -509,9 +670,25 @@ class LaneFollowerImpl(ILaneFollower):
                         self._conflict_boxes[box_id].estimated_wait_time = None
                         self._conflict_boxes[box_id].lock_acquisition_result = None
                     
-                    self._logger.info(f"Released conflict box lock: {box_id}")
+                    robot_pos = self._state_holder.get_position()
+                    self._logger.info(f"Released conflict box lock: {box_id} at ({robot_pos[0]:.2f}, {robot_pos[1]:.2f})")
                 else:
-                    self._logger.warning(f"Failed to release conflict box lock: {box_id}")
+                    # Add diagnostic detail to understand why release failed
+                    owner_hint = None
+                    try:
+                        if self._conflict_box_queue:
+                            hb = self._conflict_box_queue.heartbeat_lock(box_id, self._robot_id)
+                            owner_hint = self._robot_id if hb else 'another_robot_or_none'
+                    except Exception:
+                        print(f"[diag] set owner hint to unknown due to {_e}")
+                        owner_hint = 'unknown'
+                    # Try to fetch DB-reported owner for higher-fidelity diagnosis
+                    db_owner = None
+                    try:
+                        db_owner = self._simulation_data_service.get_conflict_box_lock_owner(box_id)
+                    except Exception as _e:
+                        db_owner = f"error: {_e}"
+                    self._logger.warning(f"Failed to release conflict box lock: {box_id} (owner_hint={owner_hint}, db_owner={db_owner})")
                 
                 return success
                 
@@ -526,7 +703,10 @@ class LaneFollowerImpl(ILaneFollower):
         if not self._current_route or self._segment_index >= len(self._current_route.segments):
             self._complete_route()
             return
-        
+
+        # Clear exited boxes tracking when starting new segment
+        self._exited_boxes_current_segment.clear()
+
         segment = self._current_route.segments[self._segment_index]
         # Set current target to the segment end point (drive toward endpoint)
         self._current_segment = LaneSegmentProgress(
@@ -551,40 +731,28 @@ class LaneFollowerImpl(ILaneFollower):
         # Before starting motion, if this is the first segment or a sharp turn, pre-rotate
         if self._should_prerotate_for_segment(self._segment_index):
             target_heading = self._segment_heading(self._current_segment.segment)
+            try:
+                x, y, theta = self._state_holder.get_position()
+            except Exception:
+                theta = 0.0
+            try:
+                #print(f"[diag][LF] robot={self._robot_id} seg {self._segment_index + 1} prerotate: current_theta={theta:.3f} target_heading={target_heading:.3f}")
+                pass
+            except Exception:
+                pass
             self._motion_executor.rotate_to_heading(target_heading)
             self._is_rotating = True
             self._pending_rotation_heading = target_heading
-            self._logger.info(f"Pre-rotating to heading {target_heading:.3f} rad before segment {self._segment_index + 1}")
             return
 
         # Start motion execution for this segment
         self._execute_segment_motion(segment)
-        
-        self._logger.info(f"Started segment {self._segment_index + 1}/{len(self._current_route.segments)}")
     
     def _execute_segment_motion(self, segment: RouteSegment) -> None:
         """Execute motion for a route segment."""
-        # If this segment intersects a conflict box, ensure we hold the lock before proceeding
-        target_box_id = self._get_first_box_for_segment(segment)
-        if target_box_id is not None and target_box_id not in self._locked_boxes:
-            # Attempt lock acquisition using configured mechanism (queue or direct DB)
-            acquired = False
-            try:
-                acquired = self.try_acquire_conflict_box_lock(target_box_id)
-            except Exception as e:
-                self._logger.warning(f"Conflict box lock attempt failed for {target_box_id}: {e}")
-                acquired = False
-
-            if not acquired:
-                # Defer motion until lock is acquired; set status and retry in update loop
-                self._pending_lock_box_id = target_box_id
-                self._status = LaneFollowingStatus.APPROACHING_CONFLICT_BOX
-                try:
-                    self._motion_executor.stop_execution()
-                except Exception:
-                    pass
-                self._logger.info(f"Waiting for conflict box lock: {target_box_id}; deferring segment start")
-                return
+        # Last-minute locking strategy: do not acquire at segment start.
+        # We rely on _preacquire_upcoming_box_if_needed() to attempt lock acquisition
+        # when approaching the conflict box boundary, preventing far-away stops.
 
         # Set appropriate speed based on segment type
         segment_in_box = self._is_segment_in_conflict_box(segment)
@@ -592,23 +760,20 @@ class LaneFollowerImpl(ILaneFollower):
             self._motion_executor.set_corner_speed(self._config.corner_speed)
         else:
             self._motion_executor.set_movement_speed(self._config.max_speed)
-        # Diagnostics: conflict box usage
-        try:
-            self._logger.info(
-                f"[ConflictBoxDiag] seg={self._segment_index + 1}/{len(self._current_route.segments) if self._current_route else '?'} "
-                f"in_box={segment_in_box} held_locks={list(self._locked_boxes)} "
-                f"queue_cfg={(self._conflict_box_queue is not None)}")
-        except Exception:
-            pass
-        
+
         # Create a single-segment route for motion executor
         single_segment_route = Route(
             segments=[segment],
             total_distance=self._calculate_segment_distance(segment),
             estimated_time=0.0
         )
-        
+
         self._motion_executor.follow_route(single_segment_route)
+
+        # Diagnostics: log when a zero-segment route is created (robot_2 only)
+        if self._robot_id == "warehouse_robot_2":
+            if single_segment_route.total_distance == 0.0:
+                self._logger.warning(f"Created a zero-segment route for segment {self._segment_index + 1}.")
     
     def _update_segment_progress(self) -> None:
         """Update progress through current segment."""
@@ -631,14 +796,15 @@ class LaneFollowerImpl(ILaneFollower):
                 self._current_segment.distance_remaining = distance_to_target
                 # Pre-acquire upcoming conflict box if we are close to its entry point
                 self._preacquire_upcoming_box_if_needed(robot_pos_2d, self._current_segment.segment)
+
                 # Diagnostics: robot_2-focused progress/no-progress logging
                 if self._robot_id == "warehouse_robot_2":
                     import time as _t
                     now = _t.time()
                     if now - self._last_progress_log_time > 1.0:
                         self._last_progress_log_time = now
-                        self._logger.info(
-                            f"Progress seg {self._segment_index + 1}: dist={distance_to_target:.3f}m/seg={segment_distance:.3f}m, progress={self._current_segment.progress_ratio:.2%}")
+                        #self._logger.info(
+                        #    f"Progress seg {self._segment_index + 1}: dist={distance_to_target:.3f}m/seg={segment_distance:.3f}m, progress={self._current_segment.progress_ratio:.2%}")
                     # No-progress detection (log only; no behavior change)
                     if now - self._last_progress_check_time > 3.0:
                         if abs(distance_to_target - self._last_progress_distance) < 0.005:
@@ -659,24 +825,22 @@ class LaneFollowerImpl(ILaneFollower):
     def _complete_current_segment(self) -> None:
         """Complete current segment and move to next."""
         if self._current_segment:
-            self._distance_traveled += self._calculate_segment_distance(self._current_segment.segment)
-            self._logger.info(f"Completed segment {self._segment_index + 1}")
-        
+            segment_distance = self._calculate_segment_distance(self._current_segment.segment)
+            self._distance_traveled += segment_distance
+
         # Determine if we need a stop-and-turn before the next segment
         next_index = self._segment_index + 1
         if self._current_route and next_index < len(self._current_route.segments):
             curr_heading = self._segment_heading(self._current_segment.segment)
             next_heading = self._segment_heading(self._current_route.segments[next_index])
+
             if self._is_turn(curr_heading, next_heading):
-                # Advance to next segment index but perform rotation before starting motion
                 self._segment_index = next_index
                 self._pending_rotation_heading = next_heading
                 self._is_rotating = True
                 self._motion_executor.rotate_to_heading(next_heading)
-                self._logger.info(f"Stop-and-turn: rotating to heading {next_heading:.3f} rad before segment {self._segment_index + 1}")
-                # Do not start next segment until rotation completes
                 return
-        
+
         # No rotation needed; advance and start next segment immediately
         self._segment_index += 1
         self._start_next_segment()
@@ -689,6 +853,12 @@ class LaneFollowerImpl(ILaneFollower):
         # Stop motion
         self._motion_executor.stop_execution()
         
+        # Proactively refresh conflict-box inside flags once at route end to avoid stale release decisions
+        try:
+            self._update_conflict_box_states()
+        except Exception as _e:
+            self._logger.warning(f"[Diag] Failed to refresh conflict-box states before release: {_e}")
+
         # Release all locks
         self._release_all_locks(force_release=False)
         
@@ -699,35 +869,47 @@ class LaneFollowerImpl(ILaneFollower):
         """Update conflict box states based on robot position."""
         robot_pos = self._state_holder.get_position()
         robot_pos_2d = (robot_pos[0], robot_pos[1])
-        
+
         for box_id, box_state in self._conflict_boxes.items():
             # Check if robot is inside this conflict box
             was_inside = box_state.robot_inside
             is_inside = self._is_robot_in_conflict_box(robot_pos_2d, box_id)
-            
+
             if is_inside != was_inside:
                 box_state.robot_inside = is_inside
                 if is_inside:
                     self._logger.info(f"Robot entered conflict box: {box_id}")
-                    # Diagnostics: warn if entering without lock
+                    #print(f"[diag] _update_conflict_box_states: on-enter state: held={list(self._locked_boxes)}, pending={self._pending_lock_box_id}")
                     if box_id not in self._locked_boxes:
-                        try:
-                            route_boxes = [b.box_id for b in (self._current_route.conflict_boxes or [])]
-                        except Exception:
-                            route_boxes = []
                         self._logger.warning(
-                            f"[ConflictBoxDiag] ENTERED box {box_id} WITHOUT LOCK | "
-                            f"held={list(self._locked_boxes)} route_boxes={route_boxes} "
-                            f"queue_cfg={(self._conflict_box_queue is not None)}")
+                            f"Entered conflict box {box_id} without lock! held={list(self._locked_boxes)}")
                     self._status = LaneFollowingStatus.IN_CONFLICT_BOX
                 else:
                     self._logger.info(f"Robot exited conflict box: {box_id}")
-                    # Release lock immediately on exit if we hold it
+                    #print(f"[diag] _update_conflict_box_states: on-exit state before release: held={list(self._locked_boxes)}, pending={self._pending_lock_box_id}")
                     if box_id in self._locked_boxes:
                         try:
+                            # Reconfirm geometry at the moment of exit in case of very tight margins
+                            if self._current_route and self._current_route.conflict_boxes:
+                                try:
+                                    route_boxes_by_id = {b.box_id: b for b in self._current_route.conflict_boxes}
+                                    rec = route_boxes_by_id.get(box_id)
+                                    if rec is not None:
+                                        inside_now = self._is_point_in_conflict_box(robot_pos_2d, rec)
+                                        box_state.robot_inside = inside_now
+                                        if inside_now:
+                                            print(f"[diag] _update_conflict_box_states: exit-trigger recompute suggests still inside {box_id}; deferring release")
+                                            return
+                                except Exception as _e:
+                                    print(f"[diag] _update_conflict_box_states: exit-trigger recompute failed for {box_id}: {_e}")
+                            #print(f"[diag] _update_conflict_box_states: attempting release on exit for {box_id}; held={list(self._locked_boxes)}")
                             self.release_conflict_box_lock(box_id)
+                            #print(f"[diag] _update_conflict_box_states: release on exit completed for {box_id}; now held={list(self._locked_boxes)}")
                         except Exception as e:
                             self._logger.warning(f"Failed to release conflict box {box_id} on exit: {e}")
+
+                    self._exited_boxes_current_segment.add(box_id)
+
                     if self._status == LaneFollowingStatus.IN_CONFLICT_BOX:
                         self._status = LaneFollowingStatus.FOLLOWING_LANE
     
@@ -770,10 +952,29 @@ class LaneFollowerImpl(ILaneFollower):
                 self.release_conflict_box_lock(box_id)
         else:
             # Safe release - only release locks for boxes robot is not inside
+            # Recompute unsafe with fresh geometry to avoid stale state between control loop ticks
             unsafe_boxes = self.get_unsafe_boxes()
             for box_id in list(self._locked_boxes):
                 if box_id not in unsafe_boxes:
                     self.release_conflict_box_lock(box_id)
+                else:
+                    try:
+                        pos = self._state_holder.get_position()
+                        self._logger.warning(f"[Diag] Safe release skipped for {box_id}: robot still inside box at {pos}")
+                        # Add diagnostic details about why this box is considered unsafe
+                        if self._current_route and self._current_route.conflict_boxes:
+                            route_boxes_by_id = {b.box_id: b for b in self._current_route.conflict_boxes}
+                            box_rec = route_boxes_by_id.get(box_id)
+                            if box_rec:
+                                print(f"[diag] _release_all_locks: {box_id} in route context, recomputed inside={self._is_point_in_conflict_box((pos[0], pos[1]), box_rec)}")
+                            else:
+                                print(f"[diag] _release_all_locks: {box_id} not in route context, cached inside={self._conflict_boxes.get(box_id, ConflictBoxState(box_id)).robot_inside}")
+                        else:
+                            cached_state = self._conflict_boxes.get(box_id, ConflictBoxState(box_id))
+                            print(f"[diag] _release_all_locks: no route context, cached inside={cached_state.robot_inside}")
+                    except Exception:
+                        print(f"[diag] _release_all_locks: failed to compute geometry for {box_id}")
+                        pass
     
     def _start_heartbeat_thread(self) -> None:
         """Start the heartbeat thread for conflict box locks."""
@@ -847,7 +1048,8 @@ class LaneFollowerImpl(ILaneFollower):
         if seg_index == 0:
             try:
                 x, y, theta = self._state_holder.get_position()
-            except Exception:
+            except Exception as _e:
+                print(f"[diag] _should_prerotate_for_segment: failed to get position: {_e}")
                 theta = 0.0
             desired = self._segment_heading(self._current_route.segments[seg_index])
             diff = abs((desired - theta + math.pi) % (2 * math.pi) - math.pi)
@@ -886,7 +1088,14 @@ class LaneFollowerImpl(ILaneFollower):
         candidate_wp: Optional[Point] = None
         for wp in segment.lane.waypoints:
             for box in self._current_route.conflict_boxes:
-                if self._is_point_in_conflict_box((wp.x, wp.y), box) and box.box_id not in self._locked_boxes:
+                if (self._is_point_in_conflict_box((wp.x, wp.y), box) and
+                    box.box_id not in self._locked_boxes):
+
+                    # Prevent re-acquisition of boxes exited in current segment
+                    if box.box_id in self._exited_boxes_current_segment:
+                        self._logger.debug(f"[PreAcquire] Skipping {box.box_id} - already exited in current segment")
+                        continue
+
                     candidate_box_id = box.box_id
                     candidate_wp = wp
                     break
@@ -896,7 +1105,7 @@ class LaneFollowerImpl(ILaneFollower):
             return
         # If close enough to the boundary waypoint, try to acquire
         distance_to_wp = self._calculate_distance(robot_pos, (candidate_wp.x, candidate_wp.y))
-        if distance_to_wp <= max(self._pre_acquire_distance, self._config.lane_tolerance * 2.0):
+        if distance_to_wp <= max(self._pre_acquire_distance, self._config.lane_tolerance):
             try:
                 acquired = self.try_acquire_conflict_box_lock(candidate_box_id)
             except Exception as e:
@@ -908,9 +1117,9 @@ class LaneFollowerImpl(ILaneFollower):
                 self._status = LaneFollowingStatus.APPROACHING_CONFLICT_BOX
                 try:
                     self._motion_executor.stop_execution()
-                except Exception:
+                except Exception as _e:
+                    print(f"[diag] _preacquire_upcoming_box_if_needed: failed to stop execution: {_e}")
                     pass
-                self._logger.info(f"Waiting for conflict box lock: {candidate_box_id}; deferring mid-segment")
 
     def _get_first_box_for_segment(self, segment: RouteSegment) -> Optional[str]:
         """Return the first conflict box id that this segment intersects (if any).
@@ -941,10 +1150,14 @@ class LaneFollowerImpl(ILaneFollower):
         return False
     
     def _is_point_in_conflict_box(self, point: Tuple[float, float], box: BoxRec) -> bool:
-        """Check if a point is inside a conflict box."""
-        half_size = box.size / 2.0
-        return (abs(point[0] - box.center.x) <= half_size and
-                abs(point[1] - box.center.y) <= half_size)
+        """Check if a point is inside a rectangular conflict box (axis-aligned)."""
+        # Small margin to avoid sticky boundary cases
+        epsilon = 0.02
+        half_w = max(0.0, (box.width * 0.5) - epsilon)
+        half_h = max(0.0, (box.height * 0.5) - epsilon)
+        dx = point[0] - box.center.x
+        dy = point[1] - box.center.y
+        return (abs(dx) <= half_w and abs(dy) <= half_h)
     
     def _calculate_lane_deviation(self, robot_pos: Tuple[float, float], segment: RouteSegment) -> float:
         """Calculate perpendicular distance from robot to lane center line."""

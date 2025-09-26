@@ -159,7 +159,8 @@ class TestLaneFollowerTaskHandlerIntegration(unittest.TestCase):
             motion_executor=self.mock_motion_executor,
             coordinate_system=self.mock_coordinate_system,
             simulation_data_service=self.mock_simulation_data_service,
-            robot_id="test_robot"
+            robot_id="test_robot",
+            battery_manager=None  # No battery manager in lane follower test
         )
         
         # Setup mock responses

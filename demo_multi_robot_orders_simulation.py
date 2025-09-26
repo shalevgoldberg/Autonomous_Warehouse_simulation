@@ -9,13 +9,29 @@ Demonstrates coordinated multi-robot operation with:
 - Real-time multi-robot visualization
 - Comprehensive error handling and monitoring
 - SOLID architecture principles maintained
-- Integrated order processing from sample_orders.json
+- Integrated order processing from configurable JSON orders file
+- Support for different warehouse layouts via CSV configuration
 
 ⚠️  DEMO CONFIGURATION: Lane tolerance set to 3.0m (too soft for production!)
     This allows tasks to complete despite navigation issues. For production,
     use 0.1-0.3m tolerance for safe warehouse operation.
 
-Run with: python demo_multi_robot_orders_simulation.py
+CLI ARGUMENTS:
+    --robots N              Number of robots to simulate (default: 3)
+    --placement MODE        Robot placement: 'random' or 'manual' (default: random)
+    --orders FILE           JSON orders file to process (default: sample_orders.json)
+
+WAREHOUSE MANAGEMENT:
+    Warehouse data is automatically managed. If no warehouse data exists in the database,
+    the demo will automatically detect this and run load_new_warehouse.py to generate it.
+
+EXAMPLES:
+    python demo_multi_robot_orders_simulation.py                    # Auto-detect and manage warehouse
+    python demo_multi_robot_orders_simulation.py --robots 5 --placement manual
+    python demo_multi_robot_orders_simulation.py --orders my_orders.json
+
+    # To load a custom warehouse first (if needed):
+    python load_new_warehouse.py --warehouse custom_layout.csv
 """
 import sys
 import os
@@ -26,6 +42,7 @@ import argparse
 from unittest.mock import MagicMock
 import logging
 from dataclasses import dataclass
+import hashlib
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -73,6 +90,20 @@ class RobotInstance:
     status: str = "initializing"
 
 
+class WarehouseDataMissingError(RuntimeError):
+    """Exception raised when warehouse data is missing from database."""
+    pass
+
+def _calculate_file_hash(file_path: str) -> str:
+    """Calculate SHA256 hash of a file for change detection."""
+    import hashlib
+    try:
+        with open(file_path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except Exception:
+        return ""
+
+
 class MultiRobotSimulationManager:
     """
     Manages multi-robot warehouse simulation.
@@ -81,113 +112,262 @@ class MultiRobotSimulationManager:
     and visualization following clean architecture principles.
     """
     
-    def __init__(self, warehouse_csv: str = "extended_warehouse.csv", robot_count: int = 2):
+    def __init__(self, robot_count: int = 2, placement_mode: str = "random", orders_file: str = "sample_orders.json"):
         """Initialize simulation manager."""
         print("🚀 Initializing Multi-Robot Warehouse Simulation")
         print(f"   🤖 Robot Count: {robot_count}")
-        
-        # Validate robot coun
+        print(f"   📋 Orders File: {orders_file}")
+        print("   💾 Data Persistence: Enabled - using existing data")
+
+        # Validate robot count
         #if robot_count < 1 or robot_count > 15:
         #    raise ValueError("Robot count must be between 1 and 15 for demo purposes")
-        
+
         self.robot_count = robot_count
+        self.placement_mode = placement_mode
+        self.orders_file = orders_file
         self.robots: List[RobotInstance] = []
-        
-        # Load warehouse
-        self.warehouse_map = WarehouseMap(csv_file=warehouse_csv)
-        print(f"   ✅ Warehouse loaded: {self.warehouse_map.width}x{self.warehouse_map.height}")
 
-        # Create real configuration provider
-        self.config_provider = ConfigurationProvider()
-        print("   ✅ Configuration provider initialized")
-
-        # Override random placement to use manual placement
-        self.config_provider.set_value("demo.random_robot_placement", True)
-        print("   ✅ Random robot placement disabled (manual placement enabled)")
-
-        # Shared MuJoCo engine for all robots
-        self.shared_engine = SharedMuJoCoEngine(self.warehouse_map, physics_dt=0.001, enable_time_gating=True,
-                                               config_provider=self.config_provider)
-        
-        # Create real simulation data service (increase pool for multi-robot)
-        self.simulation_data_service = SimulationDataServiceImpl(self.warehouse_map, pool_size=max(10, 3 * robot_count))
-        print("   ✅ Simulation data service initialized")
-        
-        # Persist grouped navigation graph (from CSV) into DB to ensure up-to-date conflict boxes
+        # Try to initialize simulation with existing warehouse data
         try:
-            result = self.simulation_data_service.persist_navigation_graph_from_csv(
-                Path(warehouse_csv), clear_existing=True
-            )
-            print(f"   ✅ Navigation graph persisted: boxes={result.boxes_persisted}, "
-                  f"nodes={result.nodes_persisted}, edges={result.edges_persisted}")
-        except Exception as e:
-            print(f"   ⚠️  Warning: Could not persist navigation graph: {e}")
-        
-        # Populate inventory for demo
-        self._populate_demo_inventory()
+            self._initialize_simulation_components()
+            print("   ✅ Warehouse data found and loaded successfully")
+            print("   💾 Using existing warehouse data")
+        except WarehouseDataMissingError:
+            print("   ⚠️  No warehouse data found in database")
+            print("🔄 FALLBACK: Auto-generating warehouse with default CSV: extended_warehouse.csv")
+            print("🔄 FALLBACK: Running load_new_warehouse.py --warehouse extended_warehouse.csv")
+            print("🔄 FALLBACK: Waiting for warehouse generation to complete...")
 
-        # Register all robots with shared engine BEFORE initialization
-        self._register_robots_with_engine()
+            # Auto-generate warehouse data
+            self._generate_warehouse_data_fallback()
 
-        # Initialize shared engine (creates appearance service)
-        try:
-            self.shared_engine.initialize()
-            print("   ✅ Shared engine initialized with appearance service")
-        except Exception as e:
-            print(f"   ⚠️  Shared engine initialization failed: {e}")
+            # Retry initialization with newly generated data
+            print("🔄 FALLBACK: Retrying simulation initialization with generated warehouse data...")
+            self._initialize_simulation_components()
+            print("✅ FALLBACK: Warehouse generation completed successfully")
+            print("✅ FALLBACK: Demo can now continue with generated warehouse data")
 
-        # Wire KPI recorder to engine for collision KPIs (authoritative mode only)
-        try:
-            if hasattr(self.simulation_data_service, "_kpi_recorder") and self.simulation_data_service._kpi_recorder is not None:
-                self.shared_engine.set_kpi_recorder(
-                    self.simulation_data_service._kpi_recorder,
-                    run_id_provider=lambda: getattr(self.simulation_data_service, "_current_simulation_run_id", None)
-                )
-        except Exception as e:
-            logging.error(f"EXCEPTION: Failed to inject KPI recorder into shared engine: {e}", exc_info=True)
+        # Verify warehouse data integrity after initialization
+        self._verify_warehouse_data()
 
-        # Create robot controller components
-        self.jobs_queue = JobsQueueImpl()
-        self.bidding_system = TransparentBiddingSystem(config_provider=self.config_provider)
-
-        # Initialize order processing pipeline
-        try:
-            self.order_source = JsonOrderSource("sample_orders.json")
-            self.order_source.connect()
-            print("   ✅ Order source initialized and connected to sample_orders.json")
-
-            self.jobs_processor = JobsProcessorImpl(
-                order_source=self.order_source,
-                simulation_data_service=self.simulation_data_service,
-                jobs_queue=self.jobs_queue,
-                config_provider=self.config_provider
-            )
-            print("   ✅ Jobs processor initialized with order processing pipeline")
-        except Exception as e:
-            print(f"   ❌ Failed to initialize order processing pipeline: {e}")
-            logging.error(f"EXCEPTION: Order processing pipeline initialization failed: {e}", exc_info=True)
-            raise
-
-        # Create robots AFTER engine initialization
-        self._create_robot_agents()
-
-        # Create robot controller
-        self.robot_controller = RobotController(
-            jobs_queue=self.jobs_queue,
-            bidding_system=self.bidding_system,
-            robot_pool=[robot.robot for robot in self.robots],
-            polling_interval=0.5  # Poll every 500ms for multi-robot coordination
-        )
-        print(f"   ✅ Robot controller initialized with {len(self.robots)} robots")
-        
-        # Visualization
-        self.visualization: Optional[IVisualization] = None
-        self.visualization_thread: Optional[VisualizationThread] = None
-        
-        # Task management (now handled by order processor)
-        self.tasks_created = 0
-        
         print("🎯 Simulation ready!")
+
+    def _initialize_simulation_components(self) -> None:
+        """
+        Initialize all simulation components assuming warehouse data exists.
+
+        This method should only be called after warehouse data has been verified
+        to exist in the database. It will fail if warehouse data is missing.
+        """
+        try:
+            # Initialize with a minimal temporary map to gain DB access
+            temp_map = WarehouseMap()  # default dimensions, not used for generation
+            self.simulation_data_service = SimulationDataServiceImpl(temp_map, pool_size=max(10, 3 * self.robot_count))
+            print("   ✅ Simulation data service initialized")
+
+            # Retrieve warehouse metadata from DB
+            source_csv, expected_hash = self._get_warehouse_metadata_from_db()
+            if not source_csv:
+                print("   ⚠️  No warehouse metadata found in database")
+                raise WarehouseDataMissingError("Warehouse metadata missing")
+
+            if not os.path.exists(source_csv):
+                print(f"   ⚠️  Warehouse CSV not found on disk: {source_csv}")
+                print("   🔄 FALLBACK: The demo will trigger regeneration")
+                raise WarehouseDataMissingError(f"Source CSV missing: {source_csv}")
+
+            # Validate hash when available
+            if expected_hash:
+                current_hash = _calculate_file_hash(source_csv)
+                if current_hash and current_hash != expected_hash:
+                    print("   ⚠️  Warehouse CSV hash mismatch detected")
+                    print(f"      Expected: {expected_hash[:8]}... | Current: {current_hash[:8]}...")
+                    print("   🔄 FALLBACK: The demo will trigger regeneration")
+                    raise WarehouseDataMissingError("Warehouse CSV has changed since data generation")
+
+            # Load verified warehouse
+            self.warehouse_map = WarehouseMap(csv_file=source_csv)
+            print(f"   ✅ Warehouse loaded: {self.warehouse_map.width}x{self.warehouse_map.height} from {source_csv}")
+
+            # Ensure the simulation data service uses the verified warehouse map
+            # and invalidate any cached MapData built from the temporary map
+            try:
+                self.simulation_data_service.warehouse_map = self.warehouse_map
+                if hasattr(self.simulation_data_service, "_cache_lock"):
+                    with self.simulation_data_service._cache_lock:
+                        self.simulation_data_service._map_data_cache = None
+                        self.simulation_data_service._cache_timestamp = 0
+            except Exception as e:
+                print(f"   ⚠️  Warning: Failed to synchronize data service map: {e}")
+
+            # Create real configuration provider
+            self.config_provider = ConfigurationProvider()
+            print("   ✅ Configuration provider initialized")
+
+            # Set robot placement mode based on CLI argument
+            random_placement = self.placement_mode == "random"
+            self.config_provider.set_value("demo.random_robot_placement", random_placement)
+
+            if random_placement:
+                print("   ✅ Random robot placement enabled")
+            else:
+                print("   ✅ Manual robot placement enabled (fixed positions)")
+
+            # Shared MuJoCo engine for all robots (uses verified map)
+            self.shared_engine = SharedMuJoCoEngine(self.warehouse_map, physics_dt=0.001, enable_time_gating=True,
+                                                   config_provider=self.config_provider)
+
+            # Test if warehouse data exists by checking conflict boxes
+            print("🔍 Testing warehouse data availability...")
+            conflict_boxes = self.simulation_data_service.get_conflict_boxes()
+            if not conflict_boxes:
+                print("   ⚠️  No conflict boxes found - warehouse data may be missing")
+                raise WarehouseDataMissingError("No warehouse data found in database - navigation graph missing")
+
+            print(f"   ✅ Warehouse data verified: {len(conflict_boxes)} conflict boxes found")
+
+            # Clear any orphaned conflict box locks from previous simulation runs
+            try:
+                cleared_count = self.simulation_data_service.clear_all_conflict_box_locks()
+                if cleared_count > 0:
+                    print(f"   🧹 Cleared {cleared_count} orphaned conflict box locks from previous runs")
+                else:
+                    print("   ✅ No orphaned conflict box locks found")
+            except Exception as e:
+                print(f"   ⚠️  Warning: Could not clear conflict box locks: {e}")
+
+            # Register all robots with shared engine BEFORE initialization
+            self._register_robots_with_engine()
+
+            # Initialize shared engine (creates appearance service)
+            try:
+                self.shared_engine.initialize()
+                print("   ✅ Shared engine initialized with appearance service")
+            except Exception as e:
+                print(f"   ⚠️  Shared engine initialization failed: {e}")
+
+            # Wire KPI recorder to engine for collision KPIs (authoritative mode only)
+            try:
+                if hasattr(self.simulation_data_service, "_kpi_recorder") and self.simulation_data_service._kpi_recorder is not None:
+                    self.shared_engine.set_kpi_recorder(
+                        self.simulation_data_service._kpi_recorder,
+                        run_id_provider=lambda: getattr(self.simulation_data_service, "_current_simulation_run_id", None)
+                    )
+            except Exception as e:
+                logging.error(f"EXCEPTION: Failed to inject KPI recorder into shared engine: {e}", exc_info=True)
+
+            # Create robot controller components
+            self.jobs_queue = JobsQueueImpl()
+            self.bidding_system = TransparentBiddingSystem(config_provider=self.config_provider)
+
+            # Initialize order processing pipeline
+            try:
+                self.order_source = JsonOrderSource(self.orders_file)
+                self.order_source.connect()
+                print(f"   ✅ Order source initialized and connected to {self.orders_file}")
+
+                self.jobs_processor = JobsProcessorImpl(
+                    order_source=self.order_source,
+                    simulation_data_service=self.simulation_data_service,
+                    jobs_queue=self.jobs_queue,
+                    config_provider=self.config_provider
+                )
+                print("   ✅ Jobs processor initialized with order processing pipeline")
+            except Exception as e:
+                print(f"   ❌ Failed to initialize order processing pipeline: {e}")
+                logging.error(f"EXCEPTION: Order processing pipeline initialization failed: {e}", exc_info=True)
+                raise
+
+            # Create robots AFTER engine initialization
+            self._create_robot_agents()
+
+            # Create robot controller
+            self.robot_controller = RobotController(
+                jobs_queue=self.jobs_queue,
+                bidding_system=self.bidding_system,
+                robot_pool=[robot.robot for robot in self.robots],
+                polling_interval=0.5  # Poll every 500ms for multi-robot coordination
+            )
+            print(f"   ✅ Robot controller initialized with {len(self.robots)} robots")
+
+            # Visualization
+            self.visualization: Optional[IVisualization] = None
+            self.visualization_thread: Optional[VisualizationThread] = None
+
+            # Task management (now handled by order processor)
+            self.tasks_created = 0
+
+        except WarehouseDataMissingError:
+            # Re-raise our custom exception for the caller to handle
+            raise
+        except Exception as e:
+            # Check if this might be related to missing warehouse data
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ['conflict', 'navigation', 'database', 'table', 'schema', 'connection']):
+                print(f"   ❌ Simulation initialization failed - possibly due to missing warehouse data: {e}")
+                raise WarehouseDataMissingError(f"Simulation initialization failed: {e}") from e
+            else:
+                # Re-raise other exceptions as-is
+                raise
+
+    def _get_warehouse_metadata_from_db(self) -> Tuple[str, str]:
+        """
+        Retrieve warehouse metadata (source CSV and its hash) from database.
+
+        Returns:
+            (source_csv_file, source_csv_hash) or ("", "") when unavailable
+        """
+        try:
+            with self.simulation_data_service._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT source_csv_file, source_csv_hash
+                        FROM warehouse_map
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        return "", ""
+                    source_csv = row.get('source_csv_file') if isinstance(row, dict) else row[0]
+                    csv_hash = row.get('source_csv_hash') if isinstance(row, dict) else row[1]
+                    return source_csv or "", csv_hash or ""
+        except Exception as e:
+            print(f"   ⚠️  Could not retrieve warehouse metadata: {e}")
+            print("   🔄 FALLBACK: Proceeding without metadata - may trigger regeneration")
+            return "", ""
+
+    def _generate_warehouse_data_fallback(self) -> None:
+        """
+        Generate warehouse data as a fallback when no data exists.
+
+        This method calls the load_new_warehouse.py script to generate warehouse data
+        and handles all error cases gracefully.
+        """
+        import subprocess
+        import sys
+
+        try:
+            result = subprocess.run([
+                sys.executable, "load_new_warehouse.py",
+                "--warehouse", "extended_warehouse.csv"
+            ], check=True, capture_output=True, text=True)
+
+            # Log success if there's output
+            if result.stdout:
+                for line in result.stdout.strip().split('\n'):
+                    if line.strip():
+                        print(f"   📋 {line}")
+
+        except subprocess.CalledProcessError as e:
+            print(f"❌ FALLBACK: Warehouse generation failed: {e}")
+            if e.stderr:
+                print(f"❌ FALLBACK: Error details: {e.stderr}")
+            raise RuntimeError("Failed to generate warehouse data. Please run load_new_warehouse.py manually.")
+
 
     def _find_random_walkable_positions(self, count: int) -> List[Tuple[int, int]]:
         """
@@ -227,8 +407,11 @@ class MultiRobotSimulationManager:
 
             # Check if cell is in any conflict box
             for box in conflict_boxes:
-                distance = ((world_x - box.center.x) ** 2 + (world_y - box.center.y) ** 2) ** 0.5
-                if distance <= (box.size / 2.0):  # Add buffer distance
+                # Axis-aligned rectangle containment
+                half_w = box.width * 0.5
+                half_h = box.height * 0.5
+                if (abs(world_x - box.center.x) <= half_w and
+                    abs(world_y - box.center.y) <= half_h):
                     cell_safe = False
                     break
 
@@ -268,11 +451,21 @@ class MultiRobotSimulationManager:
             print("   📍 Using manual robot placement...")
             # Define starting positions for robots (specific coordinates)
             start_positions = [
-                (4.25,3.25),   # Robot 1: Cell (2, 3)
-                (4.25, 3.75),   # Robot 2: Cell (4, 1)
-                (4.25, 2.75),     # Robot 3: Default position
-                (4.25, 1.75),     # Robot 4: Default position
-                (4.25, 2.25),     # Robot 5: Default position
+                (6.25,2.25),   # Robot 1: Cell (2, 3)
+                (2.75, 9.25),   # Robot 2: Cell (4, 1)
+                (1.75, 8.25),     # Robot 3: Default position
+                (5.75, 1.25),     # Robot 4: Default position
+                (2.25, 2.75),     # Robot 5: Default position
+                (1.75, 1.25),     # Robot 6: Default position
+                (1.25, 6.25),     # Robot 7: Default position
+                (4.75, 5.75),     # Robot 8: Default position
+                (5.25, 8.25),     # Robot 9: Default position
+                (5.75, 4.75),     # Robot 10: Default position
+                (3.25, 2.25),     # Robot 11: Default position
+                (3.25, 1.75),     # Robot 12: Default position
+                (3.25, 1.25),     # Robot 13: Default position
+                (3.25, 0.75),     # Robot 14: Default position
+                (3.25, 0.25),     # Robot 15: Default position
             ]
 
             for i in range(self.robot_count):
@@ -342,7 +535,7 @@ class MultiRobotSimulationManager:
                 motion_frequency=base_config.motion_frequency,
                 cell_size=base_config.cell_size,
                 # Demo-specific navigation parameters (softer for demo)
-                lane_tolerance=0.5,  # DEMO ONLY: very soft tolerance
+                lane_tolerance=0.3,  
                 corner_speed=base_config.corner_speed,
                 bay_approach_speed=base_config.bay_approach_speed,
                 # Use provider values for coordination
@@ -412,51 +605,33 @@ class MultiRobotSimulationManager:
 
         print(f"   ✅ Created {len(self.robots)} robot agents")
     
-    def _populate_demo_inventory(self) -> None:
-        """Populate shelves with demo inventory for PICK_AND_DELIVER tasks."""
-        print("   📦 Populating demo inventory...")
-        
+    def _verify_warehouse_data(self) -> None:
+        """Verify that warehouse data exists and is valid."""
+        print("🔍 Verifying warehouse data integrity...")
+
         try:
-            # Create shelves from warehouse map
-            shelves_created = self.simulation_data_service.create_shelves_from_map(clear_existing=True)
-            print(f"      ✅ Created {shelves_created} shelves from warehouse map")
-            
-            # Create demo inventory data using default assignment strategy
-            # Items will be automatically assigned to random available shelves
-            demo_inventory = [
-                {'item_id': 'laptop_001', 'name': 'Gaming Laptop', 'quantity': 5},
-                {'item_id': 'phone_001', 'name': 'Smartphone', 'quantity': 10},
-                {'item_id': 'tablet_001', 'name': 'Tablet', 'quantity': 8},
-                {'item_id': 'headphones_001', 'name': 'Wireless Headphones', 'quantity': 15},
-                {'item_id': 'keyboard_001', 'name': 'Mechanical Keyboard', 'quantity': 12},
-                {'item_id': 'mouse_001', 'name': 'Gaming Mouse', 'quantity': 20},
-                {'item_id': 'monitor_001', 'name': '4K Monitor', 'quantity': 6},
-                {'item_id': 'speaker_001', 'name': 'Bluetooth Speaker', 'quantity': 9},
-                {'item_id': 'camera_001', 'name': 'Action Camera', 'quantity': 7},
-                {'item_id': 'drone_001', 'name': 'Quadcopter Drone', 'quantity': 4},
-                {'item_id': 'gaming_console_001', 'name': 'Gaming Console', 'quantity': 3},
-                {'item_id': 'vr_headset_001', 'name': 'VR Headset', 'quantity': 8},
-                {'item_id': 'book_001', 'name': 'Programming Book', 'quantity': 15},
-                {'item_id': 'audio_001', 'name': 'Audio Equipment', 'quantity': 6},
-            ]
-            
-            # Populate inventory
-            inventory_created = self.simulation_data_service.populate_inventory(demo_inventory)
-            print(f"      ✅ Populated {inventory_created} inventory items")
-            
-            # Get inventory statistics
+            # Check conflict boxes
+            conflict_boxes = self.simulation_data_service.get_conflict_boxes()
+            if conflict_boxes:
+                print(f"   ✅ Navigation graph verified: {len(conflict_boxes)} conflict boxes found")
+            else:
+                print("   ⚠️  No conflict boxes found - this may indicate incomplete warehouse data")
+                print("   ℹ️  The demo will continue, but path planning may be limited")
+
+            # Check inventory statistics
             stats = self.simulation_data_service.get_inventory_statistics()
-            print(f"      📊 Inventory stats: {stats['total_items']} items across {stats['total_shelves']} shelves")
+            print(f"   ✅ Inventory verified: {stats['total_items']} items across {stats['total_shelves']} shelves")
 
             # Export initial inventory status
             if self.simulation_data_service.export_inventory_status_csv("initial_inventory_status.csv"):
-                print("      📊 Initial inventory status exported: initial_inventory_status.csv")
+                print("   📊 Initial inventory status exported: initial_inventory_status.csv")
             else:
-                print("      ⚠️  Failed to export initial inventory status")
+                print("   ⚠️  Failed to export initial inventory status")
 
         except Exception as e:
-            print(f"      ⚠️  Warning: Could not populate inventory: {e}")
-            print("      Continuing with mock inventory...")
+            print(f"   ❌ Warehouse data verification failed: {e}")
+            print("   🔄 This may be due to missing warehouse data - demo will attempt to continue")
+            # Don't raise exception - let demo continue even with incomplete data
     
     
     def start_simulation(self) -> None:
@@ -680,6 +855,16 @@ class MultiRobotSimulationManager:
         except Exception as e:
             print(f"   ⚠️  KPI summary unavailable: {e}")
 
+        # Clear any remaining reserved quantities (pending) before exporting final inventory
+        try:
+            cleared_rows = self.simulation_data_service.clear_all_reservations()
+            if cleared_rows > 0:
+                print(f"\n🧼 Cleared reserved quantities on {cleared_rows} inventory rows")
+            else:
+                print("\n🧼 No reserved quantities to clear")
+        except Exception as e:
+            print(f"\n⚠️  Failed to clear reserved quantities: {e}")
+
         # Export final inventory status
         print("\n📊 Exporting Final Inventory Status...")
         if self.simulation_data_service.export_inventory_status_csv("final_inventory_status.csv"):
@@ -872,20 +1057,22 @@ def demo_multi_robot_coordination():
     print("🤖 MULTI-ROBOT WAREHOUSE COORDINATION SIMULATION")
     print("=" * 70)
     
-    # Create multi-robot simulation
-    sim = MultiRobotSimulationManager(robot_count=2)
+    # Create multi-robot simulation with default parameters (auto-manages warehouse data)
+    sim = MultiRobotSimulationManager(robot_count=2, placement_mode="random",
+                                     orders_file="sample_orders.json")
     
     try:
         # Start simulation
         sim.start_simulation()
-        
+
         print("\n⏳ Running multi-robot coordination simulation...")
-        print("   Robots will coordinate through the robot controller")
-        print("   Tasks will be distributed via bidding system")
-        print("   Conflict box coordination ensures safe navigation")
+        print("   🤖 Robots will coordinate through the robot controller")
+        print("   📋 Tasks will be distributed via bidding system")
+        print("   🔄 Conflict box coordination ensures safe navigation")
+        print("   🏭 Using extended warehouse layout with sample orders")
         
-        # Start order processing (orders will be processed from sample_orders.json)
-        print("\n📋 Starting order processing from sample_orders.json...")
+        # Start order processing (orders will be processed from configured orders file)
+        print(f"\n📋 Starting order processing from {sim.orders_file}...")
         sim.create_demo_tasks(0)  # This now starts the order processor, parameter ignored
         
         # Monitor coordination for a reasonable duration
@@ -913,36 +1100,51 @@ def main():
     from robot.impl.motion_executor_impl import MotionExecutorImpl
     # Return to standard logging to reduce overhead
     MotionExecutorImpl.set_verbose_logging(False)
-    
+
     print("🤖 Multi-Robot Warehouse Coordination Simulation Demo")
     print("=" * 60)
     print("Professional multi-robot autonomous warehouse simulation")
-    print("Demonstrating coordinated operation:")
+    print("Demonstrating coordinated operation with configurable:")
     print("   🤖 Multiple robots working simultaneously")
     print("   🎮 Robot controller managing task distribution")
     print("   🔄 Conflict box coordination for safe navigation")
     print("   📊 Real-time monitoring and status reporting")
+    print("   🏭 Configurable warehouse layouts")
+    print("   📋 Configurable order processing")
     print()
     
-    # Optional CLI arguments (e.g., --robots 5)
+    # Optional CLI arguments (e.g., --robots 5 --placement random --orders sample_orders.json)
     try:
         parser = argparse.ArgumentParser(add_help=False)
-        parser.add_argument("--robots", type=int, default=3)
+        parser.add_argument("--robots", type=int, default=3,
+                          help="Number of robots to simulate (default: 3)")
+        parser.add_argument("--placement", choices=["random", "manual"], default="random",
+                          help="Robot placement mode: 'random' for random placement, 'manual' for fixed positions (default: random)")
+        parser.add_argument("--orders", type=str, default="sample_orders.json",
+                          help="JSON orders file to process (default: sample_orders.json)")
         args, _ = parser.parse_known_args()
         robot_count = args.robots
+        placement_mode = args.placement
+        orders_file = args.orders
     except Exception:
         robot_count = 3
+        placement_mode = "random"
+        orders_file = "sample_orders.json"
 
     try:
-        # Run the demo with requested robot count
+        # Run the demo with requested robot count and placement mode
         # Wrapper to use the same flow while allowing variable robot count
         print(f"Requested robot count: {robot_count}")
-        sim = MultiRobotSimulationManager(robot_count=robot_count)
+        print(f"Robot placement mode: {placement_mode}")
+        print(f"Orders file: {orders_file}")
+        print("Data persistence: enabled (warehouse data auto-managed)")
+        sim = MultiRobotSimulationManager(robot_count=robot_count, placement_mode=placement_mode,
+                                         orders_file=orders_file)
         try:
             sim.start_simulation()
             # Order processing is now handled automatically by the order processor
-            # Orders will be loaded from sample_orders.json and processed into tasks
-            print(f"\n📋 Order processing will load orders from sample_orders.json automatically")
+            # Orders will be loaded from the specified orders file and processed into tasks
+            print(f"\n📋 Order processing will load orders from {orders_file} automatically")
             # Extended monitoring for order processing and task execution
             sim.monitor_robot_coordination(180.0)  # Extended time for full order processing
         finally:

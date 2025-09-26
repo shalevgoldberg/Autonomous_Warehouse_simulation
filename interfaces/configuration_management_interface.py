@@ -52,10 +52,14 @@ class ConfigurationSection:
     is_required: bool = False
 
 
-class IConfigurationProvider(ABC):
+class IConfigurationManager(ABC):
     """
-    Interface for configuration providers.
-    
+    Interface for configuration managers.
+
+    This interface provides technical infrastructure for configuration management,
+    focusing on generic key-value access, validation, and metadata handling.
+    Used by framework components like dependency injection containers.
+
     This follows the Single Responsibility Principle by focusing solely on
     configuration management and the Interface Segregation Principle by
     providing focused configuration operations.
@@ -262,6 +266,10 @@ class ConfigurationValidationError(ConfigurationError):
 class ConfigurationSourceError(ConfigurationError):
     """Raised when there's an error with a configuration source."""
     pass
+
+
+
+
 
 
 

@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS conflict_boxes (
     box_id VARCHAR(36) PRIMARY KEY,
     center_x DECIMAL(10,3) NOT NULL,
     center_y DECIMAL(10,3) NOT NULL,
-    size DECIMAL(5,3) NOT NULL CHECK (size > 0),
+    width DECIMAL(6,3) NOT NULL CHECK (width > 0),
+    height DECIMAL(6,3) NOT NULL CHECK (height > 0),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -30,11 +31,9 @@ CREATE TABLE IF NOT EXISTS conflict_boxes (
 CREATE TABLE IF NOT EXISTS conflict_box_locks (
     box_id VARCHAR(36) PRIMARY KEY REFERENCES conflict_boxes(box_id),
     locked_by_robot VARCHAR(36) NOT NULL REFERENCES robots(robot_id),
-    lock_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    heartbeat_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    lock_timeout_seconds INTEGER DEFAULT 30, -- 30 seconds default timeout
-    robot_inside BOOLEAN DEFAULT FALSE, -- True if robot is physically inside the box
-    lock_priority INTEGER DEFAULT 0 -- For deadlock resolution
+    priority INTEGER DEFAULT 0,
+    locked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    heartbeat_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- 3. Navigation Graph Nodes Table - Store graph nodes for path planning
@@ -141,13 +140,14 @@ SELECT
     cb.box_id,
     cb.center_x,
     cb.center_y,
-    cb.size,
+    cb.width,
+    cb.height,
     COUNT(ngn.node_id) as associated_nodes,
     cb.created_at,
     cb.updated_at
 FROM conflict_boxes cb
 LEFT JOIN navigation_graph_nodes ngn ON cb.box_id = ngn.conflict_box_id
-GROUP BY cb.box_id, cb.center_x, cb.center_y, cb.size, cb.created_at, cb.updated_at;
+GROUP BY cb.box_id, cb.center_x, cb.center_y, cb.width, cb.height, cb.created_at, cb.updated_at;
 
 -- View for navigation graph connectivity
 CREATE OR REPLACE VIEW navigation_graph_connectivity AS
@@ -232,8 +232,8 @@ RETURNS INTEGER AS $$
 DECLARE
     deleted_count INTEGER;
 BEGIN
-    DELETE FROM conflict_box_locks 
-    WHERE CURRENT_TIMESTAMP > (heartbeat_timestamp + INTERVAL '1 second' * lock_timeout_seconds);
+    DELETE FROM conflict_box_locks
+    WHERE heartbeat_at < CURRENT_TIMESTAMP - INTERVAL '30 seconds';
     GET DIAGNOSTICS deleted_count = ROW_COUNT;
     RETURN deleted_count;
 END;
@@ -309,7 +309,7 @@ DECLARE
     lock_acquired BOOLEAN := FALSE;
 BEGIN
     -- Try to insert a new lock
-    INSERT INTO conflict_box_locks (box_id, locked_by_robot, lock_priority)
+    INSERT INTO conflict_box_locks (box_id, locked_by_robot, priority)
     VALUES (p_box_id, p_robot_id, p_priority)
     ON CONFLICT (box_id) DO NOTHING;
     
@@ -349,9 +349,9 @@ DECLARE
     heartbeat_updated BOOLEAN := FALSE;
 BEGIN
     UPDATE conflict_box_locks
-    SET heartbeat_timestamp = CURRENT_TIMESTAMP
+    SET heartbeat_at = CURRENT_TIMESTAMP
     WHERE box_id = p_box_id AND locked_by_robot = p_robot_id;
-    
+
     GET DIAGNOSTICS heartbeat_updated = FOUND;
     RETURN heartbeat_updated;
 END;

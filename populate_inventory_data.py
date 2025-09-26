@@ -1,34 +1,35 @@
 """
-Inventory Data Population Script
+Inventory Operations CLI (JSON-only)
 
-This script populates the warehouse database with:
-1. Shelves created from the warehouse map
-2. Sample items with realistic names and descriptions
-3. Inventory assignments (one item per shelf as per current requirements)
+Operations:
+  - add-sample: add curated sample inventory (random shelf assignment always)
+  - add: add inventory from a JSON file (supports explicit shelf_id or strategy-based assignment)
+  - delete-all: delete ALL inventory rows (shelf_inventory only)
+  - delete-items: delete inventory for specific item_ids (optional purge of orphaned items)
+  - export: export inventory status CSV to a file
+  - move: move quantity of an item from one shelf to another
 
-Usage:
-    $env:WAREHOUSE_DB_PASSWORD="renaspolter"; python populate_inventory_data.py
-
-Future Enhancements:
-- Multiple items per shelf support
-- Multiple shelves per item support
-- Dynamic inventory allocation strategies
-- Inventory forecasting and replenishment
+Rules:
+  - Never mutate shelves. If DB has no shelves, print error and exit.
+  - No mocks. Use real DB via SimulationDataServiceImpl.
+  - JSON input only (no CSV).
+  - Sample inventory is always assigned randomly to shelves.
+  - Log clearly on any fallback or validation failure.
 
 Architecture Note:
-- All inventory operations go through SimulationDataService (unified database interface)
-- This follows the Facade Pattern and Single Responsibility Principle
-- Components interact with inventory through SimulationDataService, not directly
+  - All DB access flows through SimulationDataServiceImpl
+  - This script is a thin CLI; it validates inputs and delegates to the service
 """
 import os
 import sys
 import logging
+import argparse
+import json
 from typing import List, Dict, Any
 
 # Add the project root to the Python path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from warehouse.map import WarehouseMap
 from simulation.simulation_data_service_impl import SimulationDataServiceImpl, SimulationDataServiceError
 
 
@@ -126,132 +127,173 @@ def create_sample_items() -> List[Dict[str, Any]]:
     ]
 
 
-def create_inventory_assignments(shelf_ids: List[str], items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Create inventory assignments (one item per shelf).
-    
-    Args:
-        shelf_ids: List of available shelf IDs
-        items: List of item data dictionaries
-        
-    Returns:
-        List[Dict[str, Any]]: List of inventory assignment dictionaries
-    """
-    inventory_assignments = []
-    
-    # Assign items to shelves (one item per shelf)
-    for i, item in enumerate(items):
-        if i < len(shelf_ids):
-            # Assign realistic quantities based on item type
-            if item['category'] == 'books':
-                quantity = 25  # Books can be stacked
-            elif item['category'] == 'electronics':
-                quantity = 8   # Electronics are more limited
-            elif item['category'] == 'clothing':
-                quantity = 15  # Clothing items
-            else:
-                quantity = 10  # Default quantity
-            
-            inventory_assignments.append({
-                'shelf_id': shelf_ids[i],
-                'item_id': item['item_id'],
-                'name': item['name'],
-                'quantity': quantity
-            })
-    
-    return inventory_assignments
+def _load_json_file(path: str) -> List[Dict[str, Any]]:
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError("Input JSON must be a list of inventory records")
+        return data
 
 
 def main():
-    """Main function to populate inventory data."""
     setup_logging()
     logger = logging.getLogger(__name__)
-    
+
+    parser = argparse.ArgumentParser(description="Inventory Operations CLI (JSON-only)")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # add-sample
+    p_add_sample = sub.add_parser("add-sample", help="Add curated sample inventory (random assignment)")
+    p_add_sample.add_argument("--strategy", default="random",
+                              choices=["random", "load_balanced", "category_based", "proximity_based"],
+                              help="Assignment strategy for items without shelf_id (default: random)")
+
+    # add
+    p_add = sub.add_parser("add", help="Add inventory from a JSON file")
+    p_add.add_argument("--file", required=True, help="Path to JSON file with inventory records")
+    p_add.add_argument("--strategy", default="random",
+                       choices=["random", "load_balanced", "category_based", "proximity_based"],
+                       help="Assignment strategy for items without shelf_id (default: random)")
+
+    # delete-all
+    sub.add_parser("delete-all", help="Delete ALL inventory from shelf_inventory")
+
+    # delete-items
+    p_del_items = sub.add_parser("delete-items", help="Delete inventory for specific item IDs")
+    p_del_items.add_argument("--item-ids", required=True,
+                             help="Comma-separated list of item IDs to delete")
+    p_del_items.add_argument("--purge-items", action="store_true",
+                             help="Also delete items with no remaining inventory")
+
+    # export
+    p_export = sub.add_parser("export", help="Export inventory status CSV")
+    p_export.add_argument("--file", default="inventory_status.csv",
+                          help="Output CSV filename (default: inventory_status.csv)")
+
+    # move
+    p_move = sub.add_parser("move", help="Move quantity of an item between shelves")
+    p_move.add_argument("--item-id", required=True)
+    p_move.add_argument("--from-shelf", required=True)
+    p_move.add_argument("--to-shelf", required=True)
+    p_move.add_argument("--quantity", type=int, required=True)
+
+    args = parser.parse_args()
+
+    # Check DB configuration
+    if not os.getenv('DATABASE_URL') and not os.getenv('WAREHOUSE_DB_PASSWORD'):
+        logger.error("Database configuration not found")
+        logger.info("Set WAREHOUSE_DB_PASSWORD or DATABASE_URL before running the CLI")
+        return 1
+
+    # Set CLI mode to disable KPI recorder for faster shutdown
+    os.environ['CLI_MODE'] = '1'
+
+    # Initialize service with a minimal map (never write shelves here)
+    # Note: SimulationDataServiceImpl requires a WarehouseMap instance, but we do NOT mutate shelves.
+    from warehouse.map import WarehouseMap  # deferred import to keep CLI light
+    # Use minimal safe dimensions to satisfy WarehouseMap internals; never used to write shelves
+    warehouse_map = WarehouseMap(width=3, height=3)  # placeholder; not used for shelf creation
+    svc = SimulationDataServiceImpl(warehouse_map=warehouse_map)
+
+    # Some commands require shelves to exist (add-sample, add, move). Others don't (export, delete-*).
+    def _require_shelves() -> bool:
+        try:
+            with svc._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) AS cnt FROM shelves")
+                    shelf_count = cur.fetchone()['cnt']
+                    if shelf_count == 0:
+                        logger.error("No shelves found in DB. This CLI only manages inventory on pre-existing shelves.")
+                        return False
+                    return True
+        except Exception as e:
+            logger.error(f"Failed to validate shelves in DB: {e}")
+            return False
+
     try:
-        logger.info("Starting inventory data population...")
-        
-        # Check database password
-        if not os.getenv('WAREHOUSE_DB_PASSWORD'):
-            logger.error("WAREHOUSE_DB_PASSWORD environment variable not set")
-            logger.info("Please set it with: $env:WAREHOUSE_DB_PASSWORD=\"renaspolter\"")
-            return 1
-        
-        # Create warehouse map
-        logger.info("Creating warehouse map...")
-        warehouse_map = WarehouseMap(width=20, height=15)
-        logger.info(f"Warehouse map created with {len(warehouse_map.shelves)} shelves")
-        
-        # Create simulation data service (unified database interface)
-        logger.info("Initializing simulation data service...")
-        simulation_data_service = SimulationDataServiceImpl(
-            warehouse_map=warehouse_map,
-            db_host="localhost",
-            db_port=5432,
-            db_name="warehouse_sim",
-            db_user="postgres",
-            db_password=os.getenv('WAREHOUSE_DB_PASSWORD')
-        )
-        
-        # Create shelves from map
-        logger.info("Creating shelves from warehouse map...")
-        shelves_created = simulation_data_service.create_shelves_from_map(clear_existing=True)
-        logger.info(f"Created {shelves_created} shelves")
-        
-        # Get shelf IDs for assignment
-        shelf_ids = list(warehouse_map.shelves.keys())
-        logger.info(f"Available shelf IDs: {shelf_ids[:5]}... (showing first 5)")
-        
-        # Create sample items
-        logger.info("Creating sample items...")
-        items = create_sample_items()
-        logger.info(f"Created {len(items)} sample items")
-        
-        # Create inventory assignments
-        logger.info("Creating inventory assignments...")
-        inventory_assignments = create_inventory_assignments(shelf_ids, items)
-        logger.info(f"Created {len(inventory_assignments)} inventory assignments")
-        
-        # Populate inventory
-        logger.info("Populating inventory in database...")
-        inventory_created = simulation_data_service.populate_inventory(inventory_assignments)
-        logger.info(f"Populated {inventory_created} inventory entries")
-        
-        # Get inventory statistics
-        logger.info("Getting inventory statistics...")
-        stats = simulation_data_service.get_inventory_statistics()
-        logger.info("Inventory Statistics:")
-        logger.info(f"  Total shelves: {stats['total_shelves']}")
-        logger.info(f"  Total items: {stats['total_items']}")
-        logger.info(f"  Total quantity: {stats['total_quantity']}")
-        logger.info(f"  Low stock items: {len(stats['low_stock_items'])}")
-        
-        # Show some sample assignments
-        logger.info("Sample inventory assignments:")
-        for i, assignment in enumerate(inventory_assignments[:5]):
-            logger.info(f"  {assignment['shelf_id']}: {assignment['quantity']}x {assignment['item_id']}")
-        
-        if len(inventory_assignments) > 5:
-            logger.info(f"  ... and {len(inventory_assignments) - 5} more assignments")
-        
-        # Test item location lookup
-        logger.info("Testing item location lookup...")
-        test_items = ['item_A', 'book-fantasy', 'electronics-phone']
-        for item_id in test_items:
-            shelf_id = simulation_data_service.get_item_location(item_id)
-            if shelf_id:
-                logger.info(f"  {item_id} -> {shelf_id}")
+        if args.command == "add-sample":
+            if not _require_shelves():
+                return 1
+            items = create_sample_items()
+            # Assign realistic default quantities when not provided by sample
+            payload: List[Dict[str, Any]] = []
+            for it in items:
+                qty = 25 if it.get('category') == 'books' else (8 if it.get('category') == 'electronics' else (15 if it.get('category') == 'clothing' else 10))
+                payload.append({
+                    'item_id': it['item_id'],
+                    'name': it['name'],
+                    'quantity': qty,
+                    # No shelf_id → always strategy-based; default random per requirement
+                    'category': it.get('category')
+                })
+            created = svc.populate_inventory(payload, assignment_strategy=args.strategy)
+            logger.info(f"Added sample inventory entries: {created}")
+
+        elif args.command == "add":
+            if not _require_shelves():
+                return 1
+            if not os.path.exists(args.file):
+                logger.error(f"Input JSON file not found: {args.file}")
+                logger.info("Provide a JSON file with a list of records: [{ 'item_id': '...', 'name': '...', 'quantity': N, 'shelf_id': 'optional' }]")
+                return 1
+            data = _load_json_file(args.file)
+            # Validate and coerce
+            valid: List[Dict[str, Any]] = []
+            for rec in data:
+                if not isinstance(rec, dict):
+                    logger.warning(f"Skipping non-object record: {rec}")
+                    continue
+                missing = [k for k in ("item_id", "name", "quantity") if k not in rec]
+                if missing:
+                    logger.warning(f"Skipping record missing required fields {missing}: {rec}")
+                    continue
+                if not isinstance(rec['quantity'], int) or rec['quantity'] <= 0:
+                    logger.warning(f"Skipping record with non-positive quantity: {rec}")
+                    continue
+                valid.append(rec)
+            if not valid:
+                logger.warning("No valid inventory records found; aborting add")
+                return 1
+            created = svc.populate_inventory(valid, assignment_strategy=args.strategy)
+            logger.info(f"Added inventory entries: {created}")
+
+        elif args.command == "delete-all":
+            deleted = svc.clear_all_inventory()
+            logger.info(f"Deleted all inventory rows: {deleted}")
+
+        elif args.command == "delete-items":
+            ids = [s for s in (args.item_ids or "").split(',') if s]
+            if not ids:
+                logger.warning("No item IDs provided to delete-items")
+                return 1
+            deleted = svc.delete_inventory_for_items(ids, purge_items=args.purge_items)
+            logger.info(f"Deleted inventory rows for items {ids}: {deleted}")
+
+        elif args.command == "export":
+            ok = svc.export_inventory_status_csv(args.file)
+            if ok:
+                logger.info(f"Exported inventory CSV: {args.file}")
             else:
-                logger.warning(f"  {item_id} not found in inventory")
-        
-        logger.info("Inventory data population completed successfully!")
-        logger.info("")
-        logger.info("Next steps:")
-        logger.info("1. Run the complete task flow test")
-        logger.info("2. Verify orders can be processed")
-        logger.info("3. Check robot task execution")
-        
+                logger.warning(f"Export failed for file: {args.file}")
+
+        elif args.command == "move":
+            if not _require_shelves():
+                return 1
+            if args.quantity <= 0:
+                logger.warning("Quantity must be > 0 for move")
+                return 1
+            moved = svc.move_inventory(args.item_id, args.from_shelf, args.to_shelf, args.quantity)
+            if moved:
+                logger.info(f"Moved {args.quantity} of {args.item_id} from {args.from_shelf} to {args.to_shelf}")
+            else:
+                logger.warning(f"Move failed for {args.item_id} from {args.from_shelf} to {args.to_shelf}")
+
+        else:
+            logger.error(f"Unknown command: {args.command}")
+            return 1
+
         return 0
-        
+
     except SimulationDataServiceError as e:
         logger.error(f"Simulation data service error: {e}")
         return 1
@@ -259,8 +301,10 @@ def main():
         logger.error(f"Unexpected error: {e}")
         return 1
     finally:
-        if 'simulation_data_service' in locals():
-            simulation_data_service.close()
+        try:
+            svc.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

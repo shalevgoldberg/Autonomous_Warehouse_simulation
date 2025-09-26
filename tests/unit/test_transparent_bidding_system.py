@@ -71,7 +71,7 @@ class TestTransparentBiddingSystem:
     
     def setup_method(self):
         """Set up test fixtures."""
-        self.bidding_system = TransparentBiddingSystem()
+        self.bidding_system = TransparentBiddingSystem(config_provider=None)
         self.robot1 = MockRobotAgent("robot_1", position=(0.0, 0.0), battery=80.0)
         self.robot2 = MockRobotAgent("robot_2", position=(5.0, 5.0), battery=60.0)
         self.task1 = Task.create_pick_and_deliver_task("task_1", "order_1", "shelf_1", "item_1")

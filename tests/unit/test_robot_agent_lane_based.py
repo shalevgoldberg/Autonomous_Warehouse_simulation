@@ -18,12 +18,12 @@ from interfaces.lane_follower_interface import ILaneFollower, LaneFollowingStatu
 from interfaces.motion_executor_interface import IMotionExecutor, MotionStatus
 from interfaces.coordinate_system_interface import ICoordinateSystem
 from interfaces.simulation_data_service_interface import ISimulationDataService
-from interfaces.configuration_interface import IConfigurationProvider, RobotConfig
+from interfaces.configuration_interface import IBusinessConfigurationProvider, RobotConfig
 from warehouse.map import WarehouseMap
 from simulation.mujoco_env import SimpleMuJoCoPhysics
 
 
-class MockConfigurationProvider(IConfigurationProvider):
+class MockConfigurationProvider(IBusinessConfigurationProvider):
     """Mock configuration provider for testing."""
     
     def __init__(self):
@@ -46,7 +46,6 @@ class MockConfigurationProvider(IConfigurationProvider):
             wheel_radius=0.05,
             picking_duration=5.0,
             dropping_duration=3.0,
-            charging_threshold=0.2,
             emergency_stop_distance=0.5,
             stall_recovery_timeout=10.0
         )
@@ -143,6 +142,7 @@ class TestRobotAgentLaneBased(unittest.TestCase):
         self.simulation_data_service.cleanup_expired_blocks.return_value = 0
         self.simulation_data_service.get_conflict_box_lock_owner.return_value = None
         self.simulation_data_service.cleanup_expired_conflict_box_locks.return_value = 0
+        self.simulation_data_service.clear_all_conflict_box_locks.return_value = 0
         self.simulation_data_service.is_shelf_locked.return_value = False
         self.simulation_data_service.get_shelf_lock_owner.return_value = None
         self.simulation_data_service.get_shelf_info.return_value = None

@@ -20,7 +20,7 @@ import sys
 import os
 import time
 import threading
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import argparse
 from unittest.mock import MagicMock
 import logging
@@ -98,7 +98,11 @@ class MultiRobotSimulationManager:
         self.config_provider = ConfigurationProvider()
         print("   ✅ Configuration provider initialized")
 
-        # Shared MuJoCo engine for all robots
+        # Override random placement to use manual placement
+        self.config_provider.set_value("demo.random_robot_placement", True)
+        print("   ✅ Random robot placement disabled (manual placement enabled)")
+
+        # Shared MuJoCo engine for all robots   
         self.shared_engine = SharedMuJoCoEngine(self.warehouse_map, physics_dt=0.001, enable_time_gating=True,
                                                config_provider=self.config_provider)
         
@@ -131,7 +135,7 @@ class MultiRobotSimulationManager:
 
         # Create robot controller components
         self.jobs_queue = JobsQueueImpl()
-        self.bidding_system = TransparentBiddingSystem()
+        self.bidding_system = TransparentBiddingSystem(config_provider=self.config_provider)
 
         # Create robots AFTER engine initialization
         self._create_robot_agents()
@@ -157,26 +161,106 @@ class MultiRobotSimulationManager:
         print(f"   ✅ Found {len(self.available_shelves)} shelves for tasks")
         print("🎯 Simulation ready!")
 
+    def _find_random_walkable_positions(self, count: int) -> List[Tuple[int, int]]:
+        """
+        Find random walkable positions that avoid conflict boxes.
+
+        Args:
+            count: Number of positions to find
+
+        Returns:
+            List of (grid_x, grid_y) tuples for walkable positions
+        """
+        import random
+        from interfaces.navigation_types import Point
+
+        # Get all walkable cells (grid coordinates)
+        walkable_cells = []
+        for grid_y in range(self.warehouse_map.height):
+            for grid_x in range(self.warehouse_map.width):
+                # Check if cell is walkable (free space, charging, idle, or drop-off)
+                if self.warehouse_map.grid[grid_y, grid_x] in [0, 3, 4, 5]:
+                    # Convert to world coordinates for conflict box checking
+                    world_pos = self.warehouse_map.grid_to_world(grid_x, grid_y)
+                    walkable_cells.append((grid_x, grid_y, world_pos[0], world_pos[1]))
+
+        # Get conflict boxes from database
+        conflict_boxes = []
+        try:
+            conflict_boxes = self.simulation_data_service.get_conflict_boxes()
+        except Exception as e:
+            print(f"   ⚠️  Could not load conflict boxes, proceeding without conflict box avoidance: {e}")
+
+        # Filter out cells that are in conflict boxes
+        filtered_cells = []
+
+        for grid_x, grid_y, world_x, world_y in walkable_cells:
+            cell_safe = True
+
+            # Check if cell is in any conflict box
+            for box in conflict_boxes:
+                half_w = box.width * 0.5
+                half_h = box.height * 0.5
+                if (abs(world_x - box.center.x) <= half_w and
+                    abs(world_y - box.center.y) <= half_h):
+                    cell_safe = False
+                    break
+
+            if cell_safe:
+                filtered_cells.append((grid_x, grid_y))
+
+        # Randomly select positions
+        if len(filtered_cells) < count:
+            print(f"   ⚠️  Only {len(filtered_cells)} safe walkable cells available, using all of them")
+            return filtered_cells
+
+        return random.sample(filtered_cells, count)
+
     def _register_robots_with_engine(self) -> None:
         """Register all robots with shared engine before initialization."""
         print("   🤖 Registering robots with shared engine...")
 
-        # Define starting positions for robots (avoid conflicts)
-        start_positions = [
-            (1, 1),   # Robot 1: Left lane (row 1, col 1 = 'l')
-            (1, 2),   # Robot 2: Left lane (row 2, col 1 = 'l')
-            (1, 3),   # Robot 3: Left lane (row 3, col 1 = 'l')
-            (1, 4),   # Robot 4: Left lane (row 4, col 1 = 'l')
-            (1, 5),   # Robot 5: Left lane (row 5, col 1 = 'l')
-        ]
+        # Check if random placement is enabled
+        random_placement_config = self.config_provider.get_value("demo.random_robot_placement", True)
+        random_placement = random_placement_config.value if hasattr(random_placement_config, 'value') else random_placement_config
 
-        for i in range(self.robot_count):
-            robot_id = f"warehouse_robot_{i+1}"
-            start_x, start_y = start_positions[i]
+        if random_placement:
+            print("   🎲 Using random robot placement...")
+            # Find random walkable positions
+            random_positions = self._find_random_walkable_positions(self.robot_count)
 
-            # Register robot with shared engine
-            world_pos = self.warehouse_map.grid_to_world(start_x, start_y)
-            self.shared_engine.register_robot(robot_id, (world_pos[0], world_pos[1], 0.0))
+            for i in range(self.robot_count):
+                robot_id = f"warehouse_robot_{i+1}"
+                if i < len(random_positions):
+                    grid_x, grid_y = random_positions[i]
+                    world_pos = self.warehouse_map.grid_to_world(grid_x, grid_y)
+                    print(f"      🎯 {robot_id} -> Grid ({grid_x}, {grid_y}) -> World ({world_pos[0]:.2f}, {world_pos[1]:.2f})")
+                    self.shared_engine.register_robot(robot_id, (world_pos[0], world_pos[1], 0.0))
+                else:
+                    print(f"      ⚠️  No safe position found for {robot_id}, skipping")
+        else:
+            print("   📍 Using manual robot placement...")
+            # Define starting positions for robots (specific coordinates)
+            start_positions = [
+                (3.75,2.75),   # Robot 1: Cell (2, 3)
+                (3.25, 1.25),   # Robot 2: Cell (4, 1)
+                (3.25, 3.25),     # Robot 3: Default position
+                (2.25, 1.25),     # Robot 4: Default position
+                (2.75, 0.75),     # Robot 5: Default position
+            ]
+
+            for i in range(self.robot_count):
+                robot_id = f"warehouse_robot_{i+1}"
+                if i < len(start_positions):
+                    start_x, start_y = start_positions[i]
+                    print(f"      📍 {robot_id} -> World ({start_x:.2f}, {start_y:.2f})")
+                else:
+                    # Fallback for additional robots
+                    start_x, start_y = 1.0, float(i)
+                    print(f"      📍 {robot_id} -> Fallback ({start_x:.2f}, {start_y:.2f})")
+
+                # Register robot with shared engine
+                self.shared_engine.register_robot(robot_id, (start_x, start_y, 0.0))
 
         print(f"   ✅ Registered {self.robot_count} robots with shared engine")
 
@@ -184,51 +268,78 @@ class MultiRobotSimulationManager:
         """Create multiple robot agents with different starting positions."""
         print("   🤖 Creating robot agents...")
 
-        # Define starting positions for robots (avoid conflicts)
-        start_positions = [
-            (1, 1),   # Robot 1: Left lane (row 1, col 1 = 'l')
-            (1, 2),   # Robot 2: Left lane (row 2, col 1 = 'l')
-            (1, 3),   # Robot 3: Left lane (row 3, col 1 = 'l')
-            (1, 4),   # Robot 4: Left lane (row 4, col 1 = 'l')
-            (1, 5),   # Robot 5: Left lane (row 5, col 1 = 'l')
-        ]
+        # Get positions from shared engine (already registered)
+        random_placement_config = self.config_provider.get_value("demo.random_robot_placement", True)
+        random_placement = random_placement_config.value if hasattr(random_placement_config, 'value') else random_placement_config
 
         for i in range(self.robot_count):
             robot_id = f"warehouse_robot_{i+1}"
-            start_x, start_y = start_positions[i]
 
-            # Create robot configuration
+            # Get starting position from shared engine
+            try:
+                start_pose = self.shared_engine.get_pose(robot_id)
+                start_x, start_y = start_pose[0], start_pose[1]
+                grid_pos = self.warehouse_map.world_to_grid(start_x, start_y)
+                start_grid_x, start_grid_y = int(grid_pos[0]), int(grid_pos[1])
+            except Exception as e:
+                print(f"      ⚠️  Could not get position for {robot_id}: {e}")
+                # Fallback to manual positions if registration fails
+                fallback_positions = [
+                    (2.75, 1.25),   # Robot 1: Cell (5, 2)
+                    (2.25, 0.75),   # Robot 2: Cell (4, 1)
+                    (1.0, 1.0),     # Robot 3: Default position
+                    (1.0, 2.0),     # Robot 4: Default position
+                    (1.0, 3.0),     # Robot 5: Default position
+                ]
+                if i < len(fallback_positions):
+                    start_x, start_y = fallback_positions[i]
+                else:
+                    start_x, start_y = 1.0, float(i)
+
+            # Get base configuration from provider and customize for multi-robot demo
+            base_config = self.config_provider.get_robot_config(robot_id)
+
+            # Create robot configuration with demo-specific overrides
+            # Match single-robot motion parameters for stability
             robot_config = RobotConfig(
                 robot_id=robot_id,
-                max_speed=2.0,
-                control_frequency=10.0,
-                motion_frequency=100.0,
-                cell_size=1.0,
-                lane_tolerance=0.2,
-                corner_speed=1.0,
-                bay_approach_speed=0.5,
-                conflict_box_lock_timeout=5.0,
-                conflict_box_heartbeat_interval=1.0,
-                max_linear_velocity=2.0,
-                max_angular_velocity=2.0,
-                movement_speed=2.0,
-                wheel_base=0.5,
-                wheel_radius=0.1,
-                picking_duration=2.0,
-                dropping_duration=2.0,
-                position_tolerance=0.1,
-                charging_threshold=0.2,
-                emergency_stop_distance=0.5,
-                stall_recovery_timeout=10.0
+                # Use provider values for physical dimensions and ratios
+                robot_width=base_config.robot_width,
+                robot_height=base_config.robot_height,
+                robot_length=base_config.robot_length,
+                wheel_base_ratio=base_config.wheel_base_ratio,
+                wheel_radius_ratio=base_config.wheel_radius_ratio,
+                # Demo-specific motion parameters (reduced for stability)
+                max_speed=0.5,  # Match single-robot stability settings
+                position_tolerance=base_config.position_tolerance,
+                control_frequency=base_config.control_frequency,
+                motion_frequency=base_config.motion_frequency,
+                cell_size=base_config.cell_size,
+                # Demo-specific navigation parameters (softer for demo)
+                lane_tolerance=0.5,  # DEMO ONLY: very soft tolerance
+                corner_speed=base_config.corner_speed,
+                bay_approach_speed=base_config.bay_approach_speed,
+                # Use provider values for coordination
+                conflict_box_lock_timeout=base_config.conflict_box_lock_timeout,
+                conflict_box_heartbeat_interval=base_config.conflict_box_heartbeat_interval,
+                # Demo-specific motion parameters (reduced for stability)
+                max_linear_velocity=0.5,  # Match single-robot stability settings
+                max_angular_velocity=0.5,  # Match single-robot stability settings
+                movement_speed=0.5,  # Match single-robot stability settings
+                # Use provider values for timing
+                picking_duration=base_config.picking_duration,
+                dropping_duration=base_config.dropping_duration,
+                emergency_stop_distance=base_config.emergency_stop_distance,
+                stall_recovery_timeout=base_config.stall_recovery_timeout,
+                # Use provider LiDAR config
+                lidar_config=base_config.lidar_config
             )
 
             # Create robot physics (shared engine already initialized)
             robot_physics = SharedMuJoCoPhysics(self.shared_engine, robot_id=robot_id)
-            # Diagnostics: tag physics with robot_id and enable for robot_2 only
+            # Tag physics with robot_id for proper identification
             try:
                 robot_physics.robot_id = robot_id
-                if robot_id == "warehouse_robot_2":
-                    robot_physics._diagnostics_enabled = False
             except Exception:
                 pass
             
@@ -255,7 +366,7 @@ class MultiRobotSimulationManager:
             # Configure lane follower for DEMO (very soft tolerance)
             robot.lane_follower.set_config(
                 LaneFollowingConfig(
-                    lane_tolerance=3.0,  # DEMO ONLY: too soft for production!
+                    lane_tolerance=robot_config.lane_tolerance,  # Uses the 3.0m demo tolerance set above
                     max_speed=robot_config.max_speed,
                     corner_speed=robot_config.corner_speed,
                     bay_approach_speed=robot_config.bay_approach_speed,
@@ -346,11 +457,15 @@ class MultiRobotSimulationManager:
         
         # Position robots are already pre-registered in shared engine; ensure reset
         for robot_instance in self.robots:
-            start_x, start_y = robot_instance.start_position
-            world_pos = self.warehouse_map.grid_to_world(start_x, start_y)
             try:
-                robot_instance.robot.physics.reset_robot_position(world_pos[0], world_pos[1], 0.0)
-                print(f"   ✅ Positioned {robot_instance.robot_id} at ({start_x}, {start_y})")
+                # Get current position from shared engine
+                current_pose = self.shared_engine.get_pose(robot_instance.robot_id)
+                start_x, start_y = current_pose[0], current_pose[1]
+
+                robot_instance.robot.physics.reset_robot_position(start_x, start_y, 0.0)
+                grid_pos = self.warehouse_map.world_to_grid(start_x, start_y)
+                grid_x, grid_y = int(grid_pos[0]), int(grid_pos[1])
+                print(f"   ✅ Positioned {robot_instance.robot_id} at grid ({grid_x}, {grid_y}) -> world ({start_x:.2f}, {start_y:.2f})")
 
                 # Force StateHolder update after positioning
                 try:
@@ -365,7 +480,8 @@ class MultiRobotSimulationManager:
         try:
             # Multi-robot viewer: render all robots in one window
             state_holders = {r.robot_id: r.robot.state_holder for r in self.robots}
-            self.visualization = MultiRobotMujocoVisualization(state_holders, self.warehouse_map)
+            robot_configs = {r.robot_id: r.config for r in self.robots}
+            self.visualization = MultiRobotMujocoVisualization(state_holders, self.warehouse_map, robot_configs)
             self.visualization.initialize()
             self.visualization_thread = VisualizationThread(self.visualization, fps=30.0)
             self.visualization_thread.start()
@@ -403,6 +519,45 @@ class MultiRobotSimulationManager:
     def stop_simulation(self) -> None:
         """Stop multi-robot simulation."""
         print("\n🛑 Stopping Multi-Robot Warehouse Simulation")
+
+        # Best-effort: clean up charging/idle bay locks for all robots before stopping threads
+        try:
+            for robot_instance in self.robots:
+                try:
+                    handler = getattr(robot_instance.robot, 'task_handler', None)
+                    if handler is None:
+                        continue
+                    locked_id = getattr(handler, '_locked_bay_id', None)
+                    if not locked_id:
+                        continue
+                    if isinstance(locked_id, str) and locked_id.startswith('charge_'):
+                        manager = getattr(handler, 'charging_station_manager', None)
+                        if manager is not None:
+                            try:
+                                manager.release_charging_station(locked_id, robot_instance.robot_id)
+                            except Exception:
+                                try:
+                                    handler.simulation_data_service.release_bay_lock(locked_id, robot_instance.robot_id)
+                                except Exception:
+                                    pass
+                        else:
+                            try:
+                                handler.simulation_data_service.release_bay_lock(locked_id, robot_instance.robot_id)
+                            except Exception:
+                                pass
+                    else:
+                        try:
+                            handler.simulation_data_service.release_bay_lock(locked_id, robot_instance.robot_id)
+                        except Exception:
+                            pass
+                    try:
+                        handler._locked_bay_id = None
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
         
         # Stop robot controller
         try:
@@ -428,6 +583,18 @@ class MultiRobotSimulationManager:
                 self.visualization_thread = None
             if self.visualization is not None:
                 self.visualization.shutdown()
+        except Exception:
+            pass
+
+        # Shutdown charging station managers to clear any internal assignments and caches
+        try:
+            for robot_instance in self.robots:
+                try:
+                    manager = getattr(robot_instance.robot, 'charging_station_manager', None)
+                    if manager is not None and hasattr(manager, 'shutdown'):
+                        manager.shutdown()
+                except Exception:
+                    pass
         except Exception:
             pass
         
@@ -583,9 +750,29 @@ class MultiRobotSimulationManager:
                                 operational_status = 'unknown'
                                 progress = 0.0
                             
+                            # Get battery level from robot data
+                            battery_level = robot_data.get('battery_level', 0.0)
+
+                            # Get conflict box status
+                            acquired_boxes = robot_data.get('acquired_conflict_boxes', [])
+                            pending_box = robot_data.get('pending_conflict_box')
+
+                            # Format conflict box info
+                            if acquired_boxes:
+                                conflict_info = f"Locks: {acquired_boxes}"
+                            else:
+                                conflict_info = "Locks: None"
+
+                            if pending_box:
+                                conflict_info += f" | Pending: {pending_box}"
+                            else:
+                                conflict_info += " | Pending: None"
+
                             print(f"   🤖 {robot_id}: {operational_status} | "
                                   f"Progress: {progress:.1%} | "
-                                  f"Position: ({position[0]:.2f}, {position[1]:.2f})")
+                                  f"Position: ({position[0]:.2f}, {position[1]:.2f}) | "
+                                  f"Battery: {battery_level:.1%} | "
+                                  f"{conflict_info}")
                         except Exception as e:
                             print(f"   🤖 {robot_id}: Error getting status - {e}")
                     else:

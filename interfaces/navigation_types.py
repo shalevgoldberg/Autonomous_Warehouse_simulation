@@ -54,15 +54,16 @@ class LaneRec:
 
 @dataclass
 class BoxRec:
-    """Conflict box record as defined in boxes.csv."""
+    """Conflict box record (axis-aligned rectangle)."""
     box_id: str
     center: Point
-    size: float  # Box size in meters
+    width: float
+    height: float
     
     def __post_init__(self):
         """Validate box data."""
-        if self.size <= 0:
-            raise ValueError(f"Box {self.box_id} size must be positive")
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError(f"Box {self.box_id} dimensions must be positive")
 
 
 @dataclass

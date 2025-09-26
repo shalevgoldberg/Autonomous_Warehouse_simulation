@@ -13,7 +13,7 @@ Design Principles:
 """
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, List, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 
@@ -40,6 +40,27 @@ class ConfigurationValue:
 
 
 @dataclass
+class LiDARConfig:
+    """LiDAR sensor configuration for collision avoidance."""
+    # Enable/disable LiDAR collision avoidance
+    enabled: bool = True
+
+    # Sensor specifications
+    num_rays: int = 110          # One ray per degree in 110° arc
+    max_range: float = 3.0       # Maximum detection range in meters
+    min_range: float = 0.2       # Minimum detection range in meters
+    scan_frequency: float = 10.0 # Scan frequency in Hz
+    field_of_view: float = 110.0 # Field of view in degrees
+
+    # Collision avoidance parameters
+    safety_distance: float = 0.8 # Safety distance for collision avoidance in meters
+
+    # Performance tuning (for future optimization)
+    enable_scan_caching: bool = True  # Cache scan results between frames
+    scan_cache_ttl: float = 0.1      # Cache TTL in seconds (10Hz)
+
+
+@dataclass
 class RobotConfig:
     """Robot-specific configuration parameters."""
     # Basic robot parameters
@@ -48,32 +69,121 @@ class RobotConfig:
     position_tolerance: float  # meters
     control_frequency: float  # Hz
     motion_frequency: float  # Hz
-    
+
+    # Physical robot dimensions (meters)
+    robot_width: float  # meters (diameter for circular robots)
+    robot_height: float  # meters
+    robot_length: float  # meters (only used for rectangular robots)
+
     # Coordinate system parameters
     cell_size: float  # meters per grid cell for coordinate system
-    
+
     # Lane-based navigation parameters
     lane_tolerance: float  # meters from center-line
     corner_speed: float  # m/s in conflict boxes and turns
     bay_approach_speed: float  # m/s when approaching bays
     conflict_box_lock_timeout: float  # seconds
     conflict_box_heartbeat_interval: float  # seconds
-    
+
     # Motion control parameters
     max_linear_velocity: float  # m/s
     max_angular_velocity: float  # rad/s
     movement_speed: float  # m/s
-    wheel_base: float  # meters between wheels
-    wheel_radius: float  # meters
-    
+
+    # Wheel parameters (proportional to robot size)
+    wheel_base_ratio: float  # wheel_base = robot_width * wheel_base_ratio
+    wheel_radius_ratio: float  # wheel_radius = robot_height * wheel_radius_ratio
+
+    # Derived wheel parameters (calculated from ratios and robot dimensions)
+    @property
+    def wheel_base(self) -> float:
+        """Wheel base calculated from robot width and ratio."""
+        return self.robot_width * self.wheel_base_ratio
+
+    @property
+    def wheel_radius(self) -> float:
+        """Wheel radius calculated from robot height and ratio."""
+        return self.robot_height * self.wheel_radius_ratio
+
     # Task execution parameters
     picking_duration: float  # seconds
     dropping_duration: float  # seconds
-    charging_threshold: float  # battery level (0.0 to 1.0)
-    
+
     # Safety parameters
     emergency_stop_distance: float  # meters
     stall_recovery_timeout: float  # seconds
+
+    # LiDAR collision avoidance parameters
+    lidar_config: LiDARConfig = field(default_factory=LiDARConfig)  # LiDAR sensor configuration
+
+    # Startup behavior
+    start_in_idle: bool = True
+
+
+@dataclass
+class BatteryConfig:
+    """Battery management configuration parameters."""
+    # Enable/disable enhanced battery management
+    enabled: bool
+
+    # Battery specifications
+    capacity_wh: float  # Battery capacity in watt-hours
+
+    # Consumption rates (watts)
+    idle_consumption_rate: float  # Watts when idle
+    moving_consumption_rate: float  # Base watts when moving
+    carrying_consumption_rate: float  # Watts when carrying load
+    stalled_consumption_rate: float  # Watts when stalled
+    charging_rate: float  # Watts when charging (negative = charging)
+
+    # Multipliers for dynamic consumption
+    speed_consumption_multiplier: float  # Additional watts per m/s speed
+    load_consumption_multiplier: float  # Additional watts when carrying
+
+    # Safety and thresholds
+    task_safety_margin: float  # Safety margin for task battery checks (0.0 to 1.0)
+    low_battery_threshold: float  # Threshold for triggering charging (0.0 to 1.0)
+    critical_battery_threshold: float  # Threshold for emergency actions (0.0 to 1.0)
+    emergency_stop_threshold: float  # Threshold for emergency stop (0.0 to 1.0)
+
+    # Efficiency parameters
+    charging_efficiency: float  # Charging efficiency (0.0 to 1.0)
+    self_discharge_rate: float  # Self-discharge rate per hour (0.0 to 1.0)
+
+
+@dataclass
+class ChargingStationConfig:
+    """Charging station management configuration parameters."""
+    # Enable/disable charging station management
+    enabled: bool
+
+    # Station discovery and allocation
+    auto_discover_stations: bool  # Auto-discover stations from warehouse map
+    station_lock_timeout: int  # Lock timeout in seconds
+    station_heartbeat_interval: int  # Heartbeat interval in seconds
+
+    # Station capabilities (all stations are similar)
+    station_power_watts: float  # Station power output (watts)
+    station_efficiency: float  # Charging efficiency (0.0 to 1.0)
+
+    # Allocation preferences (simple: nearest available)
+    max_search_distance: float  # Maximum distance to search for stations
+    station_selection_timeout: float  # Timeout for station selection (seconds)
+
+    # Maintenance and monitoring (kept for future enhancement)
+    enable_maintenance_mode: bool  # Enable maintenance mode support
+    maintenance_check_interval: int  # Interval to check for maintenance needs
+    station_health_timeout: int  # Timeout for station health checks
+
+    # Performance and scaling (kept for future enhancement)
+    max_stations_per_robot: int  # Maximum stations a robot can reserve
+    station_cache_ttl: int  # Cache TTL for station information
+    concurrent_allocation_limit: int  # Maximum concurrent allocation attempts
+
+    # Future enhancement hooks (reserved for advanced features)
+    enable_smart_allocation: bool  # Reserved for future smart allocation algorithms
+    enable_station_priorities: bool  # Reserved for future station priority system
+    enable_load_balancing: bool  # Reserved for future load balancing features
 
 
 @dataclass
@@ -133,6 +243,15 @@ class TaskConfig:
     max_bid_value: float
     distance_cost_factor: float
     battery_cost_factor: float
+
+    # Automatic charging parameters
+    auto_charging_enabled: bool  # Enable automatic charging when battery low
+    charging_trigger_threshold: float  # Battery level threshold for triggering charging (0.0-1.0)
+    battery_check_interval: float  # How often to check battery level (seconds)
+    safe_interrupt_tasks: List[str]  # Task types that can be safely interrupted for charging
+    prevent_duplicate_charging: bool  # Prevent creation of duplicate charging tasks
+    # Availability during charging
+    charging_availability_threshold: float  # Battery level above which robot can bid while charging (0.0-1.0)
 
 
 @dataclass
@@ -196,14 +315,17 @@ class ConfigurationError(Exception):
     pass
 
 
-class IConfigurationProvider(ABC):
+class IBusinessConfigurationProvider(ABC):
     """
-    Interface for configuration providers.
-    
+    Interface for business configuration providers.
+
+    This interface provides access to domain-specific configuration objects
+    used by business logic components (robots, tasks, bidding, etc.).
+
     Responsibilities:
+    - Provide domain-specific configuration objects (RobotConfig, BidConfig, etc.)
     - Load configuration from various sources
     - Validate configuration values
-    - Provide type-safe access to configuration
     - Support configuration updates and reloading
     """
     

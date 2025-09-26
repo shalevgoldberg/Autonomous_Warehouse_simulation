@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from interfaces.jobs_queue_interface import IJobsQueue
 from interfaces.bidding_system_interface import IBiddingSystem, BiddingRound, TaskAssignment, RobotBid
 from interfaces.task_handler_interface import Task
-from interfaces.configuration_interface import IConfigurationProvider, BidConfig
+from interfaces.configuration_interface import IBusinessConfigurationProvider, BidConfig
 from robot.robot_agent_lane_based import RobotAgent
 
 
@@ -79,7 +79,7 @@ class RobotController:
     def __init__(self, 
                  jobs_queue: IJobsQueue,
                  robot_pool: List[Any],
-                 config_provider: Optional[IConfigurationProvider] = None,
+                 config_provider: Optional[IBusinessConfigurationProvider] = None,
                  bidding_system: Optional[IBiddingSystem] = None,
                  polling_interval: Optional[float] = None):
         """

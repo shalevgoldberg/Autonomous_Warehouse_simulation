@@ -349,8 +349,8 @@ class DefaultConfigurationSource(IConfigurationSource):
             "charging_station.auto_discover_stations": True,  # Auto-discover from warehouse map
             "charging_station.station_lock_timeout": 600,  # 10 minutes lock timeout
             "charging_station.station_heartbeat_interval": 30,  # 30 seconds heartbeat
-            "charging_station.station_power_watts": 150.0,  # Station power output (watts)
-            "charging_station.station_efficiency": 0.95,  # Charging efficiency (0.95 = 95%)
+            #"charging_station.station_power_watts": 150.0,  # Station power output (watts)
+            #"charging_station.station_efficiency": 0.95,  # Charging efficiency (0.95 = 95%)
             # "charging_station.max_search_distance": 50.0,  # Max search distance (meters) - UNUSED
             # "charging_station.station_selection_timeout": 10.0,  # Selection timeout (seconds) - UNUSED
             # "charging_station.enable_maintenance_mode": True,  # Enable maintenance support - UNUSED
@@ -375,15 +375,18 @@ class DefaultConfigurationSource(IConfigurationSource):
             "idle.wander.retry_interval_seconds": 1.5,
             "idle.wander.min_target_distance_m": 1.0,
 
-            # Database configuration
-            "database.host": "localhost",
-            "database.port": 5432,
-            "database.database": "warehouse_sim",
-            "database.user": "postgres",
-            "database.password": None,
-            "database.pool_size": 10,
-            "database.connect_timeout": 10,
-            "database.application_name": "warehouse_simulation",
+            # Startup behavior
+            "robot.start_in_idle": True,
+
+            # Database configuration (uses environment variables with fallbacks)
+            "database.host": os.getenv("WAREHOUSE_DB_HOST", "localhost"),
+            "database.port": int(os.getenv("WAREHOUSE_DB_PORT", "5432")),
+            "database.database": os.getenv("WAREHOUSE_DB_NAME", "warehouse_sim"),
+            "database.user": os.getenv("WAREHOUSE_DB_USER", "postgres"),
+            "database.password": os.getenv("WAREHOUSE_DB_PASSWORD"),
+            "database.pool_size": int(os.getenv("WAREHOUSE_DB_POOL_SIZE", "10")),
+            "database.connect_timeout": int(os.getenv("WAREHOUSE_DB_CONNECT_TIMEOUT", "10")),
+            "database.application_name": os.getenv("WAREHOUSE_DB_APP_NAME", "warehouse_simulation"),
             
             # Navigation configuration
             "navigation.path_planning_timeout": 30.0,

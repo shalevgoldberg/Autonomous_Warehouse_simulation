@@ -343,6 +343,9 @@ class TaskHandlerImpl(ITaskHandler):
         # Minimum required distance for selecting a new wander target
         self._wander_min_target_distance: float = 2.0
 
+        # Single-slot pending task scheduling (consumed on control thread)
+        self._pending_start_task: Optional[Task] = None
+
     def _get_battery_level_info(self) -> str:
         """
         Get formatted battery level information for logging.
@@ -647,6 +650,23 @@ class TaskHandlerImpl(ITaskHandler):
         Includes automatic charging monitoring and emergency stop checking.
         """
         with WriteLock(self._status_lock):
+            # Consume single-slot scheduled task if idle
+            if self._pending_start_task is not None:
+                if self.is_idle():
+                    try:
+                        print(f"[TaskHandler] Consuming scheduled task {self._pending_start_task.task_id}")
+                    except Exception:
+                        pass
+                    # Use start_task as we're on control thread
+                    if self.start_task(self._pending_start_task):
+                        self._pending_start_task = None
+                    else:
+                        # Keep it for next cycle; log fallback
+                        try:
+                            print(f"[TaskHandler] Scheduled task {self._pending_start_task.task_id} not started (robot busy); will retry")
+                        except Exception:
+                            pass
+
             # Check for battery emergency stop first (highest priority)
             if self._check_emergency_stop():
                 self._trigger_emergency_stop()
@@ -667,11 +687,40 @@ class TaskHandlerImpl(ITaskHandler):
             if self._operational_status == OperationalStatus.EMERGENCY_STOP:
                 return
 
-            # Update lane following execution
+            # Update lane following execution (with low-frequency diagnostics)
+            try:
+                now_diag = time.time()
+                last = getattr(self, "_last_lf_call_diag", 0.0)
+                if now_diag - last > 2.0:
+                    setattr(self, "_last_lf_call_diag", now_diag)
+                    lf_status = self.lane_follower.get_lane_following_status()
+                    lf_val = lf_status.value if hasattr(lf_status, 'value') else lf_status
+                    #print(f"[diag][TaskHandler] robot={self.robot_id} calling update_lane_following | phase={self._task_phase.value if self._task_phase else 'n/a'} status={lf_val}")
+            except Exception:
+                pass
             self.lane_follower.update_lane_following()
 
             # Update task execution based on current phase
             self._update_current_phase()
+
+    def schedule_start_task(self, task: Task) -> None:
+        """
+        Schedule a task to start on the next control-thread cycle when idle.
+        Safe to call from any thread. Only a single pending task is kept.
+        """
+        with WriteLock(self._status_lock):
+            # Replace any existing pending task; log replacement to avoid silent fallback
+            if self._pending_start_task is not None:
+                try:
+                    print(f"[TaskHandler] Replacing pending task {self._pending_start_task.task_id} with {task.task_id}")
+                except Exception:
+                    pass
+            else:
+                try:
+                    print(f"[TaskHandler] Scheduled task {task.task_id} for startup")
+                except Exception:
+                    pass
+            self._pending_start_task = task
     
     def emergency_stop(self) -> None:
         """
@@ -779,6 +828,7 @@ class TaskHandlerImpl(ITaskHandler):
             # Reset motion executor from emergency stop if needed
             motion_status = self.motion_executor.get_motion_status()
             if motion_status == MotionStatus.ERROR:
+                print(f"[TaskHandler] MotionStatus error - Stopping motion executor from emergency stop")
                 self.motion_executor.stop_execution()  # Reset from emergency stop
             
             # Validate task
@@ -1901,7 +1951,7 @@ class TaskHandlerImpl(ITaskHandler):
             except Exception:
                 pass
 
-        print(f"[TaskHandler] Advanced to phase: {new_phase.value} ({self._get_battery_level_info()})")
+        print(f"[{self.robot_id}][TaskHandler] Advanced to phase: {new_phase.value} ({self._get_battery_level_info()})")
     
     def _complete_task(self) -> None:
         """Internal: Complete the current task with cleanup and state reset."""
@@ -2202,6 +2252,15 @@ class TaskHandlerImpl(ITaskHandler):
                 completed_segments = getattr(lane_result, 'current_segment_index', 0)
                 return min(0.95, (completed_segments + segment_progress) / total_segments)
             else:
+                try:
+                    # Diagnostics: log when we fall back to 0.1 (no progress) during navigation
+                    lane_status = self.lane_follower.get_lane_following_status()
+                    lr_status = getattr(lane_result, 'status', None)
+                    lr_prog = getattr(lane_result, 'progress_in_segment', None) if lane_result else None
+                    lr_idx = getattr(lane_result, 'current_segment_index', None) if lane_result else None
+                    #print(f"[diag][TaskHandler] nav phase progress fallback 0.1 | phase={self._task_phase.value} | lane_status={getattr(lane_status, 'value', lane_status)} | lr.status={getattr(lr_status, 'value', lr_status)} | seg_idx={lr_idx} | seg_prog={lr_prog}")
+                except Exception:
+                    pass
                 return 0.1  # Just started or error
         
         return 0.0
@@ -2450,12 +2509,12 @@ class TaskHandlerImpl(ITaskHandler):
                 else:
                     # Last resort: use a safe default position
                     print(f"[TaskHandler] No idle zones available, using default position")
-                    return (10.0, 10.0)
+                    return (1.0, 1.0)
                     
         except Exception as e:
             self.logger.error(f"Failed to get idle zone position: {e}")
             # Return a safe fallback position
-            return (10.0, 10.0)
+            return (1.0, 1.0)
 
     def _request_and_wait_for_idle_bay(self) -> Tuple[float, float]:
         """Request nearest available idle bay with periodic retry; returns bay position.

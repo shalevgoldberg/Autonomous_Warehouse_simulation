@@ -15,9 +15,11 @@ import math
 
 import mujoco
 from mujoco import viewer
+import numpy as np
 
 from interfaces.visualization_interface import IVisualization, VisualizationError
 from interfaces.state_holder_interface import IStateHolder
+from interfaces.configuration_interface import RobotConfig
 from warehouse.map import WarehouseMap
 
 
@@ -30,11 +32,23 @@ class MultiRobotMujocoVisualization(IVisualization):
     - Uses mujoco.viewer passive viewer, single window
     """
 
-    def __init__(self, state_holders: Dict[str, IStateHolder], warehouse_map: WarehouseMap):
+    def __init__(self, state_holders: Dict[str, IStateHolder], warehouse_map: WarehouseMap,
+                 robot_configs: Optional[Dict[str, RobotConfig]] = None):
         if not state_holders:
             raise VisualizationError("state_holders must be a non-empty dict of robot_id -> IStateHolder")
         self._state_holders: Dict[str, IStateHolder] = state_holders
         self.warehouse_map = warehouse_map
+
+        # Use provided robot configs or create defaults
+        if robot_configs is None:
+            from config.configuration_provider import ConfigurationProvider
+            provider = ConfigurationProvider()
+            robot_configs = {}
+            for robot_id in state_holders.keys():
+                robot_configs[robot_id] = provider.get_robot_config(robot_id)
+
+        self._robot_configs: Dict[str, RobotConfig] = robot_configs
+
         self._active = False
         self._model: Optional[mujoco.MjModel] = None
         self._data: Optional[mujoco.MjData] = None
@@ -135,17 +149,22 @@ class MultiRobotMujocoVisualization(IVisualization):
                 try:
                     x, y, theta = holder.get_position()
                     self._write_robot_qpos(robot_id, x, y, theta)
-                    # Appearance: bright GREEN when carrying, otherwise base color (no change)
+                    # Appearance: use colors from Appearance Service
                     try:
                         carrying = self._is_carrying_state(holder)
                         last = self._last_carrying_state.get(robot_id)
                         if last is None or last != carrying:
                             gid = self._robot_geom_ids.get(robot_id)
                             if gid is not None:
-                                carry_rgba = (0.0, 1.0, 0.0, 1.0)
-                                if carrying:
-                                    self._model.geom_rgba[gid] = carry_rgba
-                                # else: leave original per-robot color
+                                # Get colors from Appearance Service
+                                appearance_service = self._get_appearance_service(holder)
+                                if appearance_service is not None and appearance_service.is_enabled():
+                                    if carrying:
+                                        color = appearance_service.get_carrying_color()
+                                    else:
+                                        color = appearance_service.get_normal_color()
+                                    # Convert tuple to numpy array for MuJoCo
+                                    self._model.geom_rgba[gid] = np.array(color)
                             self._last_carrying_state[robot_id] = carrying
                             # Avoid duplicate color-change logs; engine/TaskHandler already log
                     except Exception:
@@ -233,6 +252,18 @@ class MultiRobotMujocoVisualization(IVisualization):
 
         return False
 
+    def _get_appearance_service(self, state_holder: IStateHolder):
+        """Get appearance service from state holder."""
+        try:
+            pe = getattr(state_holder, "physics_engine", None)
+            if pe is not None:
+                engine = getattr(pe, "_engine", None)
+                if engine is not None and hasattr(engine, 'get_appearance_service'):
+                    return engine.get_appearance_service()
+        except Exception:
+            pass
+        return None
+
     def _build_world_xml(self) -> str:
         """Build MuJoCo XML with floor, warehouse cells, and freejoint robot bodies."""
         world_width = self.warehouse_map.width * self.warehouse_map.grid_size
@@ -278,7 +309,7 @@ class MultiRobotMujocoVisualization(IVisualization):
                 elif cell_type == 4:  # Idle zone
                     xml_parts.append(self._geom_xml(f"idle_{x}_{y}", world_x, world_y, 0.25, 0.25, 0.05, "0.5 0.8 1.0 1"))
                 elif cell_type == 5:  # Drop-off station
-                    xml_parts.append(self._geom_xml(f"dropoff_{x}_{y}", world_x, world_y, 0.25, 0.25, 0.1, "1.0 0.4 0.4 1"))
+                    xml_parts.append(self._geom_xml(f"dropoff_{x}_{y}", world_x, world_y, 0.25, 0.25, 0.05, "1.0 0.4 0.4 1"))
         return "\n    ".join(xml_parts)
 
     def _generate_robots_xml(self) -> str:
@@ -297,6 +328,20 @@ class MultiRobotMujocoVisualization(IVisualization):
             body_name = f"robot_{robot_id}"
             joint_name = f"joint_{robot_id}"
             site_name = f"robot_site_{robot_id}"
+
+            # Get robot configuration for this robot
+            robot_config = self._robot_configs.get(robot_id)
+            if robot_config is None:
+                # Fallback to default configuration
+                from config.configuration_provider import ConfigurationProvider
+                provider = ConfigurationProvider()
+                robot_config = provider.get_robot_config(robot_id)
+
+            # Calculate robot dimensions from configuration
+            robot_radius = robot_config.robot_width / 2.0
+            robot_half_height = robot_config.robot_height / 2.0
+            direction_offset = robot_radius + 0.02
+
             # Use each robot's current pose as initial body position
             try:
                 x, y, _ = self._state_holders[robot_id].get_position()
@@ -307,9 +352,9 @@ class MultiRobotMujocoVisualization(IVisualization):
                 f"""
     <body name='{body_name}' pos='{x} {y} {z}'>
       <freejoint name='{joint_name}'/>
-      <geom name='robot_body_{robot_id}' type='cylinder' size='0.1 0.05' rgba='{color}'/>
+      <geom name='robot_body_{robot_id}' type='cylinder' size='{robot_radius} {robot_half_height}' rgba='{color}'/>
       <site name='{site_name}' pos='0 0 0' size='0.01'/>
-      <geom name='robot_direction_{robot_id}' type='cylinder' size='0.01 0.15' pos='0.15 0 0.05' rgba='1.0 1.0 0.0 1'/>
+      <geom name='robot_direction_{robot_id}' type='cylinder' size='0.01 0.15' pos='{direction_offset} 0 {robot_half_height + 0.01}' rgba='1.0 1.0 0.0 1'/>
     </body>
                 """.strip()
             )

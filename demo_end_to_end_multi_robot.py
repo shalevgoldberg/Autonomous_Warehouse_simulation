@@ -287,7 +287,6 @@ print(f"Created order {order_id} for {quantity}x {item_id}")
                 picking_duration=2.0,
                 dropping_duration=2.0,
                 position_tolerance=0.1,
-                charging_threshold=0.2,
                 emergency_stop_distance=0.5,
                 stall_recovery_timeout=10.0
             )
@@ -337,7 +336,7 @@ print(f"Created order {order_id} for {quantity}x {item_id}")
             print(f"      ✅ Created {robot_id} at position ({start_x}, {start_y})")
 
         # Create bidding system and robot controller
-        self.bidding_system = TransparentBiddingSystem()
+        self.bidding_system = TransparentBiddingSystem(config_provider=self.config_provider)
 
         # Adapter to match controller expectations
         class RobotAdapter:
@@ -532,9 +531,29 @@ print(f"Created order {order_id} for {quantity}x {item_id}")
                     operational_status = 'idle'
                     progress = 0.0
 
+                # Get battery level from robot status
+                battery_level = robot_status.get('battery_level', 0.0)
+
+                # Get conflict box status
+                acquired_boxes = robot_status.get('acquired_conflict_boxes', [])
+                pending_box = robot_status.get('pending_conflict_box')
+
+                # Format conflict box info
+                if acquired_boxes:
+                    conflict_info = f"Locks: {acquired_boxes}"
+                else:
+                    conflict_info = "Locks: None"
+
+                if pending_box:
+                    conflict_info += f" | Pending: {pending_box}"
+                else:
+                    conflict_info += " | Pending: None"
+
                 print(f"   🤖 {robot_instance.robot_id}: {operational_status} | "
                       f"Progress: {progress:.1%} | "
-                      f"Position: ({position[0]:.1f}, {position[1]:.1f})")
+                      f"Position: ({position[0]:.1f}, {position[1]:.1f}) | "
+                      f"Battery: {battery_level:.1%} | "
+                      f"{conflict_info}")
             except Exception as e:
                 print(f"   🤖 {robot_instance.robot_id}: Error - {e}")
 
@@ -554,11 +573,74 @@ print(f"Created order {order_id} for {quantity}x {item_id}")
             processing_rate = self.metrics.orders_processed / self.metrics.orders_created * 100
             print(f"   📈 Order Processing Rate: {processing_rate:.1f}%")
 
+        # KPI Overview (Phase 5)
+        try:
+            cfg = self.config_provider
+            export_enabled = cfg.get_value("kpi.export_csv_enabled", True).value
+            export_path = cfg.get_value("kpi.export_csv_path", "kpi_results.csv").value
+        except Exception:
+            export_enabled = True
+            export_path = "kpi_results.csv"
+
+        try:
+            overview = self.simulation_data_service.get_kpi_overview()
+            print("   📊 KPI Overview:")
+            print(f"      - Tasks Completed: {overview.get('tasks_completed', 0)}")
+            print(f"      - Task Success Rate: {overview.get('task_success_rate', 0.0):.1f}%")
+            print(f"      - Avg Task Time: {overview.get('avg_task_time_seconds', 0.0):.2f}s")
+            if export_enabled:
+                if self.simulation_data_service.export_kpi_overview_csv(overview, export_path):
+                    print(f"   💾 KPI CSV exported: {export_path}")
+                else:
+                    print("   ⚠️  KPI CSV export failed (see logs)")
+        except Exception as e:
+            print(f"   ⚠️  KPI overview unavailable: {e}")
+
         print("   ✅ Complete End-to-End Workflow Demonstrated!")
 
     def stop_demo(self) -> None:
         """Stop the complete demo."""
         print("\n🛑 Stopping End-to-End Demo")
+
+        # Best-effort: clean up charging/idle bay locks for all robots before stopping threads
+        try:
+            for robot_instance in self.robots:
+                try:
+                    handler = getattr(robot_instance.robot, 'task_handler', None)
+                    if handler is None:
+                        continue
+                    locked_id = getattr(handler, '_locked_bay_id', None)
+                    if not locked_id:
+                        continue
+                    # Route releases based on lock type to keep caches consistent
+                    if isinstance(locked_id, str) and locked_id.startswith('charge_'):
+                        manager = getattr(handler, 'charging_station_manager', None)
+                        if manager is not None:
+                            try:
+                                manager.release_charging_station(locked_id, robot_instance.robot_id)
+                            except Exception:
+                                try:
+                                    handler.simulation_data_service.release_bay_lock(locked_id, robot_instance.robot_id)
+                                except Exception:
+                                    pass
+                        else:
+                            try:
+                                handler.simulation_data_service.release_bay_lock(locked_id, robot_instance.robot_id)
+                            except Exception:
+                                pass
+                    else:
+                        try:
+                            handler.simulation_data_service.release_bay_lock(locked_id, robot_instance.robot_id)
+                        except Exception:
+                            pass
+                    try:
+                        handler._locked_bay_id = None
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         # Stop robot controller
         try:
@@ -575,6 +657,18 @@ print(f"Created order {order_id} for {quantity}x {item_id}")
                 print(f"   ✅ Stopped {robot_instance.robot_id}")
             except Exception as e:
                 print(f"   ⚠️  Error stopping {robot_instance.robot_id}: {e}")
+
+        # Shutdown charging station managers to clear any internal assignments and caches
+        try:
+            for robot_instance in self.robots:
+                try:
+                    manager = getattr(robot_instance.robot, 'charging_station_manager', None)
+                    if manager is not None and hasattr(manager, 'shutdown'):
+                        manager.shutdown()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         # Stop visualization
         try:

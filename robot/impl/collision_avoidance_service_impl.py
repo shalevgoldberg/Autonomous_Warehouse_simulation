@@ -540,8 +540,8 @@ class CollisionAvoidanceServiceImpl(ICollisionAvoidanceService):
 
         # Always log STOP actions (emergency situations), except for static obstacles
         if current_action_type == SafetyActionType.STOP:
-            if "Static obstacle" not in str(final_action.reason):
-                self.logger.warning(f"EMERGENCY STOP: {final_action.reason}")
+            #if "Static obstacle" not in str(final_action.reason):
+            #   self.logger.warning(f"EMERGENCY STOP: {final_action.reason}")
             self._previous_action_type = current_action_type
             return
 

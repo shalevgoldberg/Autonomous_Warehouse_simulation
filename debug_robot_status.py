@@ -9,7 +9,7 @@ from typing import List, Dict, Any
 
 from interfaces.jobs_queue_interface import IJobsQueue
 from interfaces.task_handler_interface import Task, TaskType
-from interfaces.configuration_interface import IConfigurationProvider, SystemConfig, BidConfig
+from interfaces.configuration_interface import IBusinessConfigurationProvider, SystemConfig, BidConfig
 from warehouse.impl.robot_controller_impl import RobotController
 
 class SimpleMockRobot:

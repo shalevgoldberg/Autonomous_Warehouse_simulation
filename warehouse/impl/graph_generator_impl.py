@@ -44,9 +44,24 @@ class GraphGeneratorImpl(IGraphGenerator):
         # Build connections based on exit directions
         self._build_connections(nodes, position_to_node, edges)
         
-        # Convert conflict_boxes to BoxRec for NavigationGraph
-        boxrec_conflict_boxes = {box_id: BoxRec(box_id=box.box_id, center=box.position, size=box.size)
-                                 for box_id, box in conflict_boxes.items()}
+        # Convert conflict_boxes to BoxRec for NavigationGraph (rectangles)
+        boxrec_conflict_boxes = {}
+        for box_id, box in conflict_boxes.items():
+            # ConflictBox now expected to expose width/height; if not, derive from size as square
+            width = getattr(box, 'width', None)
+            height = getattr(box, 'height', None)
+            if width is None or height is None:
+                # Legacy fallback during migration: treat as square of size
+                print(f"[diag] _generate_graph: fallback: treating box {box_id} as square of size {box.size}")
+                width = box.size
+                height = box.size
+                
+            boxrec_conflict_boxes[box_id] = BoxRec(
+                box_id=box.box_id,
+                center=box.position,
+                width=width,
+                height=height
+            )
         return NavigationGraph(
             nodes=nodes,
             edges=edges,
@@ -163,7 +178,7 @@ class GraphGeneratorImpl(IGraphGenerator):
                         node_id=node_id,
                         position=Point(x, y),
                         directions=directions,
-                        is_conflict_box=True,
+                        is_conflict_box=True, # TODO TEMP!!!
                         conflict_box_id=None
                     )
                     nodes[node_id] = node
@@ -215,13 +230,23 @@ class GraphGeneratorImpl(IGraphGenerator):
                         position_to_node[pos] = node_id
                         if is_parking_adjacent:
                             conflict_box_id = f"cb_p_{row_idx}_{col_idx}"
-                            conflict_boxes[conflict_box_id] = ConflictBox(
-                                box_id=conflict_box_id,
-                                position=Point(x, y),
-                                size=self.cell_size,
-                                participating_nodes={node_id},
-                                directions=directions
-                            )
+                            try:
+                                conflict_boxes[conflict_box_id] = ConflictBox(
+                                    box_id=conflict_box_id,
+                                    position=Point(x, y),
+                                    width=self.cell_size,
+                                    height=self.cell_size,
+                                    participating_nodes={node_id},
+                                    directions=directions
+                                )
+                            except TypeError:
+                                conflict_boxes[conflict_box_id] = ConflictBox(
+                                    box_id=conflict_box_id,
+                                    position=Point(x, y),
+                                    size=self.cell_size,
+                                    participating_nodes={node_id},
+                                    directions=directions
+                                )
                 elif cell_value in ['i', '4']:  # Idle zone as a graph node (non-through)
                     # Idle nodes have no encoded directions; we connect them to adjacent lanes/junctions later
                     node_id = f"idle_{row_idx}_{col_idx}"
@@ -234,6 +259,7 @@ class GraphGeneratorImpl(IGraphGenerator):
                     nodes[node_id] = node
                     position_to_node[pos] = node_id
                 elif cell_value in ['c', '3']:  # Charging zone as a graph node (non-through)
+                    # Use grid coordinates for consistent station ID format
                     node_id = f"charge_{row_idx}_{col_idx}"
                     node = GraphNode(
                         node_id=node_id,
@@ -288,10 +314,9 @@ class GraphGeneratorImpl(IGraphGenerator):
                             stack.append((nr, nc))
                 if not component:
                     continue
-                # Compute group box parameters (AABB-based square)
+                # Compute group box parameters (AABB-based rectangle)
                 width_m = (max_col - min_col + 1) * self.cell_size
                 height_m = (max_row - min_row + 1) * self.cell_size
-                size_m = max(width_m, height_m)
                 # Center of the AABB in world coordinates (cell centers are at +0.5)
                 center_x = (min_col + max_col + 1) * 0.5 * self.cell_size
                 center_y = (min_row + max_row + 1) * 0.5 * self.cell_size
@@ -303,13 +328,26 @@ class GraphGeneratorImpl(IGraphGenerator):
                     node_ref = nodes[node_id]
                     node_ref.conflict_box_id = group_id
                 # Create one conflict box record for the whole component
-                conflict_boxes[group_id] = ConflictBox(
-                    box_id=group_id,
-                    position=Point(center_x, center_y),
-                    size=size_m,
-                    participating_nodes=node_ids_in_component,
-                    directions=list(dir_union)
-                )
+                # Prefer width/height if ConflictBox supports them; otherwise store size for fallback
+                try:
+                    conflict_boxes[group_id] = ConflictBox(
+                        box_id=group_id,
+                        position=Point(center_x, center_y),
+                        width=width_m,
+                        height=height_m,
+                        participating_nodes=node_ids_in_component,
+                        directions=list(dir_union)
+                    )
+                except TypeError:
+                    # During migration window if interface still expects size
+                    size_m = max(width_m, height_m)
+                    conflict_boxes[group_id] = ConflictBox(
+                        box_id=group_id,
+                        position=Point(center_x, center_y),
+                        size=size_m,
+                        participating_nodes=node_ids_in_component,
+                        directions=list(dir_union)
+                    )
     
     def _parse_directions(self, direction_str: str) -> List[LaneDirection]:
         """Parse direction string into LaneDirection set."""

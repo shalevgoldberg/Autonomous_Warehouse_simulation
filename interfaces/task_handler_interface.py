@@ -14,12 +14,14 @@ class OperationalStatus(Enum):
     """Robot operational status - managed by TaskHandler."""
     IDLE = "idle"
     MOVING_TO_SHELF = "moving_to_shelf"
+    APPROACHING_SHELF = "approaching_shelf"  # Close to shelf (≤2m), relaxed safety margins
     PICKING = "picking"
     MOVING_TO_DROPOFF = "moving_to_dropoff"
     DROPPING = "dropping"
     MOVING_TO_CHARGING = "moving_to_charging"
     CHARGING = "charging"
     MOVING_TO_IDLE = "moving_to_idle"
+    WANDERING = "wandering"
     STALLED = "stalled"
     ERROR = "error"
     EMERGENCY_STOP = "emergency_stop"
@@ -185,6 +187,7 @@ class TaskHandlerStatus:
     operational_status: OperationalStatus
     progress: float  # 0.0 to 1.0
     stall_reason: Optional[str] = None
+    locked_bay_id: Optional[str] = None  # Current charging/idle bay lock
 
 
 class TaskHandlingError(Exception):

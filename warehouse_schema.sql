@@ -33,21 +33,12 @@ CREATE TABLE shelf_inventory (
     shelf_id VARCHAR(36) NOT NULL,
     item_id VARCHAR(36) NOT NULL,
     quantity INTEGER NOT NULL DEFAULT 0,
-    -- Pending quantity reserved by accepted tasks but not yet consumed
-    pending INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (shelf_id) REFERENCES shelves(shelf_id) ON DELETE CASCADE,
     FOREIGN KEY (item_id) REFERENCES items(item_id) ON DELETE CASCADE,
     UNIQUE(shelf_id, item_id)
 );
-
--- Data integrity constraints for reservations
-ALTER TABLE shelf_inventory
-    ADD CONSTRAINT chk_shelf_inventory_pending_non_negative
-        CHECK (pending >= 0),
-    ADD CONSTRAINT chk_shelf_inventory_pending_not_exceed_quantity
-        CHECK (pending <= quantity);
 
 -- 4. Robots Table - Store only robot definitions
 CREATE TABLE robots (
@@ -174,6 +165,20 @@ COMMENT ON TABLE shelf_inventory IS 'Current inventory quantities on each shelf'
 COMMENT ON TABLE shelf_approach_cells IS 'Precomputed approach positions for each shelf to optimize path planning';
 COMMENT ON TABLE robots IS 'Robot definitions and configurations';
 COMMENT ON TABLE warehouse_map IS 'Warehouse layout and grid configuration';
+
+-- Metadata columns to track the source of the warehouse layout
+-- Safe to run multiple times thanks to IF NOT EXISTS guards
+ALTER TABLE IF EXISTS warehouse_map
+    ADD COLUMN IF NOT EXISTS source_csv_file VARCHAR(255);
+
+ALTER TABLE IF EXISTS warehouse_map
+    ADD COLUMN IF NOT EXISTS source_csv_hash VARCHAR(64);
+
+-- Index for faster lookups by source file
+CREATE INDEX IF NOT EXISTS idx_warehouse_map_source_csv ON warehouse_map(source_csv_file);
+
+COMMENT ON COLUMN warehouse_map.source_csv_file IS 'Original CSV file used to generate this warehouse data';
+COMMENT ON COLUMN warehouse_map.source_csv_hash IS 'SHA256 hash of CSV file to detect changes';
 COMMENT ON TABLE simulation_metrics IS 'Performance metrics collected during simulation runs';
 
 -- Grant permissions (adjust as needed for your setup)

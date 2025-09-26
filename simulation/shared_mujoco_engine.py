@@ -19,10 +19,11 @@ import math
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List, Set, Union
+from typing import Dict, Optional, Tuple, List, Set, Union, Callable
 
 import numpy as np
 import mujoco
+import logging
 
 from warehouse.map import WarehouseMap
 from interfaces.appearance_service_interface import IAppearanceService
@@ -335,15 +336,15 @@ class RaycastService:
                 )
 
                 # Diagnostics: periodic category counts per robot - DISABLED
-                # cnt = self._debug_scan_counter.get(robot_id, 0) + 1
-                # self._debug_scan_counter[robot_id] = cnt
-                # if cnt % 10 == 0:
-                #     try:
-                #         unique, counts = np.unique(hit_category, return_counts=True)
-                #         cat_counts = {str(k): int(v) for k, v in zip(unique.tolist(), counts.tolist())}
-                #         print(f"[RaycastService] DEBUG: robot={robot_id} lidar_z={lidar_z:.3f} categories={cat_counts}")
-                #     except Exception:
-                #         pass
+                cnt = self._debug_scan_counter.get(robot_id, 0) + 1
+                self._debug_scan_counter[robot_id] = cnt
+                if cnt % 10 == 0:
+                    try:
+                        unique, counts = np.unique(hit_category, return_counts=True)
+                        cat_counts = {str(k): int(v) for k, v in zip(unique.tolist(), counts.tolist())}
+                        #print(f"[RaycastService] DEBUG: robot={robot_id} lidar_z={lidar_z:.3f} categories={cat_counts}")
+                    except Exception:
+                        pass
 
                 return scan
 
@@ -576,6 +577,37 @@ class SharedMuJoCoEngine:
         # Timing state (used only when time-gating is enabled)
         self._last_step_time = time.perf_counter()
 
+        # KPI collision recording infrastructure (optional DI)
+        self._kpi_recorder = None  # type: ignore[assignment]
+        self._kpi_run_id_provider: Optional[Callable[[], Optional[str]]] = None
+        self._kpi_collision_enabled: bool = True
+        self._kpi_collision_sample_interval_steps: int = 10
+        self._kpi_collision_step_counter: int = 0
+        try:
+            if self._config_provider is not None:
+                enabled_val = self._config_provider.get_value("kpi.collision_enabled", True)
+                self._kpi_collision_enabled = enabled_val.value if hasattr(enabled_val, 'value') else bool(enabled_val)
+                interval_val = self._config_provider.get_value("kpi.collision_sample_interval_steps", 10)
+                self._kpi_collision_sample_interval_steps = int(interval_val.value if hasattr(interval_val, 'value') else int(interval_val))
+        except Exception:
+            # Default to safe sampling if config lookup fails
+            self._kpi_collision_enabled = True
+            self._kpi_collision_sample_interval_steps = 10
+
+        self._logger = logging.getLogger(__name__)
+
+    def set_kpi_recorder(self, recorder, run_id_provider: Optional[Callable[[], Optional[str]]] = None) -> None:
+        """
+        Inject KPI recorder for collision events.
+
+        recorder: IKpiRecorder-like object with record_event(KpiEvent) method.
+        run_id_provider: function returning current simulation run id, or None.
+        """
+        self._kpi_recorder = recorder
+        self._kpi_run_id_provider = run_id_provider
+
+        # No reinitialization of engine state here to avoid resetting robots
+
     # ---------------- World build & registration ----------------
     def register_robot(self, robot_id: str, initial_pose: Tuple[float, float, float]) -> None:
         with self._lock:
@@ -730,8 +762,8 @@ class SharedMuJoCoEngine:
                 robots_xml.append(
                     f"""
     <body name='{body}' pos='0 0 {z}'>
-      <joint name='planar_x_{robot_id}' type='slide' axis='1 0 0' range='-10 10' limited='true' damping='0.1'/>
-      <joint name='planar_y_{robot_id}' type='slide' axis='0 1 0' range='-10 10' limited='true' damping='0.1'/>
+      <joint name='planar_x_{robot_id}' type='slide' axis='1 0 0' range='-10 10' limited='false' damping='0.1'/>
+      <joint name='planar_y_{robot_id}' type='slide' axis='0 1 0' range='-10 10' limited='false' damping='0.1'/>
       <joint name='yaw_{robot_id}' type='hinge' axis='0 0 1' range='-12.14159 12.14159' limited='false' damping='0.1'/> 
       <geom name='robot_geom_{robot_id}' type='cylinder' size='{self._robot_width/2} {self._robot_height/2}' rgba='0.8 0.2 0.2 1' contype='1' conaffinity='1'/>
     </body>
@@ -800,7 +832,7 @@ class SharedMuJoCoEngine:
                 elif cell == 4:  # idle (visual-only marker)
                     xml_parts.append(self._geom_xml(f"idle_{x}_{y}", world_x, world_y, 0.3, 0.3, 0.05, "0.5 0.8 1.0 1", visual_only=True))
                 elif cell == 5:  # dropoff (visual-only marker)
-                    xml_parts.append(self._geom_xml(f"dropoff_{x}_{y}", world_x, world_y, 0.3, 0.3, 0.1, "1.0 0.4 0.4 1", visual_only=True))
+                    xml_parts.append(self._geom_xml(f"dropoff_{x}_{y}", world_x, world_y, 0.3, 0.3, 0.05, "1.0 0.4 0.4 1", visual_only=True))
         return "\n    ".join(xml_parts)
 
     def _geom_xml(self, name: str, x: float, y: float, sx: float, sy: float, sz: float, rgba: str, visual_only: bool = False) -> str:
@@ -1120,6 +1152,16 @@ class SharedMuJoCoEngine:
         # Run MuJoCo physics simulation (contacts handled by MuJoCo)
         mujoco.mj_step(self._model, self._data)
 
+        # --- Collision KPI sampling (authoritative mode only) ---
+        try:
+            if self._physics_mode == "mujoco_authoritative" and self._kpi_collision_enabled and self._kpi_recorder is not None:
+                self._kpi_collision_step_counter += 1
+                if self._kpi_collision_step_counter % max(1, self._kpi_collision_sample_interval_steps) == 0:
+                    self._emit_collision_kpis()
+        except Exception as e:
+            # Never let KPI sampling affect physics loop
+            self._logger.error(f"[KPI][Collision] Sampling error: {e}")
+
         # Read resulting poses and update internal state
         for robot_id in robot_ids:
             planar_pose = self._read_planar_pose(robot_id)
@@ -1294,8 +1336,8 @@ class SharedMuJoCoEngine:
                     return None
 
             # Log unusual positions that might indicate issues
-            if abs(x) > 10.0 or abs(y) > 10.0:
-                print(f"[SharedMuJoCoEngine] WARNING: Robot {robot_id} at unusual position ({x:.3f}, {y:.3f}, {yaw:.3f})")
+            #if abs(x) > 10.0 or abs(y) > 10.0:
+            #    print(f"[SharedMuJoCoEngine] WARNING: Robot {robot_id} at unusual position ({x:.3f}, {y:.3f}, {yaw:.3f})")
 
             return (x, y, yaw)
         except (IndexError, ValueError, TypeError) as e:
@@ -1437,6 +1479,74 @@ class SharedMuJoCoEngine:
             self._write_robot_pose(robot_id, prev_pose[0], prev_pose[1], prev_pose[2])
             mujoco.mj_forward(self._model, self._data)
 
+    def _emit_collision_kpis(self) -> None:
+        """Read MuJoCo contacts and enqueue lightweight collision events.
+
+        Safety: No DB calls; only queue to the recorder. Guarded by authoritative mode.
+        """
+        try:
+            if self._model is None or self._data is None or self._kpi_recorder is None:
+                return
+
+            # Build reverse map: geom_id -> robot_id
+            geom_to_robot: Dict[int, str] = {}
+            for rid, gids in self._robot_geom_ids.items():
+                for gid in gids:
+                    geom_to_robot[int(gid)] = rid
+
+            # Iterate all contacts this step
+            ncon = int(self._data.ncon)
+            for i in range(ncon):
+                c = self._data.contact[i]
+                g1 = int(c.geom1)
+                g2 = int(c.geom2)
+
+                r1 = geom_to_robot.get(g1)
+                r2 = geom_to_robot.get(g2)
+
+                # We care only about contacts where at least one robot is involved
+                if not r1 and not r2:
+                    continue
+
+                robot_id = r1 or r2
+                other_gid = g2 if r1 else g1
+                try:
+                    other_name = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_GEOM, other_gid) or "unknown"
+                except Exception:
+                    other_name = "unknown"
+
+                if other_name.startswith("robot_geom_"):
+                    collision_type = "robot"
+                elif other_name.startswith("shelf_") or other_name.startswith("shelf_geom_"):
+                    collision_type = "shelf"
+                elif other_name.startswith("wall_"):
+                    collision_type = "wall"
+                else:
+                    collision_type = "unknown"
+
+                # Optional contact position (first contact point only)
+                posx = float(c.pos[0]) if hasattr(c, 'pos') else 0.0
+                posy = float(c.pos[1]) if hasattr(c, 'pos') else 0.0
+
+                # Build and enqueue KPI event (lightweight)
+                try:
+                    from kpi.kpi_recorder_interface import KpiEvent
+                    run_id = self._kpi_run_id_provider() if self._kpi_run_id_provider else None
+                    self._kpi_recorder.record_event(KpiEvent(
+                        event_type="collision_detected",
+                        robot_id=robot_id,
+                        event_data={
+                            "collision_type": 1.0 if collision_type == "robot" else (2.0 if collision_type == "shelf" else (3.0 if collision_type == "wall" else 0.0)),
+                            "pos_x": posx,
+                            "pos_y": posy,
+                        },
+                        simulation_run_id=run_id,
+                    ))
+                except Exception as e:
+                    self._logger.error(f"[KPI][Collision] Failed to enqueue collision event: {e}")
+
+        except Exception as e:
+            self._logger.error(f"[KPI][Collision] Unexpected error while emitting collisions: {e}")
 
 class AppearanceService(IAppearanceService):
     """

@@ -21,6 +21,7 @@ import random
 from contextlib import contextmanager
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import psycopg2
 import psycopg2.pool
@@ -37,6 +38,7 @@ from interfaces.simulation_data_service_interface import (
     ItemInventoryInfo,
     ItemShelfLocation,
 )
+from utils.database_config import get_database_config, DatabaseConfigError
 from interfaces.graph_persistence_interface import GraphPersistenceResult
 from warehouse.impl.graph_persistence_impl import GraphPersistenceImpl
 from pathlib import Path
@@ -51,6 +53,8 @@ import csv
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+
 
 
 class SimulationDataServiceImpl(ISimulationDataService):
@@ -77,33 +81,42 @@ class SimulationDataServiceImpl(ISimulationDataService):
                  pool_size: int = 10):
         """
         Initialize SimulationDataService with database connection.
+
+        Database configuration priority:
+        1. DATABASE_URL environment variable (recommended)
+        2. Individual WAREHOUSE_DB_* environment variables
+        3. Constructor parameters (for backward compatibility)
         
         Args:
             warehouse_map: Warehouse layout for map data
-            db_host: Database host
-            db_port: Database port  
-            db_name: Database name
-            db_user: Database user
-            db_password: Database password (or from WAREHOUSE_DB_PASSWORD env var)
+            db_host: Database host (fallback)
+            db_port: Database port (fallback)
+            db_name: Database name (fallback)
+            db_user: Database user (fallback)
+            db_password: Database password (fallback)
             pool_size: Connection pool size
         """
         self.warehouse_map = warehouse_map
         
-        # Get database password from environment if not provided
-        if db_password is None:
-            db_password = os.getenv('WAREHOUSE_DB_PASSWORD')
-            if not db_password:
-                raise SimulationDataServiceError(
-                    "Database password not provided. Set WAREHOUSE_DB_PASSWORD environment variable."
-                )
+        # Get database configuration using shared utility
+        try:
+            db_config = get_database_config(
+                db_host=db_host,
+                db_port=db_port,
+                db_name=db_name,
+                db_user=db_user,
+                db_password=db_password
+            )
+        except DatabaseConfigError as e:
+            raise SimulationDataServiceError(str(e))
         
         # Database connection parameters
         self.db_params = {
-            'host': db_host,
-            'port': db_port,
-            'database': db_name,
-            'user': db_user,
-            'password': db_password,
+            'host': db_config['host'],
+            'port': db_config['port'],
+            'database': db_config['database'],
+            'user': db_config['user'],
+            'password': db_config['password'],
             'cursor_factory': RealDictCursor,
             'connect_timeout': 10,
             'application_name': 'warehouse_simulation'
@@ -128,19 +141,24 @@ class SimulationDataServiceImpl(ISimulationDataService):
 
         # Initialize KPI recorder (non-blocking, background persistence)
         # Note: We use conservative defaults to avoid introducing new config dependencies here.
-        try:
-            self._kpi_recorder = KpiRecorderDbImpl(
-                connection_getter=self._get_connection,
-                flush_interval_sec=60.0,
-                max_batch_size=256,
-                queue_capacity=8192,
-                logger=logging.getLogger(f"{__name__}.KPI"),
-            )
-            logger.info("KPI recorder initialized (DB-backed)")
-        except Exception as e:
-            # Fallback: disable recorder; direct DB writes will be used with explicit logging
+        # Skip initialization in CLI mode for faster shutdown
+        if os.getenv('CLI_MODE') == '1':
             self._kpi_recorder = None
-            logger.error(f"Failed to initialize KPI recorder, falling back to direct DB writes: {e}")
+            logger.info("KPI recorder disabled (CLI mode)")
+        else:
+            try:
+                self._kpi_recorder = KpiRecorderDbImpl(
+                    connection_getter=self._get_connection,
+                    flush_interval_sec=5.0,  # Reduced from 60.0 for faster CLI shutdown
+                    max_batch_size=256,
+                    queue_capacity=8192,
+                    logger=logging.getLogger(f"{__name__}.KPI"),
+                )
+                logger.info("KPI recorder initialized (DB-backed)")
+            except Exception as e:
+                # Fallback: disable recorder; direct DB writes will be used with explicit logging
+                self._kpi_recorder = None
+                logger.error(f"Failed to initialize KPI recorder, falling back to direct DB writes: {e}")
 
         logger.info(f"SimulationDataService initialized with database {db_name}@{db_host}:{db_port}")
 
@@ -252,7 +270,7 @@ class SimulationDataServiceImpl(ISimulationDataService):
                                 lock_acquired BOOLEAN := FALSE;
                             BEGIN
                                 -- Attempt to insert lock row; if exists, do nothing
-                                INSERT INTO conflict_box_locks (box_id, locked_by_robot, lock_priority)
+                                INSERT INTO conflict_box_locks (box_id, locked_by_robot, priority)
                                 VALUES (p_box_id, p_robot_id, COALESCE(p_priority, 0))
                                 ON CONFLICT (box_id) DO NOTHING;
 
@@ -299,7 +317,7 @@ class SimulationDataServiceImpl(ISimulationDataService):
                                 heartbeat_updated BOOLEAN := FALSE;
                             BEGIN
                                 UPDATE conflict_box_locks
-                                SET heartbeat_timestamp = CURRENT_TIMESTAMP
+                                SET heartbeat_at = CURRENT_TIMESTAMP
                                 WHERE box_id = p_box_id AND locked_by_robot = p_robot_id;
                                 GET DIAGNOSTICS heartbeat_updated = FOUND;
                                 RETURN heartbeat_updated;
@@ -435,10 +453,11 @@ class SimulationDataServiceImpl(ISimulationDataService):
                             elif cell_value == 5:  # Drop-off station
                                 dropoff_zones.append((x, y))
 
+                    # Always derive dimensions from the current warehouse_map to avoid stale defaults
                     map_data = MapData(
-                        width=self.warehouse_map.width,
-                        height=self.warehouse_map.height,
-                        cell_size=self.warehouse_map.grid_size,
+                        width=int(self.warehouse_map.width),
+                        height=int(self.warehouse_map.height),
+                        cell_size=float(self.warehouse_map.grid_size),
                         obstacles=self.warehouse_map.get_obstacle_cells(),
                         shelves=shelves,
                         dropoff_zones=dropoff_zones,
@@ -1065,10 +1084,11 @@ class SimulationDataServiceImpl(ISimulationDataService):
         except Exception as e:
             logger.error(f"Failed to create shelves from map: {e}")
             raise SimulationDataServiceError(f"Shelf creation failed: {e}")
-
+    
     def _select_shelf_for_item(self, item_data: Dict[str, Any],
                               assignment_strategy: str,
-                              strategy_options: Optional[Dict[str, Any]] = None) -> str:
+                              strategy_options: Optional[Dict[str, Any]] = None,
+                              available_shelves: Optional[List[str]] = None) -> str:
         """
         Select appropriate shelf based on assignment strategy.
 
@@ -1084,8 +1104,18 @@ class SimulationDataServiceImpl(ISimulationDataService):
             SimulationDataServiceError: If no suitable shelf can be found
         """
         try:
-            available_shelves = list(self.warehouse_map.shelves.keys())
+            # Prefer shelves provided by caller (DB source of truth)
+            if available_shelves is None:
+                try:
+                    available_shelves = self._get_available_shelves_from_db()
+                except Exception as e:
+                    logger.warning(f"Failed to load shelves from DB inside selector, falling back to in-memory map: {e}")
+                    available_shelves = list(self.warehouse_map.shelves.keys())
 
+            if not available_shelves:
+                # As a final compatibility fallback, try in-memory map once more
+                logger.warning("No shelves provided/found; falling back to in-memory map shelves (compatibility mode)")
+                available_shelves = list(self.warehouse_map.shelves.keys())
             if not available_shelves:
                 raise SimulationDataServiceError("No shelves available for inventory assignment")
 
@@ -1115,8 +1145,15 @@ class SimulationDataServiceImpl(ISimulationDataService):
             # Final fallback to random assignment
             logger.warning(f"Falling back to random assignment due to error: {e}")
             try:
-                available_shelves = list(self.warehouse_map.shelves.keys())
-                return self._get_random_shelf(available_shelves)
+                # Attempt random from DB; if that fails, map fallback
+                fallback_shelves = None
+                try:
+                    fallback_shelves = self._get_available_shelves_from_db()
+                except Exception:
+                    fallback_shelves = list(self.warehouse_map.shelves.keys())
+                if not fallback_shelves:
+                    fallback_shelves = list(self.warehouse_map.shelves.keys())
+                return self._get_random_shelf(fallback_shelves)
             except Exception:
                 raise SimulationDataServiceError(f"Unable to assign shelf for item {item_data.get('item_id', 'unknown')}")
 
@@ -1132,12 +1169,27 @@ class SimulationDataServiceImpl(ISimulationDataService):
         """
         return random.choice(available_shelves)
 
+    def _get_available_shelves_from_db(self) -> List[str]:
+        """
+        Read available shelf IDs from the database.
+        Returns: List of shelf_id strings.
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("SELECT shelf_id FROM shelves ORDER BY shelf_id")
+                    rows = cur.fetchall()
+                    return [row['shelf_id'] for row in rows]
+        except Exception as e:
+            logger.error(f"Failed to read shelves from DB: {e}")
+            raise SimulationDataServiceError(f"Failed to read shelves: {e}")
+
     def populate_inventory(self, inventory_data: List[Dict[str, Any]],
                           assignment_strategy: str = "random",
                           strategy_options: Optional[Dict[str, Any]] = None) -> int:
         """
         Populate inventory with items and assign them to shelves.
-
+        
         Args:
             inventory_data: List of inventory data dictionaries with format:
                 {
@@ -1158,10 +1210,10 @@ class SimulationDataServiceImpl(ISimulationDataService):
                 - category_zones: Dict mapping categories to shelf ID prefixes
                 - priority_zones: Dict mapping priorities to shelf ID prefixes
                 - max_shelf_capacity: Maximum items per shelf
-
+            
         Returns:
             int: Number of inventory entries created
-
+            
         Raises:
             SimulationDataServiceError: If inventory population fails
         """
@@ -1176,15 +1228,26 @@ class SimulationDataServiceImpl(ISimulationDataService):
                 logger.warning(f"Invalid assignment strategy '{assignment_strategy}', falling back to 'random'")
                 assignment_strategy = "random"
 
-            # Get available shelves
-            available_shelves = list(self.warehouse_map.shelves.keys())
+            # Get available shelves from DB (never rely on in-memory map for data ops)
+            try:
+                available_shelves = self._get_available_shelves_from_db()
+            except Exception as e:
+                logger.warning(f"Failed to load shelves from DB, falling back to in-memory map: {e}")
+                available_shelves = list(self.warehouse_map.shelves.keys())
+            # If DB query succeeded but returned no shelves, try in-memory map as a compatibility fallback
+            if not available_shelves:
+                logger.warning("No shelves found in DB; falling back to in-memory map shelves (compatibility mode)")
+                available_shelves = list(self.warehouse_map.shelves.keys())
+            if not available_shelves:
+                logger.error("No shelves available for inventory assignment.")
+                return 0
             if not available_shelves:
                 raise SimulationDataServiceError("No shelves available for inventory assignment")
 
             with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     inventory_created = 0
-
+                    
                     for item_data in inventory_data:
                         # Validate required fields
                         if 'item_id' not in item_data or 'name' not in item_data or 'quantity' not in item_data:
@@ -1200,7 +1263,12 @@ class SimulationDataServiceImpl(ISimulationDataService):
                         shelf_id = item_data.get('shelf_id')
                         if not shelf_id:
                             try:
-                                shelf_id = self._select_shelf_for_item(item_data, assignment_strategy, strategy_options)
+                                shelf_id = self._select_shelf_for_item(
+                                    item_data,
+                                    assignment_strategy,
+                                    strategy_options,
+                                    available_shelves=available_shelves
+                                )
                                 logger.debug(f"Assigned item '{item_data['item_id']}' to shelf '{shelf_id}' using {assignment_strategy} strategy")
                             except Exception as e:
                                 logger.error(f"Failed to assign shelf for item '{item_data['item_id']}': {e}")
@@ -1208,7 +1276,7 @@ class SimulationDataServiceImpl(ISimulationDataService):
 
                         # Validate shelf exists
                         if shelf_id not in available_shelves:
-                            logger.warning(f"Shelf '{shelf_id}' not found in warehouse map, skipping item '{item_data['item_id']}'")
+                            logger.warning(f"Shelf '{shelf_id}' not found in DB shelves, skipping item '{item_data['item_id']}'")
                             continue
 
                         # Insert item if it doesn't exist (let defaults handle created_at/updated_at)
@@ -1217,7 +1285,7 @@ class SimulationDataServiceImpl(ISimulationDataService):
                             VALUES (%s, %s)
                             ON CONFLICT (item_id) DO NOTHING
                         """, (item_data['item_id'], item_data['name']))
-
+                        
                         # Insert inventory on shelf
                         cur.execute("""
                             INSERT INTO shelf_inventory (shelf_id, item_id, quantity)
@@ -1229,10 +1297,10 @@ class SimulationDataServiceImpl(ISimulationDataService):
                             item_data['item_id'],
                             item_data['quantity']
                         ))
-
+                        
                         if cur.rowcount > 0:
                             inventory_created += 1
-
+                    
                     conn.commit()
                     logger.info(f"Populated {inventory_created} inventory entries using {assignment_strategy} strategy")
                     return inventory_created
@@ -1300,7 +1368,7 @@ class SimulationDataServiceImpl(ISimulationDataService):
         except Exception as e:
             logger.error(f"Failed to get inventory statistics: {e}")
             raise SimulationDataServiceError(f"Failed to get inventory statistics: {e}")
-
+    
     def export_inventory_status_csv(self, filename: str) -> bool:
         """
         Export complete inventory status including reserved quantities to CSV.
@@ -1385,6 +1453,145 @@ class SimulationDataServiceImpl(ISimulationDataService):
         except Exception as e:
             logger.error(f"Failed to export inventory status to {filename}: {e}")
             return False
+
+    def clear_all_reservations(self) -> int:
+        """
+        Clear all reserved (pending) quantities across all shelves without consuming stock.
+        Returns the number of rows affected (those that previously had pending > 0).
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Count rows that currently have pending > 0
+                    cur.execute("SELECT COUNT(*) AS cnt FROM shelf_inventory WHERE COALESCE(pending, 0) > 0")
+                    rows_with_pending = cur.fetchone()['cnt']
+                    if rows_with_pending == 0:
+                        return 0
+                    # Zero all pending values
+                    cur.execute(
+                        """
+                        UPDATE shelf_inventory
+                        SET pending = 0,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE COALESCE(pending, 0) > 0
+                        """
+                    )
+                    conn.commit()
+                    logger.info(f"Cleared reserved quantities on {rows_with_pending} shelf_inventory rows")
+                    return rows_with_pending
+        except Exception as e:
+            logger.error(f"Failed to clear reserved quantities: {e}")
+            raise SimulationDataServiceError(f"Failed to clear reserved quantities: {e}")
+
+    def clear_all_inventory(self) -> int:
+        """
+        Remove all inventory rows from shelf_inventory.
+        Returns: number of rows deleted.
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) AS cnt FROM shelf_inventory")
+                    before = cur.fetchone()['cnt']
+                    cur.execute("DELETE FROM shelf_inventory")
+                    conn.commit()
+                    logger.info(f"Cleared all inventory rows: {before}")
+                    return before
+        except Exception as e:
+            logger.error(f"Failed to clear all inventory: {e}")
+            raise SimulationDataServiceError(f"Failed to clear all inventory: {e}")
+
+    def delete_inventory_for_items(self, item_ids: List[str], purge_items: bool = False) -> int:
+        """
+        Delete inventory rows for the given item_ids. Optionally purge items table entries
+        that no longer have inventory.
+        Returns: number of shelf_inventory rows deleted.
+        """
+        if not item_ids:
+            logger.warning("delete_inventory_for_items called with empty item_ids; nothing to delete")
+            return 0
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT COUNT(*) AS cnt FROM shelf_inventory WHERE item_id = ANY(%s)
+                    """, (item_ids,))
+                    before = cur.fetchone()['cnt']
+                    cur.execute("""
+                        DELETE FROM shelf_inventory WHERE item_id = ANY(%s)
+                    """, (item_ids,))
+                    deleted = cur.rowcount
+                    if purge_items:
+                        # Delete items that no longer have inventory
+                        cur.execute("""
+                            DELETE FROM items i
+                            WHERE i.item_id = ANY(%s)
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM shelf_inventory si WHERE si.item_id = i.item_id
+                              )
+                        """, (item_ids,))
+                    conn.commit()
+                    logger.info(f"Deleted {deleted} inventory rows for items {item_ids}")
+                    return before if before == deleted else deleted
+        except Exception as e:
+            logger.error(f"Failed to delete inventory for items {item_ids}: {e}")
+            raise SimulationDataServiceError(f"Failed to delete inventory for items: {e}")
+
+    def move_inventory(self, item_id: str, from_shelf_id: str, to_shelf_id: str, quantity: int) -> bool:
+        """
+        Atomically move 'quantity' of item from one shelf to another respecting pending.
+        """
+        if quantity <= 0:
+            logger.warning(f"move_inventory called with non-positive quantity: {quantity}")
+            return False
+        if from_shelf_id == to_shelf_id:
+            logger.warning("move_inventory called with same source and destination shelf; no-op")
+            return True
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Ensure shelves exist
+                    cur.execute("SELECT 1 FROM shelves WHERE shelf_id = %s", (from_shelf_id,))
+                    if not cur.fetchone():
+                        logger.warning(f"Source shelf {from_shelf_id} does not exist; aborting move")
+                        return False
+                    cur.execute("SELECT 1 FROM shelves WHERE shelf_id = %s", (to_shelf_id,))
+                    if not cur.fetchone():
+                        logger.warning(f"Destination shelf {to_shelf_id} does not exist; aborting move")
+                        return False
+
+                    # Decrement from source if sufficient available (quantity - pending)
+                    cur.execute(
+                        """
+                        UPDATE shelf_inventory
+                        SET quantity = quantity - %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE shelf_id = %s AND item_id = %s
+                              AND (quantity - COALESCE(pending, 0)) >= %s
+                        """,
+                        (quantity, from_shelf_id, item_id, quantity)
+                    )
+                    if cur.rowcount != 1:
+                        conn.rollback()
+                        logger.warning(f"Insufficient available to move {quantity} of {item_id} from {from_shelf_id}")
+                        return False
+
+                    # Increment destination (insert or update)
+                    cur.execute(
+                        """
+                        INSERT INTO shelf_inventory (shelf_id, item_id, quantity)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (shelf_id, item_id)
+                        DO UPDATE SET quantity = shelf_inventory.quantity + EXCLUDED.quantity,
+                                      updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (to_shelf_id, item_id, quantity)
+                    )
+                    conn.commit()
+                    logger.info(f"Moved {quantity} of {item_id} from {from_shelf_id} to {to_shelf_id}")
+                    return True
+        except Exception as e:
+            logger.error(f"Failed to move inventory: {e}")
+            raise SimulationDataServiceError(f"Failed to move inventory: {e}")
 
     def get_item_inventory(self, item_id: str) -> Optional['ItemInventoryInfo']:
         """
@@ -1684,7 +1891,7 @@ class SimulationDataServiceImpl(ISimulationDataService):
             with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
-                        SELECT box_id, center_x, center_y, size
+                        SELECT box_id, center_x, center_y, width, height
                         FROM conflict_boxes
                         ORDER BY box_id
                     """)
@@ -1696,7 +1903,8 @@ class SimulationDataServiceImpl(ISimulationDataService):
                         box = BoxRec(
                             box_id=row['box_id'],
                             center=Point(x=float(row['center_x']), y=float(row['center_y'])),
-                            size=float(row['size'])
+                            width=float(row['width']),
+                            height=float(row['height'])
                         )
                         boxes.append(box)
                     
@@ -2065,7 +2273,7 @@ class SimulationDataServiceImpl(ISimulationDataService):
                     return owner
                     
         except Exception as e:
-            logger.error(f"Failed to get conflict box lock owner {box_id}: {e}")
+            #logger.error(f"Failed to get conflict box lock owner {box_id}: {e}")
             raise SimulationDataServiceError(f"Failed to get conflict box lock owner: {e}")
 
     def cleanup_expired_conflict_box_locks(self) -> int:
@@ -2112,8 +2320,41 @@ class SimulationDataServiceImpl(ISimulationDataService):
             logger.error(f"[DEBUG] Exception type: {type(e).__name__}")
             raise SimulationDataServiceError(f"Failed to cleanup expired conflict box locks: {e}")
     
+    def clear_all_conflict_box_locks(self) -> int:
+        """
+        Clear all conflict box lock entries.
+
+        WARNING: This method removes ALL conflict box locks regardless of state.
+        Use with caution as it may cause race conditions if locks are actively held.
+
+        Returns:
+            int: Number of locks removed
+
+        Raises:
+            SimulationDataServiceError: If clear operation fails
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Count locks before deletion for return value
+                    cur.execute("SELECT COUNT(*) FROM conflict_box_locks")
+                    count_before = cur.fetchone()
+                    initial_count = int(self._scalar(count_before, 0))
+
+                    # Clear all conflict box locks
+                    cur.execute("DELETE FROM conflict_box_locks")
+
+                    conn.commit()
+
+                    logger.warning(f"Cleared {initial_count} conflict box locks from database")
+                    return initial_count
+
+        except Exception as e:
+            logger.error(f"Failed to clear all conflict box locks: {e}")
+            raise SimulationDataServiceError(f"Failed to clear all conflict box locks: {e}")
+
     def close(self) -> None:
-        """Close database connections and cleanup resources."""
+        """Close database connections and cleanup resources immediately."""
         try:
             # Stop KPI recorder first
             try:
@@ -2124,6 +2365,7 @@ class SimulationDataServiceImpl(ISimulationDataService):
 
             if self._connection_pool:
                 with self._pool_lock:
+                    # Force close all connections immediately
                     self._connection_pool.closeall()
                     self._connection_pool = None
                 logger.info("SimulationDataService database connections closed")

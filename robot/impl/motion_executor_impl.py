@@ -55,7 +55,7 @@ class MotionExecutorImpl(IMotionExecutor):
     """
     
     # Class-level logging configuration
-    VERBOSE_MOTION_LOGGING = False  # Set to True to enable verbose motion logs
+    VERBOSE_MOTION_LOGGING = True  # Set to True to enable verbose motion logs
     
     @classmethod
     def set_verbose_logging(cls, enabled: bool) -> None:
@@ -250,6 +250,18 @@ class MotionExecutorImpl(IMotionExecutor):
                 # Keep the flag for a few iterations to ensure TaskHandler can read it
                 # Don't clear it immediately
                 status = MotionStatus.REACHED_TARGET
+                # Diagnostics: if REACHED_TARGET while not in SINGLE_MOVE/FOLLOWING_PATH, flag possible stale state
+                try:
+                    now_diag = time.time()
+                    last = getattr(self, "_last_status_diag_time", 0.0)
+                    if now_diag - last > 1.0:
+                        setattr(self, "_last_status_diag_time", now_diag)
+                        mode_val = self._current_mode.value if hasattr(self._current_mode, 'value') else str(self._current_mode)
+                        if self._current_mode not in [MotionMode.SINGLE_MOVE, MotionMode.FOLLOWING_PATH]:
+                            #print(f"[diag][MotionExecutor.{self.robot_id}] get_motion_status returning REACHED_TARGET while mode={mode_val}")
+                            pass
+                except Exception:
+                    pass
             elif self._current_mode == MotionMode.STOPPED:
                 status = MotionStatus.IDLE
             elif self._current_mode in [MotionMode.FOLLOWING_PATH, MotionMode.SINGLE_MOVE, MotionMode.ROTATING]:
@@ -356,8 +368,13 @@ class MotionExecutorImpl(IMotionExecutor):
             self._motion_start_time = time.time()
             # Clear any leftover reached flag from previous segment
             self._reached_target_flag = False
+            try:
+                #print(f"[diag][MotionExecutor.{self.robot_id}] rotate_to_heading start: target={target_heading_rad:.3f} cleared_reached_flag=True")
+                pass
+            except Exception:
+                pass
             # 🔍 CRITICAL: Rotation configured - keep this for debugging
-            print(f"[MotionExecutor] Rotating to {target_heading_rad:.3f}rad")
+            #print(f"[MotionExecutor] Rotating to {target_heading_rad:.3f}rad")
     
     def set_wheel_commands_atomic(self, left_vel: float, right_vel: float) -> None:
         """
@@ -382,9 +399,9 @@ class MotionExecutorImpl(IMotionExecutor):
             if self.physics_engine is not None:
                 try:
                     self.physics_engine.set_wheel_velocities(left_vel, right_vel)
-                    # Diagnostics: robot_2-focused log of commands
-                    if self.robot_id == "warehouse_robot_2" and self.VERBOSE_MOTION_LOGGING:
-                        print(f"[MotionDiag] robot_2 cmd L={left_vel:.3f} R={right_vel:.3f}")
+                    # Diagnostics: robot_3-focused log of commands
+                    if self.robot_id == "warehouse_robot_3" and self.VERBOSE_MOTION_LOGGING:
+                        print(f"[MotionDiag] robot_3 cmd L={left_vel:.3f} R={right_vel:.3f}")
                 except Exception as e:
                     print(f"[MotionExecutor] Error writing to physics engine: {e}")
 
@@ -414,6 +431,14 @@ class MotionExecutorImpl(IMotionExecutor):
             self._iteration_counter = 0  # Reset iteration counter on completion
             # Set flag to signal REACHED_TARGET
             self._reached_target_flag = True
+            try:
+                # Diagnostics: note that we do not actively zero wheels here
+                last_left = getattr(self._pending_wheel_commands, 'left_wheel_velocity', None)
+                last_right = getattr(self._pending_wheel_commands, 'right_wheel_velocity', None)
+                #print(f"[diag][MotionExecutor.{self.robot_id}] path complete -> STOPPED (flag=REACHED_TARGET) last_wheels=L={last_left} R={last_right}")
+                pass
+            except Exception:
+                pass
             return
         
         # Get current position to check if we reached the waypoint
@@ -471,7 +496,7 @@ class MotionExecutorImpl(IMotionExecutor):
         if distance < self._position_tolerance and not self._snap_triggered:
             self._snap_triggered = True
             self._snap_start_time = time.time()
-            print(f"[MotionExecutor] Snap triggered at distance {distance:.3f}m (single move)")
+            #print(f"[MotionExecutor] Snap triggered at distance {distance:.3f}m (single move)")
         
         # Check if we reached the target
         if distance < self._position_tolerance:
@@ -480,7 +505,15 @@ class MotionExecutorImpl(IMotionExecutor):
             self._current_target = None
             self._iteration_counter = 0
             self._reached_target_flag = True
-            print(f"[MotionExecutor] Single move completed - reached target!")
+            try:
+                # Diagnostics: note that we do not actively zero wheels here
+                last_left = getattr(self._pending_wheel_commands, 'left_wheel_velocity', None)
+                last_right = getattr(self._pending_wheel_commands, 'right_wheel_velocity', None)
+                #print(f"[diag][MotionExecutor.{self.robot_id}] single_move complete -> STOPPED (flag=REACHED_TARGET) last_wheels=L={last_left} R={last_right}")
+                pass
+            except Exception:
+                pass
+            #print(f"[MotionExecutor] Single move completed - reached target!")
             return
         
         # Calculate motion commands toward target
@@ -505,6 +538,11 @@ class MotionExecutorImpl(IMotionExecutor):
         if abs(theta_error) <= self._angular_tolerance:
             self._current_mode = MotionMode.STOPPED
             self.set_wheel_commands_atomic(0.0, 0.0)
+            try:
+                #print(f"[diag][MotionExecutor.{self.robot_id}] rotation complete: within tolerance ({abs(theta_error):.3f} <= {self._angular_tolerance:.3f}) -> STOPPED")
+                pass
+            except Exception:
+                pass
             return
 
         # Proportional angular velocity with cap
@@ -534,7 +572,7 @@ class MotionExecutorImpl(IMotionExecutor):
         dy = target_y - current_y
         distance = (dx**2 + dy**2)**0.5
         
-        if self.VERBOSE_MOTION_LOGGING:
+        if self.VERBOSE_MOTION_LOGGING and self.robot_id == "warehouse_robot_3":
             print(f"[MotionExecutor] Motion calc: pos=({current_x:.3f},{current_y:.3f},{current_theta:.3f}), "
                   f"target=({target_x:.3f},{target_y:.3f}), dist={distance:.3f}")
         
@@ -596,9 +634,9 @@ class MotionExecutorImpl(IMotionExecutor):
             angular_vel = max(-self._max_angular_velocity, min(self._max_angular_velocity, angular_vel))
             
             left_vel, right_vel = self._angular_to_wheel_velocities(linear_vel, angular_vel)
-            if self.VERBOSE_MOTION_LOGGING:
-                print(f"[MotionExecutor] Calculated: linear={linear_vel:.3f}, angular={angular_vel:.3f}, "
-                      f"wheels=L{left_vel:.3f}/R{right_vel:.3f}")
+            #if self.VERBOSE_MOTION_LOGGING:
+            #    print(f"[MotionExecutor] Calculated: linear={linear_vel:.3f}, angular={angular_vel:.3f}, "
+            #         f"wheels=L{left_vel:.3f}/R{right_vel:.3f}")
 
         # Apply safety filtering if active (Phase 4)
         if self._safety_action and self._motion_command_filter:
@@ -635,17 +673,17 @@ class MotionExecutorImpl(IMotionExecutor):
     
     def _write_to_mujoco_atomic(self, left_vel: float, right_vel: float) -> None:
         """Write wheel commands to physics engine."""
-        if self.VERBOSE_MOTION_LOGGING:
-            print(f"[MotionExecutor] _write_to_mujoco_atomic called: L={left_vel:.3f}, R={right_vel:.3f}")
+        #if self.VERBOSE_MOTION_LOGGING:
+        #    print(f"[MotionExecutor] _write_to_mujoco_atomic called: L={left_vel:.3f}, R={right_vel:.3f}")
         
         # First try to write to physics engine (preferred method)
         if self.physics_engine is not None:
             try:
-                if self.VERBOSE_MOTION_LOGGING:
-                    print(f"[MotionExecutor] Calling physics_engine.set_wheel_velocities")
+                #if self.VERBOSE_MOTION_LOGGING:
+                #    print(f"[MotionExecutor] Calling physics_engine.set_wheel_velocities")
                 self.physics_engine.set_wheel_velocities(left_vel, right_vel)
-                if self.VERBOSE_MOTION_LOGGING:
-                    print(f"[MotionExecutor] Successfully sent to physics engine")
+                #if self.VERBOSE_MOTION_LOGGING:
+                #    print(f"[MotionExecutor] Successfully sent to physics engine")
                 return  # Success - no need to try MuJoCo direct access
             except Exception as e:
                 print(f"[MotionExecutor] Error writing to physics engine: {e}")
@@ -759,7 +797,7 @@ class MotionExecutorImpl(IMotionExecutor):
             self._snap_triggered = False
             self._snap_start_time = None
             # 🔍 CRITICAL: Motion configured - keep this for debugging
-            print(f"[MotionExecutor] Motion to ({end_point.x:.1f}, {end_point.y:.1f})")
+            #print(f"[MotionExecutor] Motion to ({end_point.x:.1f}, {end_point.y:.1f})")
     
     def set_corner_speed(self, speed: float) -> None:
         """Set corner speed for conflict boxes and bay navigation."""

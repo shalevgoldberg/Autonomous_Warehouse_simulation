@@ -78,7 +78,9 @@ class TestTaskHandlerSimulationIntegration:
             motion_executor=mock_motion_executor,
             coordinate_system=mock_coordinate_system,
             simulation_data_service=mock_simulation_data_service,
-            robot_id="test_robot_1"
+            robot_id="test_robot_1",
+            lane_follower=Mock(),  # Add missing lane_follower parameter
+            battery_manager=None  # No battery manager in simulation test
         )
     
     @pytest.fixture
@@ -485,7 +487,9 @@ class TestTaskHandlerRealWorldScenarios:
             motion_executor=mock_motion_executor,
             coordinate_system=mock_coordinate_system,
             simulation_data_service=mock_simulation_service,
-            robot_id="warehouse_robot_1"
+            robot_id="warehouse_robot_1",
+            lane_follower=Mock(),  # Add missing lane_follower parameter
+            battery_manager=None  # No battery manager in simulation test
         )
     
     def test_complete_pick_and_deliver_workflow(self, integrated_task_handler):

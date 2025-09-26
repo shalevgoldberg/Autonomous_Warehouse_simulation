@@ -11,6 +11,7 @@ from enum import Enum
 
 from .path_planner_interface import Path, Cell  # Legacy support
 from .navigation_types import Route, Point
+from .collision_avoidance_interface import SafetyAction
 
 
 class MotionStatus(Enum):
@@ -228,19 +229,42 @@ class IMotionExecutor(ABC):
         This allows the motion executor to return to normal status reporting.
         """
         pass
-    
+
     @abstractmethod
     def is_at_target(self, target: Point) -> bool:
         """
         Check if robot is at the specified target position.
-        
+
         Single Source of Truth for position accuracy - all components should
         use this method instead of implementing their own position checking.
-        
+
         Args:
             target: Target position to check against
-            
+
         Returns:
             bool: True if robot is within position tolerance of target
+        """
+        pass
+
+    @abstractmethod
+    def set_safety_action(self, safety_action: Optional[SafetyAction]) -> None:
+        """
+        Set the current safety action for collision avoidance.
+
+        The motion executor will apply this safety action to all wheel commands
+        until a new safety action is set or None is passed to clear it.
+
+        Args:
+            safety_action: Safety action from collision avoidance, or None to clear
+        """
+        pass
+
+    @abstractmethod
+    def get_safety_action(self) -> Optional[SafetyAction]:
+        """
+        Get the currently active safety action.
+
+        Returns:
+            Optional[SafetyAction]: Current safety action, or None if no safety constraints
         """
         pass 

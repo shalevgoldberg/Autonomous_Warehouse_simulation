@@ -39,6 +39,13 @@ class IAppearanceService(ABC):
         pass
 
     @abstractmethod
+    def get_normal_color(self) -> Tuple[float, float, float, float]:
+        """
+        Get the RGBA color used for normal appearance.
+        """
+        pass
+
+    @abstractmethod
     def is_enabled(self) -> bool:
         """
         Check if appearance service is enabled.

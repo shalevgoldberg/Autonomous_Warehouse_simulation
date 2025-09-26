@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from typing import Dict, Any, Optional, List, Tuple, Callable
 from dataclasses import dataclass
 import heapq
+from urllib.parse import urlparse
 
 import psycopg2
 import psycopg2.pool
@@ -35,10 +36,13 @@ from interfaces.conflict_box_queue_interface import (
     QueuePosition,
     ConflictBoxQueueError
 )
+from utils.database_config import get_database_config, DatabaseConfigError
 
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+
 
 
 @dataclass
@@ -81,33 +85,42 @@ class ConflictBoxQueueImpl(IConflictBoxQueue):
                  cleanup_interval: float = 10.0):
         """
         Initialize the conflict box queue system.
-        
+
+        Database configuration priority:
+        1. DATABASE_URL environment variable (recommended)
+        2. Individual WAREHOUSE_DB_* environment variables
+        3. Constructor parameters (for backward compatibility)
+
         Args:
-            db_host: Database host
-            db_port: Database port
-            db_name: Database name
-            db_user: Database user
-            db_password: Database password (or from WAREHOUSE_DB_PASSWORD env var)
+            db_host: Database host (fallback)
+            db_port: Database port (fallback)
+            db_name: Database name (fallback)
+            db_user: Database user (fallback)
+            db_password: Database password (fallback)
             pool_size: Connection pool size
             default_timeout: Default timeout for queue requests (seconds)
             heartbeat_interval: Heartbeat interval for active locks (seconds)
             cleanup_interval: Cleanup interval for expired entries (seconds)
         """
-        # Get database password from environment if not provided
-        if db_password is None:
-            db_password = os.getenv('WAREHOUSE_DB_PASSWORD')
-            if not db_password:
-                raise ConflictBoxQueueError(
-                    "Database password not provided. Set WAREHOUSE_DB_PASSWORD environment variable."
-                )
-        
+        # Get database configuration using shared utility
+        try:
+            db_config = get_database_config(
+                db_host=db_host,
+                db_port=db_port,
+                db_name=db_name,
+                db_user=db_user,
+                db_password=db_password
+            )
+        except DatabaseConfigError as e:
+            raise ConflictBoxQueueError(str(e))
+
         # Database connection parameters
         self.db_params = {
-            'host': db_host,
-            'port': db_port,
-            'database': db_name,
-            'user': db_user,
-            'password': db_password,
+            'host': db_config['host'],
+            'port': db_config['port'],
+            'database': db_config['database'],
+            'user': db_config['user'],
+            'password': db_config['password'],
             'cursor_factory': RealDictCursor,
             'connect_timeout': 10,
             'application_name': 'conflict_box_queue'
@@ -408,7 +421,8 @@ class ConflictBoxQueueImpl(IConflictBoxQueue):
                         WHERE box_id = %s AND locked_by_robot = %s
                     """, (box_id, robot_id))
                     
-                    if not cur.fetchone():
+                    owner_row = cur.fetchone()
+                    if not owner_row:
                         conn.rollback()
                         logger.warning(f"Robot {robot_id} tried to release lock {box_id} but doesn't own it")
                         return False
@@ -424,6 +438,7 @@ class ConflictBoxQueueImpl(IConflictBoxQueue):
                     lock_duration = duration_result['duration'] if duration_result else 0.0
                     
                     # Release the lock
+                    logger.debug(f"[Diag][Queue] Releasing lock in DB for {box_id} by {robot_id}")
                     cur.execute("""
                         DELETE FROM conflict_box_locks
                         WHERE box_id = %s AND locked_by_robot = %s
@@ -462,6 +477,8 @@ class ConflictBoxQueueImpl(IConflictBoxQueue):
                         """, (box_id, next_robot_id))
                         
                         logger.info(f"Lock transferred from {robot_id} to {next_robot_id} for {box_id}")
+                    else:
+                        logger.info(f"Lock {box_id} released by {robot_id}; no queued robots to transfer")
                     
                     # Update queue positions for remaining robots
                     cur.execute("SELECT update_queue_positions_simple(%s)", (box_id,))
@@ -470,6 +487,7 @@ class ConflictBoxQueueImpl(IConflictBoxQueue):
                     self._update_lock_statistics(box_id, lock_duration)
                     
                     conn.commit()
+                    logger.debug(f"[Diag][Queue] Commit release transaction for {box_id} by {robot_id}")
                     logger.info(f"Lock released: {box_id} by robot {robot_id}")
                     return True
                     
@@ -656,9 +674,9 @@ class ConflictBoxQueueImpl(IConflictBoxQueue):
                     conn.commit()
                     
                     if success:
-                        logger.debug(f"Heartbeat sent for lock {box_id} by robot {robot_id}")
+                        logger.debug(f"[Diag][Queue] Heartbeat OK for {box_id} by {robot_id}")
                     else:
-                        logger.warning(f"Failed to send heartbeat for lock {box_id} by robot {robot_id}")
+                        logger.warning(f"[Diag][Queue] Heartbeat failed for {box_id} by {robot_id} (not owner?)")
                     
                     return success
                     

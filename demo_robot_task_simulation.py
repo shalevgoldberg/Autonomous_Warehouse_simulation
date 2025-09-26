@@ -637,6 +637,7 @@ def demo_automated_tasks():
             print(f"   ⏱️  Avg Task Time: {overview.get('avg_task_time_seconds', 0.0):.2f}s")
             print(f"   📈 Success Rate: {overview.get('task_success_rate', 0.0):.1f}%")
             print(f"   🧩 PD Completed: {overview.get('pd_tasks_completed', 0)} | PD Failed: {overview.get('pd_tasks_failed', 0)} | PD Success: {overview.get('pd_success_rate', 0):.1f}% | PD Avg Time: {overview.get('pd_avg_task_time_seconds', 0):.1f}s")
+            print(f"   💥 Collisions: {overview.get('collision_count', 0)} | Rate: {overview.get('collision_rate_per_min', 0):.2f}/min | Robot Collisions: {overview.get('collision_types_robot', 0)}")
             if export_enabled:
                 if sim.simulation_data_service.export_kpi_overview_csv(overview, export_path):
                     print(f"   💾 KPI CSV exported: {export_path}")

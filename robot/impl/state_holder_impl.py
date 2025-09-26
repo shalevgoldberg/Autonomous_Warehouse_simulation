@@ -10,6 +10,8 @@ from typing import Tuple, Optional, Dict, Any
 from dataclasses import dataclass, replace
 
 from interfaces.state_holder_interface import IStateHolder, RobotPhysicsState
+from interfaces.battery_manager_interface import IBatteryManager, RobotActivity
+from interfaces.lidar_interface import LiDARScan
 
 
 class StateHolderImpl(IStateHolder):
@@ -23,20 +25,22 @@ class StateHolderImpl(IStateHolder):
     Uses double-buffering to ensure atomic reads of complete state.
     """
     
-    def __init__(self, robot_id: str, model=None, data=None, physics_engine=None):
+    def __init__(self, robot_id: str, model=None, data=None, physics_engine=None, battery_manager=None):
         """
         Initialize StateHolder.
-        
+
         Args:
             robot_id: Unique identifier for this robot
             model: MuJoCo model (mjModel) - can be None for testing
             data: MuJoCo data (mjData) - can be None for testing
             physics_engine: Physics engine to get real robot position from
+            battery_manager: Optional battery manager for advanced battery simulation
         """
         self.robot_id = robot_id
         self.model = model
         self.data = data
         self.physics_engine = physics_engine
+        self.battery_manager = battery_manager
         
         # Thread safety: Double buffering for atomic reads
         self._state_lock = threading.RLock()
@@ -130,12 +134,41 @@ class StateHolderImpl(IStateHolder):
         """
         Get current battery level.
         **Thread-safe**: Can be called from any thread.
-        
+
         Returns:
             float: Battery level from 0.0 to 1.0
         """
         with self._state_lock:
             return self._current_state.battery_level
+
+    # LiDAR sensor data access (Phase 2.1)
+    def get_lidar_scan(self) -> Optional[LiDARScan]:
+        """
+        Get the latest LiDAR scan data.
+        **Thread-safe**: Can be called from any thread.
+
+        Returns:
+            LiDARScan: Latest LiDAR scan data, or None if not available
+        """
+        with self._state_lock:
+            return self._current_state.lidar_scan
+
+    def update_lidar_scan(self, scan: LiDARScan) -> None:
+        """
+        Update LiDAR scan data in the state.
+        **PHYSICS THREAD ONLY**: Should be called from physics thread.
+        **Not thread-safe**: Never call from multiple threads simultaneously.
+
+        Args:
+            scan: New LiDAR scan data to store
+        """
+        # Note: This method should only be called from physics thread
+        # No locking here since it's called from physics thread which already has synchronization
+        self._current_state = replace(
+            self._current_state,
+            lidar_scan=scan,
+            timestamp=time.time()
+        )
     
     def update_from_simulation(self) -> None:
         """
@@ -146,7 +179,11 @@ class StateHolderImpl(IStateHolder):
         # Read from MuJoCo (or simulate for testing)
         position = self._read_position_from_mujoco()
         velocity = self._read_velocity_from_mujoco()
-        battery_level = self._update_battery_level()
+        battery_level = self._update_battery_level_with_manager()
+
+        # Preserve existing LiDAR scan data during state update
+        with self._state_lock:
+            existing_lidar_scan = self._current_state.lidar_scan
 
         # Atomic update of complete state
         new_state = RobotPhysicsState(
@@ -154,7 +191,8 @@ class StateHolderImpl(IStateHolder):
             position=position,
             velocity=velocity,
             battery_level=battery_level,
-            timestamp=time.time()
+            timestamp=time.time(),
+            lidar_scan=existing_lidar_scan  # Preserve LiDAR data
         )
 
         with self._state_lock:
@@ -163,7 +201,8 @@ class StateHolderImpl(IStateHolder):
 
             # Only log significant position changes to avoid spam
             if abs(position[0] - old_position[0]) > 0.1 or abs(position[1] - old_position[1]) > 0.1:
-                print(f"[StateHolder] Robot {self.robot_id} moved: {old_position} -> {position}")
+                battery_info = f"battery: {self.get_battery_level():.1%}"
+                print(f"[StateHolder] Robot {self.robot_id} moved: {old_position} -> {position} ({battery_info})")
     
     def _read_position_from_mujoco(self) -> Tuple[float, float, float]:
         """Read robot position from physics engine or MuJoCo."""
@@ -231,10 +270,84 @@ class StateHolderImpl(IStateHolder):
         """Update battery level (simulated drain)."""
         with self._state_lock:
             current_battery = self._current_state.battery_level
-            
+
         # Simple battery drain simulation
         new_battery = max(0.0, current_battery - self._battery_drain_rate)
         return new_battery
+
+    def _update_battery_level_with_manager(self) -> float:
+        """
+        Update battery level using battery manager if available, fallback to legacy method.
+
+        This method provides backward compatibility while enabling advanced battery management.
+        """
+        if self.battery_manager is not None:
+            # Use advanced battery manager
+            with self._state_lock:
+                current_level = self._current_state.battery_level
+
+            # Determine current activity (simplified - could be enhanced)
+            activity = self._determine_current_activity()
+            speed = self._get_current_speed()
+            carrying_load = self._is_carrying_load()
+
+            # Update battery using manager
+            new_level = self.battery_manager.update_battery_level(
+                current_level=current_level,
+                activity=activity,
+                speed=speed,
+                carrying_load=carrying_load,
+                dt=0.001  # 1kHz physics step
+            )
+
+            return new_level
+        else:
+            # Fallback to legacy method for backward compatibility
+            return self._update_battery_level()
+
+    def _determine_current_activity(self) -> RobotActivity:
+        """
+        Determine current robot activity based on state and motion.
+
+        This is a simplified implementation that could be enhanced with
+        more sophisticated activity detection.
+        """
+        # Check if robot is charging first (highest priority)
+        if self.battery_manager and self.battery_manager.is_charging():
+            return RobotActivity.CHARGING
+
+        # Get current velocity magnitude
+        velocity = self.get_velocity()
+        speed = (velocity[0]**2 + velocity[1]**2)**0.5
+
+        # Simple activity determination
+        if self._is_carrying_load():
+            return RobotActivity.CARRYING
+        elif speed > 0.1:  # Moving if speed > 0.1 m/s
+            return RobotActivity.MOVING
+        else:
+            return RobotActivity.IDLE
+
+    def _get_current_speed(self) -> float:
+        """Get current robot speed."""
+        velocity = self.get_velocity()
+        return (velocity[0]**2 + velocity[1]**2)**0.5
+
+    def _is_carrying_load(self) -> bool:
+        """
+        Determine if robot is currently carrying a load.
+
+        This is a placeholder implementation that could be enhanced
+        by integrating with task handler or physics engine.
+        """
+        # Placeholder: Could check physics engine for attached shelves
+        # or task handler for current task type
+        if self.physics_engine:
+            # Check if physics engine has attached shelf information
+            attached_shelf = getattr(self.physics_engine, '_attached_shelf_id', None)
+            return attached_shelf is not None
+
+        return False
     
     def _quaternion_to_euler(self, quat) -> float:
         """

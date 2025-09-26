@@ -1,7 +1,7 @@
 """
 Configuration Provider Implementation
 
-This module provides a concrete implementation of IConfigurationProvider
+This module provides a concrete implementation of IConfigurationManager
 that reads configuration from multiple sources including environment variables
 and configuration files.
 """
@@ -14,7 +14,7 @@ from pathlib import Path
 import time
 
 from interfaces.configuration_management_interface import (
-    IConfigurationProvider, IConfigurationValidator, IConfigurationSource,
+    IConfigurationManager, IConfigurationValidator, IConfigurationSource,
     ConfigurationItem, ConfigurationSection, ConfigurationSource,
     ConfigurationValueType, ConfigurationValidationError
 )
@@ -289,7 +289,7 @@ class ConfigurationValidator(IConfigurationValidator):
         return errors
 
 
-class ConfigurationProviderImpl(IConfigurationProvider):
+class ConfigurationProviderImpl(IConfigurationManager):
     """
     Configuration provider implementation that aggregates configuration
     from multiple sources and provides a unified configuration interface.

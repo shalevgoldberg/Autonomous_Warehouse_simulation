@@ -129,12 +129,7 @@ def create_warehouse_components(config_provider: ConfigurationProvider):
     
     # Create simulation data service
     simulation_data_service = SimulationDataServiceImpl(
-        warehouse_map=warehouse_map,
-        db_host="localhost",
-        db_port=5432,
-        db_name="warehouse_sim",
-        db_user="postgres",
-        db_password="renaspolter"
+        warehouse_map=warehouse_map
     )
     
     # Create order source

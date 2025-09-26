@@ -213,12 +213,22 @@ class ILaneFollower(ABC):
     def get_held_conflict_boxes(self) -> List[str]:
         """
         Get list of conflict boxes currently held by this robot.
-        
+
         Returns:
             List[str]: List of conflict box IDs currently held
         """
         pass
-    
+
+    @abstractmethod
+    def get_pending_conflict_box(self) -> Optional[str]:
+        """
+        Get the conflict box ID that this robot is currently waiting to acquire.
+
+        Returns:
+            Optional[str]: Conflict box ID being waited for, or None if no pending lock
+        """
+        pass
+
     @abstractmethod
     def set_config(self, config: LaneFollowingConfig) -> None:
         """
